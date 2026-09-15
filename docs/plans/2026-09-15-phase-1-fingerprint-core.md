@@ -2034,6 +2034,11 @@ ledger:
    so the two responses were byte-identical and the assertion degenerated to `f(x) == f(x)` — mutation-testing showed a
    leaky implementation still passed. The fixture is now parameterized so the second server returns distinct
    non-behavioral values, which is the implementation the test exists to reject.
+3. **`identity`, `params`, and `capabilities` record their normalized payload; `template` stays digest-only.** Spec §6.3
+   records the normalized form for external un-versioned sources, and spec §8.3's risk table names specific values
+   ("model lost the `tools` capability" is CRITICAL), which a digest alone cannot report. Each of those three payloads is
+   small. `template` is large and its diff value is low — "the chat template changed" is the whole message — so it
+   remains digest-only. The code carries this rule as a comment.
 
 - [ ] **Step 1: Write the failing tests**
 
