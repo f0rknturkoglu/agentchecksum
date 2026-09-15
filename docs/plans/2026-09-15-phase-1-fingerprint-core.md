@@ -906,6 +906,21 @@ git commit -m "Add schema-aware semantic normalization rules"
 error instead of silently ignored configuration. The structs cover the *whole* documented config surface, including
 sections later phases consume, so the config in spec §5 parses today. That is typed config surface, not dead code.
 
+**Post-implementation note (Task 4 shipped as commit 173ee17).** The code blocks below are the task's original
+specification. Three things changed during execution, all ruled in the SDD ledger:
+
+1. `normalize_rel_path` is defined **in this task**, in `src/config.rs`, not in the discovery module. Task 4's review
+   found that duplicate-prompt detection keyed on the raw path while the dependency id is normalized, so
+   `prompts/system.md` and `./prompts/system.md` both passed validation and the lockfile would have silently kept one.
+   Duplicate detection now normalizes every declaration before keying the set, which also rejects absolute paths, `..`,
+   and backslashes at config-validation time. Task 6 imports the function.
+2. The two typo tests were replaced. The originals mutated `[agent]` → `[agentt]` and `name = ` → `naem = `, which
+   deletes a *required* field, so they were rejected for "missing field" and passed with or without
+   `deny_unknown_fields` — §14.1's guarantee was untested. The replacements add an unknown key beside a known one and
+   append an unknown table, so only the unknown-key rejection can make them fail.
+3. `validate` also rejects transport-incompatible MCP fields (`url` on a stdio server; `command`/`args`/`env` on a
+   streamable-http server) rather than silently discarding them, and `Config::root_for` gained tests.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `src/config.rs`:
@@ -1703,34 +1718,10 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn a_leading_dot_slash_is_removed_from_the_id() {
-        assert_eq!(normalize_rel_path("./prompts/a.md").unwrap(), "prompts/a.md");
-    }
-
-    #[test]
-    fn an_absolute_path_is_rejected() {
-        assert!(normalize_rel_path("/etc/passwd").is_err());
-    }
-
-    #[test]
-    fn a_parent_directory_component_is_rejected() {
-        assert!(normalize_rel_path("../outside.md").is_err());
-        assert!(normalize_rel_path("prompts/../../outside.md").is_err());
-    }
-
-    #[test]
-    fn a_backslash_is_rejected_because_the_id_must_mean_the_same_thing_on_every_platform() {
-        // A backslash is a legal filename character on Unix and a path separator
-        // on Windows, so an id containing one would not round-trip.
-        assert!(normalize_rel_path("prompts\\a.md").is_err());
-    }
-
-    #[test]
-    fn an_empty_path_is_rejected() {
-        assert!(normalize_rel_path("").is_err());
-        assert!(normalize_rel_path(".").is_err());
-    }
+    // Path normalization is owned by `crate::config`: duplicate declared paths must
+    // be detected on the normalized form, so the single implementation lives where
+    // validation happens. Its tests are in src/config.rs, and `discover` imports
+    // the function.
 
     #[test]
     fn a_prompt_produces_content_and_shape_facets_and_a_stable_id() {
@@ -1823,14 +1814,12 @@ mod tests {
 Run: `cargo test --lib discovery`
 Expected: FAIL — `cannot find function discover`.
 
-- [ ] **Step 3: Add the path and encoding error variants**
+- [ ] **Step 3: Add the encoding error variant**
 
-In `src/error.rs`, add:
+`Error::PromptPath` already exists — it was added in Task 4 along with
+`normalize_rel_path`. In `src/error.rs`, add:
 
 ```rust
-    #[error("prompt path `{path}` must be relative, must not contain `..`, and must not contain a backslash")]
-    PromptPath { path: String },
-
     #[error("prompt `{path}` is not valid UTF-8")]
     PromptNotUtf8 { path: PathBuf },
 ```
@@ -1838,12 +1827,7 @@ In `src/error.rs`, add:
 and extend `suggestion()`:
 
 ```rust
-            Error::PromptPath { .. } => Some(
-                "Use a path relative to the config file, for example `prompts/system.md`.".to_string(),
-            ),
-            Error::PromptNotUtf8 { .. } => {
-                Some("Re-save the file as UTF-8.".to_string())
-            }
+            Error::PromptNotUtf8 { .. } => Some("Re-save the file as UTF-8.".to_string()),
 ```
 
 - [ ] **Step 4: Write the implementation**
@@ -1858,59 +1842,16 @@ and extend `suggestion()`:
 //! lockfile would be a second source of truth.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, normalize_rel_path};
 use crate::error::{Error, Result};
 use crate::fingerprint::normalize;
 use crate::manifest::{Dependency, DependencyKind, Digest, Facet};
 
-/// Normalize a config-declared path into a stable, project-relative,
-/// forward-slash identity.
-///
-/// Absolute paths, `..`, and backslashes are rejected: an absolute path would
-/// make the lockfile depend on the machine it was produced on, and a backslash is
-/// a path separator on Windows but an ordinary filename character on Unix, so an
-/// id containing one would not mean the same thing everywhere.
-pub fn normalize_rel_path(path: &str) -> Result<String> {
-    if path.contains('\\') {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    let mut parts: Vec<&str> = Vec::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(part) => {
-                parts.push(part.to_str().ok_or_else(|| Error::PromptPath {
-                    path: path.to_string(),
-                })?);
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::PromptPath {
-                    path: path.to_string(),
-                });
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    Ok(parts.join("/"))
-}
+// `normalize_rel_path` lives in `crate::config`: duplicate declared paths must be
+// detected on the normalized form during config validation, so the single
+// implementation belongs where validation happens.
 
 /// Content and shape facets for a text file. `content` is what a human would
 /// call the document; `shape` ignores interior whitespace so a formatting-only
