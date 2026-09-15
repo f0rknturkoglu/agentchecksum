@@ -63,5 +63,18 @@ async fn dispatch(cli: &Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Diff => {
+            let baseline = cli.from.as_deref().unwrap_or(&cli.lock);
+            let outcome = cmd::diff::run(&root, &cli.config, baseline).await?;
+            match cli.format {
+                OutputFormat::Human => print!("{}", report::human::diff(&outcome)),
+                OutputFormat::Json => print!("{}", report::json::diff(&outcome)?),
+            }
+            // Exit 0 even when the overall risk is CRITICAL. `diff` reports what
+            // changed; deciding whether that should block a merge belongs to the
+            // CI gate, and conflating "found danger" with "failed to compare"
+            // would make the exit code useless for telling the two apart.
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }

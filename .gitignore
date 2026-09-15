@@ -11,5 +11,9 @@
 # Tooling scratch space (plan ledgers, briefs, review packages). Never committed.
 .superpowers/
 
+# A failed snapshot assertion leaves the candidate here; accepting it is a
+# deliberate `cargo insta accept`, not something to commit by accident.
+**/*.snap.new
+
 # macOS
 .DS_Store

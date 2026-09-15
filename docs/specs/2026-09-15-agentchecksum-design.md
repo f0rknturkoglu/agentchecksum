@@ -454,9 +454,22 @@ The `ac1` prefix versions the aggregation format independently of `lock_version`
 Three axes: **Added / Removed / Modified**. `Modified` is reported at facet level with a semantic
 detail and a risk level.
 
+A report describes a **comparison**, not only a delta. A modified dependency lists *every* facet
+present on either side, including the facets that were compared and found equal, marked
+`unchanged`. This is not decoration: "the schema did not break, the description did" (§15.1) is the
+product's sharpest sentence, and without the unchanged lines a reader cannot tell a facet that was
+checked from a facet that was never looked at. A consumer that wants only the delta filters on
+`change != "unchanged"`. Facets that did not move carry `risk: "none"` and no details.
+
 Diff sources: the committed `agentchecksum.lock` versus live discovery, or `--from <path>` for
 another lockfile. The binary has no git integration; CI provides the old lockfile
 (`git show HEAD:agentchecksum.lock > /tmp/old.lock`).
+
+The baseline is verified before anything is discovered: if a lockfile's recorded `agent_checksum`
+does not describe the entries beside it, the comparison is against a baseline that never existed, so
+`diff` refuses with exit 3 rather than reporting a diff against a fabricated state. Verification
+recomputes the aggregate from the entries; it does not re-derive the individual facet digests, whose
+derivation is not recorded in the lockfile.
 
 Semantic interpretations produced for schema changes (closed set, v0.1):
 
@@ -468,15 +481,29 @@ Anything outside this set is reported as a generic schema change. Classification
 an unrecognized change never scores below MEDIUM.
 
 ```text
-Agent checksum changed: ac1:72b5a918… → ac1:c4d1e07f…
+AgentChecksum diff
 
-TOOL  demo-tools.search_repos            MEDIUM
-  description      sha256:11aa… → sha256:99bb…
-  input_schema     unchanged
-  output_schema    unchanged
+Baseline: ac1:72b5a918…
+Current:  ac1:c4d1e07f…
+
+1 dependency changed.
+
+TOOL  demo-tools.search_repos                MEDIUM
+  description    sha256:11aa88ff… → sha256:99bbccdd…
+    classification: text-changed
+  input_schema   unchanged
+  output_schema  unchanged
 
 Overall behavioral risk: MEDIUM (heuristic)
 ```
+
+Layout rules: the kind and the dependency's identity (without its redundant kind prefix) form the
+header, with the dependency's risk in the last column; one line per facet, showing the fingerprint
+that moved (`sha256:` plus eight hex characters and an ellipsis) or the word `unchanged`; semantic
+details indented beneath the facet they explain; the verdict last, always qualified as
+`(heuristic)` because §8.3's table is a judgement, not a security fact. `diff` exits **0** whenever
+the comparison ran, whatever the risk: turning risk into a failing build is the gate's job (§12.2),
+and conflating "found danger" with "failed to compare" would make the exit code useless.
 
 ### 8.3 Risk classification
 
@@ -487,20 +514,125 @@ Overall behavioral risk: MEDIUM (heuristic)
 > they originate from a trusted server.
 
 v0.1 implements risk as a **pure function over a diff** — no I/O, no model, no configuration knobs.
+This is the table the code asserts, row by row, in `src/diff/risk.rs`.
+
+**Text, tool, model, and server changes**
 
 | Change | Risk |
 |---|---|
 | Text facet changed formatting only (equal `shape` digest) | LOW |
 | Prompt content changed · tool description changed | MEDIUM |
-| Property description changed · optional property added · `enum` value added | MEDIUM |
-| Inference parameters changed · dependency added · MCP protocol version changed | MEDIUM |
-| `required` field added/removed · `enum` value removed · `type` changed · `additionalProperties` tightened | HIGH |
-| Tool removed · model id changed · quantization changed · chat template changed | HIGH |
-| Model content digest changed (same id) · model lost `tools` capability · new destructive/write-capable tool (declared) | CRITICAL |
-| Unclassifiable change | MEDIUM (floor) |
+| A prompt dependency added | MEDIUM |
+| Inference parameters changed · a model or server capability added · server implementation info changed | MEDIUM |
+| A facet whose digest changed and no analyzer could explain it | MEDIUM, or HIGH for a schema facet |
+| A model, tool, or server dependency added | HIGH |
+| Tool removed · a prompt dependency removed | HIGH |
+| Quantization changed · chat template changed · endpoint identity changed (openai-compatible) · a model gained or lost any other capability · an identity subfield changed that we cannot name | HIGH |
+| MCP protocol era or version changed · a server dependency removed | HIGH |
+| Gaining a facet | MEDIUM, or HIGH for a schema facet |
+| Losing a facet | HIGH |
+| Model removed · provider, family, or parameter size changed · content digest changed (same id) | CRITICAL |
+| Model lost the `tools` capability | CRITICAL |
+| A dependency whose id is unchanged but whose kind is not | CRITICAL |
+| A new destructive/write-capable tool, declared via MCP `annotations` | CRITICAL — **Phase 3**, it needs the server's annotations |
+| Unclassifiable change | never below MEDIUM |
+
+**Schema changes, by side.** The same structural change carries different risk per side: an input
+schema decides whether the agent's calls are still valid, an output schema decides whether the caller
+can still parse what comes back.
+
+| Change | Input | Output |
+|---|---|---|
+| `required` field added | CRITICAL | MEDIUM |
+| `required` field removed | MEDIUM | CRITICAL |
+| `type` changed | CRITICAL | HIGH |
+| Property removed | HIGH | HIGH |
+| `enum` value removed | HIGH | HIGH |
+| `enum` value added | MEDIUM | MEDIUM |
+| Optional property added | LOW | LOW |
+| A property `description` changed, added, or removed | MEDIUM | MEDIUM |
+| `additionalProperties` tightened | HIGH | HIGH |
+| `additionalProperties` loosened | MEDIUM | MEDIUM |
+| Anything the analyzer cannot name | HIGH | HIGH |
+
+Three positions are worth stating explicitly, because they were argued rather than derived:
+
+- **Adding a required input field, or changing an input `type`, is CRITICAL — not HIGH.** This is the
+  canonical silent breakage (§15.2): every previously valid call becomes invalid at once. The other
+  input-schema rows stay where the sketch put them; these two do not.
+- **Adding an optional property is LOW — not MEDIUM.** It is purely additive: it cannot invalidate a
+  call that already worked, and it cannot break a caller's parser. Calling it MEDIUM would put a false
+  alarm on the most common `fail_on_risk` threshold, which is how a gate loses its audience. The change
+  is still reported with its fingerprint — LOW is a claim about risk, not about visibility.
+- **An MCP protocol-era change is HIGH.** The tool surface, lifecycle, and discovery semantics come
+  from the protocol revision itself, not from configuration, so a revision change can alter behavior
+  with no dependency changing at all.
+
+Two consequences of the tables above that are easy to miss:
+
+- **A model id change is a removal plus an addition**, and the removal decides: CRITICAL.
+- **A kind mismatch is CRITICAL and stands alone.** Facet maps produced under different kinds are not
+  comparable, so reporting it as "some facets changed" would be a silent reinterpretation of state we
+  do not understand.
 
 Overall risk for a diff is the **maximum** across changes, and is connectable to the gate via
 `fail_on_risk`.
+
+### 8.4 Machine-readable diff (`diff --format json`)
+
+The JSON form is the CLI's contract, so it is typed in the code rather than assembled from strings:
+field order is stable, change and risk values are lowercase tokens, and no prose is embedded — a
+consumer reads structure, not sentences.
+
+```jsonc
+{
+  "status": "ok",
+  "changed": true,
+  "overall_risk": "medium",
+  "baseline_checksum": "ac1:…",
+  "current_checksum": "ac1:…",
+  "changes": [
+    {
+      "id": "tool:github.search_repositories",
+      "kind": "tool",
+      "change": "modified",
+      "risk": "medium",
+      "facets": [
+        {
+          "name": "description",
+          "change": "modified",
+          "risk": "medium",
+          "before_digest": "sha256:…",
+          "after_digest": "sha256:…",
+          "details": [
+            { "path": "classification", "change": "modified", "after": "text-changed" }
+          ]
+        },
+        {
+          "name": "input_schema",
+          "change": "unchanged",
+          "risk": "none",
+          "before_digest": "sha256:…",
+          "after_digest": "sha256:…",
+          "details": []
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `kind` uses the lockfile's vocabulary (`model`, `prompt`, `tool`, `mcp_server`). Note the id
+  prefix is **not** the same token: it follows `as_str()`, so an MCP server is `"kind": "mcp_server"`
+  with an id of `mcp:github`. Both are stable; neither is derived from the other at runtime.
+- `before`/`after` inside `details` appear only where the baseline recorded a normalized payload to
+  read a value from. `before_digest`/`after_digest` are absent when the facet does not exist on that
+  side.
+- `status: "ok"` means the comparison ran, regardless of risk. A runtime failure is exit 3 with the
+  diagnostic on stderr and nothing on stdout, so `agentchecksum diff --format json | jq` is always
+  parseable.
+- `changes` is empty and `changed` is `false` when nothing moved — including when the two aggregate
+  checksums differ but no dependency does, which is the honest answer for a stale aggregate.
 
 ---
 
@@ -914,12 +1046,19 @@ The "harmless documentation edit" that a maintainer would merge without a second
 ```text
 $ agentchecksum check
 
-Agent checksum changed: ac1:72b5a918… → ac1:c4d1e07f…
+AgentChecksum diff
 
-TOOL  demo-tools.search_repos             MEDIUM (heuristic)
-  description     changed
-  input_schema    unchanged
-  output_schema   unchanged
+Baseline: ac1:72b5a918…
+Current:  ac1:c4d1e07f…
+
+1 dependency changed.
+
+TOOL  demo-tools.search_repos                MEDIUM
+  description    sha256:11aa88ff… → sha256:99bbccdd…
+  input_schema   unchanged
+  output_schema  unchanged
+
+Overall behavioral risk: MEDIUM (heuristic)
 
 Behavioral probes: 9 / 15 passed
 
@@ -949,8 +1088,9 @@ Why this is the right primary demo:
 ### 15.2 Secondary demo: the contract-breaking change
 
 The same project with `required = ["query", "owner"]` added to `search_repos`. This is the *expected*
-failing case — HIGH risk in the diff, `argument_validity` collapse. It is kept as a second example to
-show that the tool also catches schema-level breaks, not as the headline.
+failing case — CRITICAL risk in the diff (§8.3: a newly required input invalidates every call that
+used to work), `argument_validity` collapse. It is kept as a second example to show that the tool also
+catches schema-level breaks, not as the headline.
 
 A quantization swap (`qwen3:8b` q8 → q4) is documented as a third, heavier example.
 

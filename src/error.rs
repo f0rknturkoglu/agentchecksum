@@ -115,6 +115,18 @@ pub enum Error {
         found: u32,
         supported: u32,
     },
+
+    #[error("baseline lockfile `{path}` does not exist")]
+    BaselineMissing { path: PathBuf },
+
+    #[error(
+        "baseline lockfile `{path}` does not describe its own contents (recorded {recorded}, computed {computed})"
+    )]
+    BaselineChecksumMismatch {
+        path: PathBuf,
+        recorded: String,
+        computed: String,
+    },
 }
 
 impl Error {
@@ -177,6 +189,16 @@ impl Error {
             }
             Error::LockVersion { .. } => Some(
                 "Upgrade agentchecksum. A newer lockfile is never silently reinterpreted.".to_string(),
+            ),
+            Error::BaselineMissing { .. } => Some(
+                "Run `agentchecksum snapshot` and commit the generated lockfile before comparing \
+                 changes."
+                    .to_string(),
+            ),
+            Error::BaselineChecksumMismatch { .. } => Some(
+                "Restore the lockfile from git, or regenerate it deliberately with `agentchecksum \
+                 snapshot`."
+                    .to_string(),
             ),
         }
     }
