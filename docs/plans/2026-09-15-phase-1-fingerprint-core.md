@@ -431,7 +431,9 @@ mod tests {
 
     #[test]
     fn canonical_output_carries_no_insignificant_whitespace() {
-        let value = Nested { list: vec![1, 2, 3] };
+        let value = Nested {
+            list: vec![1, 2, 3],
+        };
         assert_eq!(
             String::from_utf8(to_vec(&value).unwrap()).unwrap(),
             r#"{"list":[1,2,3]}"#
