@@ -53,6 +53,34 @@ pub enum Error {
 
     #[error("prompt `{path}` is not valid UTF-8")]
     PromptNotUtf8 { path: PathBuf },
+
+    #[error("model `{id}` was not found on the `{provider}` endpoint `{endpoint}`")]
+    ModelMissing {
+        provider: String,
+        id: String,
+        endpoint: String,
+    },
+
+    #[error("provider `{provider}` requires an `endpoint` to be configured")]
+    ModelEndpointMissing { provider: String },
+
+    #[error("failed to reach the `{provider}` endpoint `{endpoint}`")]
+    ModelEndpoint {
+        provider: String,
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("the `{provider}` endpoint `{endpoint}` returned HTTP {status}")]
+    ModelStatus {
+        provider: String,
+        endpoint: String,
+        status: u16,
+    },
+
+    #[error("unsupported model provider `{provider}`")]
+    ModelProvider { provider: String },
 }
 
 impl Error {
@@ -78,6 +106,23 @@ impl Error {
                 Some("Use a path relative to the config file, for example `prompts/system.md`.".to_string())
             }
             Error::PromptNotUtf8 { .. } => Some("Re-save the file as UTF-8.".to_string()),
+            Error::ModelMissing { provider, id, .. } if provider == "ollama" => {
+                Some(format!("Pull the model with `ollama pull {id}`, or correct `[model].id`."))
+            }
+            Error::ModelMissing { .. } => None,
+            Error::ModelEndpointMissing { .. } => {
+                Some("Add `endpoint = \"http://localhost:11434\"` to the `[model]` section.".to_string())
+            }
+            Error::ModelEndpoint { provider, .. } if provider == "ollama" => {
+                Some("Check that the Ollama server is running (`ollama serve`).".to_string())
+            }
+            Error::ModelEndpoint { .. } => None,
+            Error::ModelStatus { .. } => {
+                Some("Run `ollama list` to confirm the model server is healthy.".to_string())
+            }
+            Error::ModelProvider { .. } => Some(
+                "Providers supported in this version: `ollama`, `openai-compatible`.".to_string(),
+            ),
         }
     }
 }

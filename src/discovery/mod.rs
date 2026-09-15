@@ -2,6 +2,7 @@
 
 //! Dependency discovery. All I/O lives here; everything downstream is pure.
 
+pub mod model;
 pub mod prompts;
 
 use crate::manifest::Dependency;
