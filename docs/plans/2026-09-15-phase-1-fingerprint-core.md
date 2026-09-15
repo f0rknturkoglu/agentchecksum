@@ -200,7 +200,10 @@ pub mod digest;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// The project rule `rs-result-type` mandates the defaulted-parameter form.
+/// `Result<T>` still resolves to `std::result::Result<T, Error>`, so callers see
+/// the interface the plan specifies.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -377,32 +380,64 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Field declaration order is fixed by the type, so this value reaches the
+    /// serializer as `z, a` no matter how `serde_json` backs its maps. A
+    /// `json!({...})` literal cannot test key sorting: without the
+    /// `preserve_order` feature a serde_json map is a BTreeMap, so the literal is
+    /// already sorted and `to_vec(&a) == to_vec(&b)` degenerates to `f(x) == f(x)`.
+    #[derive(serde::Serialize)]
+    struct OutOfOrder {
+        z: u8,
+        a: u8,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Inner {
+        y: u8,
+        b: u8,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Outer {
+        z: u8,
+        a: Inner,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Nested {
+        list: Vec<u8>,
+    }
+
     #[test]
-    fn object_key_order_does_not_affect_canonical_bytes() {
-        let a = json!({ "b": 1, "a": 2 });
-        let b = json!({ "a": 2, "b": 1 });
-        assert_eq!(to_vec(&a).unwrap(), to_vec(&b).unwrap());
+    fn object_keys_are_sorted_into_canonical_order() {
+        let value = OutOfOrder { z: 1, a: 2 };
         assert_eq!(
-            String::from_utf8(to_vec(&a).unwrap()).unwrap(),
-            r#"{"a":2,"b":1}"#
+            String::from_utf8(to_vec(&value).unwrap()).unwrap(),
+            r#"{"a":2,"z":1}"#
         );
     }
 
     #[test]
     fn nested_object_keys_are_sorted_recursively() {
-        let value = json!({ "outer": { "z": 1, "a": { "y": 1, "b": 2 } } });
+        let value = Outer {
+            z: 1,
+            a: Inner { y: 1, b: 2 },
+        };
         assert_eq!(
             String::from_utf8(to_vec(&value).unwrap()).unwrap(),
-            r#"{"outer":{"a":{"b":2,"y":1},"z":1}}"#
+            r#"{"a":{"b":2,"y":1},"z":1}"#
         );
     }
 
     #[test]
-    fn whitespace_in_the_source_text_cannot_influence_the_digest() {
-        let compact: serde_json::Value = serde_json::from_str(r#"{"a":[1,2,3]}"#).unwrap();
-        let spaced: serde_json::Value =
-            serde_json::from_str("{\n  \"a\": [ 1, 2,\n 3 ]\n}").unwrap();
-        assert_eq!(to_vec(&compact).unwrap(), to_vec(&spaced).unwrap());
+    fn canonical_output_carries_no_insignificant_whitespace() {
+        let value = Nested {
+            list: vec![1, 2, 3],
+        };
+        assert_eq!(
+            String::from_utf8(to_vec(&value).unwrap()).unwrap(),
+            r#"{"list":[1,2,3]}"#
+        );
     }
 
     #[test]
@@ -453,8 +488,9 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_change_changes_the_shape() {
-        assert_ne!(shape_text("Be concise."), shape_text("Be thorough."));
+    fn shape_collapses_interior_whitespace_while_content_keeps_it() {
+        assert_eq!(shape_text("a\n\nb"), "a b");
+        assert_eq!(normalize_text("a\n\nb"), "a\n\nb");
     }
 }
 ```
@@ -518,11 +554,16 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 //! Text normalization for prompts and tool descriptions.
 //!
-//! Two different normalizations are needed. `normalize_text` removes
-//! differences that no human would call a change, and is what gets hashed.
-//! `shape_text` additionally collapses interior whitespace, and exists only so
-//! a formatting-only edit can be told apart from a semantic one without asking
-//! a model.
+//! Two different normalizations are needed.
+//!
+//! `normalize_text` is what gets hashed. It removes the byte-level differences a
+//! human would not call a change: a leading BOM, line endings, trailing
+//! whitespace on each line, and surrounding blank lines. It deliberately keeps
+//! interior whitespace runs.
+//!
+//! `shape_text` additionally collapses every whitespace run to a single space. It
+//! exists only so that a formatting-only edit can be told apart from a semantic
+//! one without asking a model.
 
 /// Strip a BOM and normalize line endings.
 fn unify(raw: &str) -> String {
@@ -864,6 +905,21 @@ git commit -m "Add schema-aware semantic normalization rules"
 **Design note — strictness and scope.** Config parsing is strict (`deny_unknown_fields`) so a typo like `[modell]` is an
 error instead of silently ignored configuration. The structs cover the *whole* documented config surface, including
 sections later phases consume, so the config in spec §5 parses today. That is typed config surface, not dead code.
+
+**Post-implementation note (Task 4 shipped as commit 173ee17).** The code blocks below are the task's original
+specification. Three things changed during execution, all ruled in the SDD ledger:
+
+1. `normalize_rel_path` is defined **in this task**, in `src/config.rs`, not in the discovery module. Task 4's review
+   found that duplicate-prompt detection keyed on the raw path while the dependency id is normalized, so
+   `prompts/system.md` and `./prompts/system.md` both passed validation and the lockfile would have silently kept one.
+   Duplicate detection now normalizes every declaration before keying the set, which also rejects absolute paths, `..`,
+   and backslashes at config-validation time. Task 6 imports the function.
+2. The two typo tests were replaced. The originals mutated `[agent]` → `[agentt]` and `name = ` → `naem = `, which
+   deletes a *required* field, so they were rejected for "missing field" and passed with or without
+   `deny_unknown_fields` — §14.1's guarantee was untested. The replacements add an unknown key beside a known one and
+   append an unknown table, so only the unknown-key rejection can make them fail.
+3. `validate` also rejects transport-incompatible MCP fields (`url` on a stdio server; `command`/`args`/`env` on a
+   streamable-http server) rather than silently discarding them, and `Config::root_for` gained tests.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1429,8 +1485,46 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_dependency_set_still_produces_a_stable_checksum() {
-        assert_eq!(agent_checksum(&[]).unwrap(), agent_checksum(&[]).unwrap());
+    fn the_empty_dependency_set_produces_the_documented_payload_shape() {
+        // Pinned by value rather than compared with itself: the payload shape is
+        // the committed `ac1` contract, and empty `deps` canonicalizes to
+        // `{"deps":[]}`.
+        let expected = Digest::sha256(b"{\"deps\":[]}");
+        assert_eq!(
+            agent_checksum(&[]).unwrap().as_str(),
+            format!("ac1:{}", expected.hex())
+        );
+    }
+
+    #[test]
+    fn the_aggregate_payload_shape_is_the_documented_contract() {
+        let dependency = dep(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]);
+        let expected = Digest::sha256(
+            format!(
+                "{{\"deps\":[[\"prompt\",\"prompt:a.md\",\"{}\"]]}}",
+                dependency.digest().unwrap().as_str()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            agent_checksum(std::slice::from_ref(&dependency))
+                .unwrap()
+                .as_str(),
+            format!("ac1:{}", expected.hex())
+        );
+    }
+
+    #[test]
+    fn the_aggregate_is_order_independent_even_for_duplicate_ids() {
+        // Upstream validation rejects duplicate ids; the aggregate defends the
+        // invariant anyway, so a duplicate cannot make the checksum depend on
+        // discovery order.
+        let v1 = dep(DependencyKind::Tool, "tool:s.t", &[("description", "v1")]);
+        let v2 = dep(DependencyKind::Tool, "tool:s.t", &[("description", "v2")]);
+        assert_eq!(
+            agent_checksum(&[v1.clone(), v2.clone()]).unwrap(),
+            agent_checksum(&[v2, v1]).unwrap()
+        );
     }
 }
 ```
@@ -1570,20 +1664,34 @@ pub fn dep_digest(facets: &BTreeMap<String, Facet>) -> Result<Digest> {
     Ok(Digest::sha256(&canonical::to_vec(&payload)?))
 }
 
-/// SHA-256 over the canonical form of the `(kind, id, dep_digest)` list, after
-/// sorting by `(kind, id)`. The sort is what makes the aggregate independent of
-/// discovery order; nothing downstream depends on iteration order.
+/// SHA-256 over the canonical form of `{"deps": [[kind, id, dep_digest], ...]}`,
+/// after sorting by `(kind, id, dep_digest)`.
+///
+/// The sort is what makes the aggregate independent of discovery order. The
+/// digest is part of the sort key so that two dependencies sharing a `(kind, id)`
+/// still aggregate deterministically: upstream validation rejects that case, and
+/// including it means the aggregate defends the invariant rather than relying on
+/// a check that lives somewhere else.
 pub fn agent_checksum(dependencies: &[Dependency]) -> Result<AgentChecksum> {
-    let mut sorted: Vec<&Dependency> = dependencies.iter().collect();
-    sorted.sort_by(|a, b| (a.kind, a.id.as_str()).cmp(&(b.kind, b.id.as_str())));
-
-    let mut entries: Vec<(DependencyKind, &str, Digest)> = Vec::with_capacity(sorted.len());
-    for dependency in sorted {
-        entries.push((dependency.kind, dependency.id.as_str(), dependency.digest()?));
+    let mut entries: Vec<(DependencyKind, String, Digest)> = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        entries.push((
+            dependency.kind,
+            dependency.id.clone(),
+            dependency.digest()?,
+        ));
     }
+    entries.sort();
 
-    let digest = Digest::sha256(&canonical::to_vec(&entries)?);
+    let digest = Digest::sha256(&canonical::to_vec(&Aggregate { deps: &entries })?);
     Ok(AgentChecksum::from_digest(&digest))
+}
+
+/// The aggregate payload shape is the committed `ac1` contract (design spec §8.1):
+/// `{"deps": [[kind, id, dep_digest], ...]}`.
+#[derive(Serialize)]
+struct Aggregate<'a> {
+    deps: &'a [(DependencyKind, String, Digest)],
 }
 ```
 
@@ -1662,34 +1770,10 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn a_leading_dot_slash_is_removed_from_the_id() {
-        assert_eq!(normalize_rel_path("./prompts/a.md").unwrap(), "prompts/a.md");
-    }
-
-    #[test]
-    fn an_absolute_path_is_rejected() {
-        assert!(normalize_rel_path("/etc/passwd").is_err());
-    }
-
-    #[test]
-    fn a_parent_directory_component_is_rejected() {
-        assert!(normalize_rel_path("../outside.md").is_err());
-        assert!(normalize_rel_path("prompts/../../outside.md").is_err());
-    }
-
-    #[test]
-    fn a_backslash_is_rejected_because_the_id_must_mean_the_same_thing_on_every_platform() {
-        // A backslash is a legal filename character on Unix and a path separator
-        // on Windows, so an id containing one would not round-trip.
-        assert!(normalize_rel_path("prompts\\a.md").is_err());
-    }
-
-    #[test]
-    fn an_empty_path_is_rejected() {
-        assert!(normalize_rel_path("").is_err());
-        assert!(normalize_rel_path(".").is_err());
-    }
+    // Path normalization is owned by `crate::config`: duplicate declared paths must
+    // be detected on the normalized form, so the single implementation lives where
+    // validation happens. Its tests are in src/config.rs, and `discover` imports
+    // the function.
 
     #[test]
     fn a_prompt_produces_content_and_shape_facets_and_a_stable_id() {
@@ -1703,6 +1787,13 @@ mod tests {
         assert_eq!(deps[0].kind, DependencyKind::Prompt);
         assert!(deps[0].facets.contains_key("content"));
         assert!(deps[0].facets.contains_key("shape"));
+        assert!(
+            deps[0]
+                .facets
+                .values()
+                .all(|facet| facet.normalized.is_none()),
+            "repo-local prompt facets are digest-only: git already versions the content"
+        );
         assert_eq!(deps[0].source, None);
     }
 
@@ -1782,14 +1873,12 @@ mod tests {
 Run: `cargo test --lib discovery`
 Expected: FAIL — `cannot find function discover`.
 
-- [ ] **Step 3: Add the path and encoding error variants**
+- [ ] **Step 3: Add the encoding error variant**
 
-In `src/error.rs`, add:
+`Error::PromptPath` already exists — it was added in Task 4 along with
+`normalize_rel_path`. In `src/error.rs`, add:
 
 ```rust
-    #[error("prompt path `{path}` must be relative, must not contain `..`, and must not contain a backslash")]
-    PromptPath { path: String },
-
     #[error("prompt `{path}` is not valid UTF-8")]
     PromptNotUtf8 { path: PathBuf },
 ```
@@ -1797,12 +1886,7 @@ In `src/error.rs`, add:
 and extend `suggestion()`:
 
 ```rust
-            Error::PromptPath { .. } => Some(
-                "Use a path relative to the config file, for example `prompts/system.md`.".to_string(),
-            ),
-            Error::PromptNotUtf8 { .. } => {
-                Some("Re-save the file as UTF-8.".to_string())
-            }
+            Error::PromptNotUtf8 { .. } => Some("Re-save the file as UTF-8.".to_string()),
 ```
 
 - [ ] **Step 4: Write the implementation**
@@ -1817,59 +1901,16 @@ and extend `suggestion()`:
 //! lockfile would be a second source of truth.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, normalize_rel_path};
 use crate::error::{Error, Result};
 use crate::fingerprint::normalize;
 use crate::manifest::{Dependency, DependencyKind, Digest, Facet};
 
-/// Normalize a config-declared path into a stable, project-relative,
-/// forward-slash identity.
-///
-/// Absolute paths, `..`, and backslashes are rejected: an absolute path would
-/// make the lockfile depend on the machine it was produced on, and a backslash is
-/// a path separator on Windows but an ordinary filename character on Unix, so an
-/// id containing one would not mean the same thing everywhere.
-pub fn normalize_rel_path(path: &str) -> Result<String> {
-    if path.contains('\\') {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    let mut parts: Vec<&str> = Vec::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(part) => {
-                parts.push(part.to_str().ok_or_else(|| Error::PromptPath {
-                    path: path.to_string(),
-                })?);
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::PromptPath {
-                    path: path.to_string(),
-                });
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        return Err(Error::PromptPath {
-            path: path.to_string(),
-        });
-    }
-
-    Ok(parts.join("/"))
-}
+// `normalize_rel_path` lives in `crate::config`: duplicate declared paths must be
+// detected on the normalized form during config validation, so the single
+// implementation belongs where validation happens.
 
 /// Content and shape facets for a text file. `content` is what a human would
 /// call the document; `shape` ignores interior whitespace so a formatting-only
@@ -1976,6 +2017,28 @@ git commit -m "Add prompt discovery with project-relative identities"
 
 The split is deliberate: parsing is a pure function over a fetched struct, so fingerprint logic is tested without HTTP,
 and HTTP is tested against a `wiremock` server separately. No mocking framework and no trait are introduced for this.
+
+**Post-implementation note (Task 7 shipped as commit b2d216c, corrected in the following fix round).** The code blocks
+below are the task's original specification. Two ruled changes were made during execution; both are recorded in the SDD
+ledger:
+
+1. **The `params` facet captures both sources of effective inference parameters.** The block below hashes only the
+   provider-reported `parameters` text, which contradicted design spec §5 ("`params` is hashed; it is behavior-relevant
+   by definition") and §11.2 (the probe runner sets `seed` and `temperature` from `[model].params`). As shipped, the
+   facet payload is `{"configured": <[model].params>, "reported": <parsed Ollama text>}`, with either key omitted when
+   its source is empty and the facet absent when both are. Without this, changing `temperature` in `agentchecksum.toml`
+   produced no dependency change at all — an invisible behavior change, the exact class this product exists to catch.
+   The spec's Model facet row was clarified to match.
+2. **The metadata-exclusion test was made load-bearing.** `timestamps_sizes_and_licenses_never_reach_the_dependency`
+   originally built both servers' responses from one fixture with hard-coded identical `modified_at`/`size`/`license`,
+   so the two responses were byte-identical and the assertion degenerated to `f(x) == f(x)` — mutation-testing showed a
+   leaky implementation still passed. The fixture is now parameterized so the second server returns distinct
+   non-behavioral values, which is the implementation the test exists to reject.
+3. **`identity`, `params`, and `capabilities` record their normalized payload; `template` stays digest-only.** Spec §6.3
+   records the normalized form for external un-versioned sources, and spec §8.3's risk table names specific values
+   ("model lost the `tools` capability" is CRITICAL), which a digest alone cannot report. Each of those three payloads is
+   small. `template` is large and its diff value is low — "the chat template changed" is the whole message — so it
+   remains digest-only. The code carries this rule as a comment.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2765,6 +2828,32 @@ git commit -m "Add model discovery with quantization, template, and capability f
   `cli::cmd::snapshot::run(&Path, &Path, &Path) -> Result<(Lockfile, Discovery)>`,
   `report::human::snapshot(&Lockfile, &Discovery) -> String`,
   `report::json::snapshot(&Lockfile, &Discovery) -> Result<String>`.
+
+**Post-implementation note (Task 8 shipped as commits 87f797b, 9d11c00, 53c360c, 3daecb6).** The code blocks below are
+the task's original specification. Five changes were ruled during execution; all are recorded in the SDD ledger:
+
+1. **The version gate moved before the full parse.** `Lockfile::read` originally deserialized the whole document and
+   only then compared `lock_version`, so a newer lockfile whose structure had also changed was reported as
+   `LockParse` — "not valid JSON", which is false — with the suggestion "Regenerate it with `agentchecksum snapshot`".
+   A shared module-level `VersionProbe` now peeks `lock_version` first and is the single version gate.
+2. **`snapshot` refuses to overwrite a newer lockfile.** Spec §14.1 requires "refuse to compare or extend, exit 3" for
+   a higher `lock_version`, and the write path honoured none of it: run against a v2 lockfile the command exited 0 and
+   replaced it with a v1 one. `Lockfile::ensure_writable` now runs at the top of `snapshot::run`, before `Config::load`
+   and discovery, so the refusal cannot be masked by a config or network error and nothing can write first. A current
+   or unrecognizable lockfile is still regenerated, which is what `snapshot` is for.
+3. **`the_lockfile_checksum_is_wired_from_the_dependency_inputs` was added.** Nothing pinned that
+   `Lockfile::from_dependencies` takes its checksum from the dependency inputs; a constant checksum, or one derived
+   from the lockfile's own serialization, passed the whole suite.
+4. **The unknown-field tolerance test now injects at every level** (top level, `generator`, `LockedDependency`,
+   `Facet`) with a guard proving the injections reach the written bytes, instead of one string replacement at the top
+   level.
+5. **Two test names were corrected to match what they prove**: `reformatting_the_lockfile_round_trips_to_an_equal_lockfile`
+   (a struct round-trip, not checksum independence) and `changing_a_prompt_changes_the_agent_checksum` (now compares the
+   checksum field rather than whole lockfile bytes, which a constant checksum would have satisfied).
+
+Deferred to the final review, not fixed here: `init`'s test asserts only the exit code rather than that the existing
+config is untouched; `--format json` is ignored by `init`; and `report::human::snapshot`'s warning and plural branches
+have no direct test.
 
 - [ ] **Step 1: Add the lockfile and composition error variants**
 

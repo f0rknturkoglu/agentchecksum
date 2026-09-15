@@ -8,5 +8,8 @@
 .agentchecksum/runs/
 .agentchecksum/cache/
 
+# Tooling scratch space (plan ledgers, briefs, review packages). Never committed.
+.superpowers/
+
 # macOS
 .DS_Store

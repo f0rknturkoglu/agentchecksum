@@ -245,8 +245,10 @@ agentchecksum.lock            committed — the dependency baseline
 ```
 
 `agentchecksum.lock` is JSON: the canonical-JSON story, and future SBOM/JSON-Schema export, stay in
-one format. It is written with deterministic ordering (dependency ids sorted by `(kind, id)`),
-2-space indentation, and a trailing newline.
+one format. It is written with deterministic ordering (keys sorted by dependency id; ids are kind-prefixed,
+so dependencies group by kind), 2-space indentation, and a trailing newline. The aggregate's own sort is by
+`(kind, id)` (§8.1) — the two orders differ, because enumeration order and id-prefix order are not the same,
+and neither is load-bearing beyond being deterministic.
 
 ```jsonc
 {
@@ -256,17 +258,21 @@ one format. It is written with deterministic ordering (dependency ids sorted by 
   "dependencies": {
     "model:ollama/qwen3:8b": {
       "kind": "model",
+      // External, un-versioned source → `normalized` is recorded alongside each
+      // facet's digest, so a payload and its digest cannot drift apart. The facets
+      // whose values the risk table names record a payload; `template` does not,
+      // being large with little diff value.
       "facets": {
-        "identity":     { "digest": "sha256:…" },
-        "params":       { "digest": "sha256:…" },
+        "identity": {
+          "digest": "sha256:…",
+          "normalized": { "family": "qwen3", "parameter_size": "8.0B",
+                          "quantization_level": "Q8_0", "digest": "sha256:…" }
+        },
+        "params":       { "digest": "sha256:…",
+                          "normalized": { "configured": { "temperature": 0.0 },
+                                          "reported": { "num_ctx": ["2048"] } } },
         "template":     { "digest": "sha256:…" },
-        "capabilities": { "digest": "sha256:…" }
-      },
-      // External, un-versioned source → its normalized form is recorded.
-      "normalized": {
-        "identity": { "family": "qwen3", "parameter_size": "8.0B",
-                      "quantization_level": "Q8_0", "digest": "sha256:…" },
-        "capabilities": ["completion", "tools"]
+        "capabilities": { "digest": "sha256:…", "normalized": ["completion", "tools"] }
       }
     },
     "prompt:prompts/system.md": {
@@ -279,28 +285,27 @@ one format. It is written with deterministic ordering (dependency ids sorted by 
     },
     "mcp:github": {
       "kind": "mcp_server",
-      "facets": { "identity": { "digest": "sha256:…" } },
-      "normalized": {
-        "era": "modern",
-        "protocol_version": "2026-07-28",
-        "supported_versions": ["2026-07-28"],
-        "server_info": { "name": "github-mcp", "version": "1.4.0" }
+      "facets": {
+        "identity": {
+          "digest": "sha256:…",
+          "normalized": { "era": "modern",
+                          "protocol_version": "2026-07-28",
+                          "supported_versions": ["2026-07-28"],
+                          "server_info": { "name": "github-mcp", "version": "1.4.0" } }
+        }
       }
     },
     "tool:github.search_repositories": {
       "kind": "tool",
       "server": "github",
-      "facets": {
-        "input_schema":  { "digest": "sha256:…" },
-        "output_schema": { "digest": "sha256:…" },
-        "description":   { "digest": "sha256:…", "shape": "sha256:…" },
-        "capabilities":  { "digest": "sha256:…" }
-      },
       // External, un-versioned source → normalized form recorded so that a later
       // `diff --from old.lock` can explain WHAT changed, not just THAT it changed.
-      "normalized": {
-        "description": "Search repositories…",
-        "input_schema": { /* canonical JSON */ }
+      "facets": {
+        "input_schema":  { "digest": "sha256:…", "normalized": { /* canonical JSON */ } },
+        "output_schema": { "digest": "sha256:…" },
+        "description":   { "digest": "sha256:…", "shape": "sha256:…",
+                           "normalized": "Search repositories…" },
+        "capabilities":  { "digest": "sha256:…" }
       }
     }
   }
@@ -367,7 +372,7 @@ A short, documented, individually tested rule list:
 | 1 | Sort `required` arrays | Order is meaningless in JSON Schema |
 | 2 | Sort `enum` arrays | Order is meaningless for validation |
 | 3 | Resolve a missing `$schema` to the 2020-12 default | The MCP specification defaults to 2020-12 when `$schema` is absent |
-| 4 | Text: CRLF→LF, strip trailing whitespace per line, strip BOM, trim outer whitespace | Invisible differences |
+| 4 | Text: CRLF→LF, strip trailing whitespace per line, strip BOM, strip leading and trailing blank lines | Invisible differences |
 
 ### 7.4 Deliberately **not** normalized
 
@@ -384,7 +389,7 @@ equivalence, not a judgement about importance.
 
 | Kind | Facets |
 |---|---|
-| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size), `params` (behavior-relevant inference parameters, parsed from Ollama's `parameters` text), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
+| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size), `params` (effective inference parameters: `configured` from `[model].params`, `reported` from Ollama's `parameters` text), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
 | `Prompt` | `content`, `shape` |
 | `Tool` | `input_schema`, `output_schema`, `description` (+ `shape`), `capabilities` |
 | `McpServer` | `identity` (era, protocol version, supported versions, server info) |
