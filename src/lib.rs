@@ -6,3 +6,4 @@
 pub mod config;
 pub mod error;
 pub mod fingerprint;
+pub mod manifest;
