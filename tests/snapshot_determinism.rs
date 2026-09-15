@@ -126,14 +126,80 @@ async fn a_lockfile_with_a_newer_version_is_refused() {
 async fn unknown_fields_inside_a_known_lock_version_are_tolerated() {
     let dir = tempfile::tempdir().unwrap();
     write_project(dir.path());
-    let extended = String::from_utf8(lock_bytes(dir.path()).await)
+
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&lock_bytes(dir.path()).await).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert("future_top_level".to_string(), serde_json::json!("ignored"));
+    object
+        .get_mut("generator")
+        .and_then(|value| value.as_object_mut())
         .unwrap()
-        .replace(
-            "\"lock_version\": 1",
-            "\"lock_version\": 1,\n  \"future_field\": \"ignored\"",
+        .insert("future_generator_field".to_string(), serde_json::json!(1));
+
+    {
+        let dependencies = object
+            .get_mut("dependencies")
+            .and_then(|value| value.as_object_mut())
+            .unwrap();
+        let (_, dependency) = dependencies.iter_mut().next().unwrap();
+        let dependency = dependency.as_object_mut().unwrap();
+        dependency.insert(
+            "future_dependency_field".to_string(),
+            serde_json::json!(true),
         );
+
+        let facets = dependency
+            .get_mut("facets")
+            .and_then(|value| value.as_object_mut())
+            .unwrap();
+        for facet in facets.values_mut() {
+            facet
+                .as_object_mut()
+                .unwrap()
+                .insert("future_facet_field".to_string(), serde_json::json!("x"));
+        }
+    }
+
+    // Guard against the injection silently doing nothing: all four unknown
+    // fields must be in the bytes we are about to hand to `read`.
+    let text = serde_json::to_string(&value).unwrap();
+    for injected in [
+        "future_top_level",
+        "future_generator_field",
+        "future_dependency_field",
+        "future_facet_field",
+    ] {
+        assert!(
+            text.contains(injected),
+            "injection missing `{injected}`:\n{text}"
+        );
+    }
+
     let path = dir.path().join("agentchecksum.lock");
-    std::fs::write(&path, extended).unwrap();
+    std::fs::write(&path, text).unwrap();
 
     assert!(Lockfile::read(&path).is_ok());
+}
+
+#[tokio::test]
+async fn the_lockfile_checksum_is_wired_from_the_dependency_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path());
+
+    let config = Config::load(&dir.path().join("agentchecksum.toml")).unwrap();
+    let discovery = discovery::run(&config, dir.path()).await.unwrap();
+
+    // The lockfile's checksum must be the aggregate over the dependency
+    // inputs, not something derived from the lockfile's own serialization.
+    // Comparing two independently computed values is what pins that wiring.
+    assert_eq!(
+        Lockfile::from_dependencies(&discovery.dependencies)
+            .unwrap()
+            .agent_checksum
+            .as_str(),
+        agentchecksum::manifest::agent_checksum(&discovery.dependencies)
+            .unwrap()
+            .as_str()
+    );
 }
