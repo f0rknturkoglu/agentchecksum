@@ -117,6 +117,29 @@ fn snapshot_json_output_is_valid_json_on_stdout() {
 }
 
 #[test]
+fn snapshot_exits_3_and_leaves_a_newer_lockfile_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path());
+    write_config(dir.path());
+
+    let path = dir.path().join("agentchecksum.lock");
+    let future = r#"{"lock_version": 2, "schema": "future"}"#;
+    std::fs::write(&path, future).unwrap();
+
+    let output = Command::cargo_bin("agentchecksum")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("snapshot")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Upgrade agentchecksum"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), future);
+}
+
+#[test]
 fn a_missing_prompt_file_exits_with_code_3_and_suggests_a_fix() {
     let dir = tempfile::tempdir().unwrap();
     write_config(dir.path());

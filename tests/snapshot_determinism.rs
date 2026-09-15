@@ -216,6 +216,55 @@ async fn unknown_fields_inside_a_known_lock_version_are_tolerated() {
 }
 
 #[tokio::test]
+async fn snapshot_refuses_to_overwrite_a_newer_lockfile() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path());
+
+    let path = dir.path().join("agentchecksum.lock");
+    let future = r#"{"lock_version": 2, "schema": "future"}"#;
+    std::fs::write(&path, future).unwrap();
+
+    let err = Lockfile::ensure_writable(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            agentchecksum::error::Error::LockVersion { found: 2, .. }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        future,
+        "the refusal must leave the file untouched"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_overwrites_a_current_or_unrecognized_lockfile() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path());
+
+    let path = dir.path().join("agentchecksum.lock");
+    std::fs::write(
+        &path,
+        r#"{"lock_version": 1, "agent_checksum": "ac1:stale"}"#,
+    )
+    .unwrap();
+    assert!(
+        Lockfile::ensure_writable(&path).is_ok(),
+        "a v1 lock is ours to replace"
+    );
+
+    std::fs::write(&path, "this is not json at all").unwrap();
+    assert!(
+        Lockfile::ensure_writable(&path).is_ok(),
+        "an unrecognizable file is regenerated, which is what snapshot is for"
+    );
+
+    assert!(Lockfile::ensure_writable(&dir.path().join("absent.lock")).is_ok());
+}
+
+#[tokio::test]
 async fn the_lockfile_checksum_is_wired_from_the_dependency_inputs() {
     let dir = tempfile::tempdir().unwrap();
     write_project(dir.path());

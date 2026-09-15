@@ -18,6 +18,13 @@ use crate::manifest::{AgentChecksum, Dependency, DependencyKind, Facet, agent_ch
 
 pub const SUPPORTED_LOCK_VERSION: u32 = 1;
 
+/// Peeked before the full parse so a newer lockfile is refused as a version
+/// problem rather than reported as a parse error.
+#[derive(Deserialize)]
+struct VersionProbe {
+    lock_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lockfile {
     pub lock_version: u32,
@@ -89,11 +96,6 @@ impl Lockfile {
             source,
         })?;
 
-        #[derive(Deserialize)]
-        struct VersionProbe {
-            lock_version: u32,
-        }
-
         // Peek the version before the full parse. A newer lockfile whose structure
         // also changed would otherwise be reported as a parse error, and the
         // parse-error suggestion invites the user to regenerate a file that is
@@ -112,5 +114,34 @@ impl Lockfile {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    /// Refuse to overwrite a lockfile that a newer binary wrote.
+    ///
+    /// `snapshot` regenerates the lockfile from live state, so writing over a
+    /// newer format would silently discard fields this build cannot reproduce.
+    /// A file this build cannot recognize as our format at all is left to
+    /// `snapshot` to regenerate, which is what the user asked for.
+    pub fn ensure_writable(path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        if let Ok(probe) = serde_json::from_str::<VersionProbe>(&text)
+            && probe.lock_version > SUPPORTED_LOCK_VERSION
+        {
+            return Err(Error::LockVersion {
+                path: path.to_path_buf(),
+                found: probe.lock_version,
+                supported: SUPPORTED_LOCK_VERSION,
+            });
+        }
+
+        Ok(())
     }
 }
