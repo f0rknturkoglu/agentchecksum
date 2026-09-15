@@ -29,6 +29,22 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("invalid configuration in `{path}`")]
+    ConfigParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("invalid configuration: {reason}")]
+    ConfigInvalid { reason: String },
+
+    #[error("unsupported config version {found}; this build supports version {supported}")]
+    ConfigVersion { found: u32, supported: u32 },
+
+    #[error("dependency id collision: `{id}` is declared more than once")]
+    DependencyCollision { id: String },
 }
 
 impl Error {
@@ -41,6 +57,15 @@ impl Error {
                 "This is a bug in agentchecksum; please report it with the input that triggered it."
                     .to_string(),
             ),
+            Error::ConfigParse { .. } => Some(
+                "Fix the reported key. Unknown keys are rejected so a typo cannot be silently ignored."
+                    .to_string(),
+            ),
+            Error::ConfigInvalid { .. } => None,
+            Error::ConfigVersion { .. } => {
+                Some("Upgrade agentchecksum, or set `version` to a supported value.".to_string())
+            }
+            Error::DependencyCollision { .. } => None,
         }
     }
 }
