@@ -1334,4 +1334,36 @@ mod tests {
         assert_eq!(changes[0].risk, RiskLevel::High);
         assert_eq!(changes[0].details.len(), 2, "{:?}", changes[0].details);
     }
+
+    #[test]
+    fn a_permissive_form_change_claims_no_direction_but_is_not_silent_either() {
+        // `{}` and an absent key mean the same thing, so the analyzer asserts no
+        // direction — that is the false alarm this pass removes. The recorded
+        // digests still differ, though, and a fingerprint that moved without an
+        // explanation must not be reported as nothing happening: the facet takes the
+        // generic floor.
+        //
+        // Deliberate, and worth knowing: a semantically null edit like this is
+        // loud. The alternative — inventing an "insignificant difference" verdict
+        // that drops the facet — would buy quiet at the price of the one invariant
+        // this layer exists to keep.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object", "properties": {}, "additionalProperties": {}
+            }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert!(
+            changes[0].details.is_empty(),
+            "no direction is claimed: {:?}",
+            changes[0].details
+        );
+    }
 }
