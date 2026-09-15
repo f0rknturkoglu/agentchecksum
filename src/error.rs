@@ -50,6 +50,9 @@ pub enum Error {
         "prompt path `{path}` must be relative, must not contain `..`, and must not contain a backslash"
     )]
     PromptPath { path: String },
+
+    #[error("prompt `{path}` is not valid UTF-8")]
+    PromptNotUtf8 { path: PathBuf },
 }
 
 impl Error {
@@ -74,6 +77,7 @@ impl Error {
             Error::PromptPath { .. } => {
                 Some("Use a path relative to the config file, for example `prompts/system.md`.".to_string())
             }
+            Error::PromptNotUtf8 { .. } => Some("Re-save the file as UTF-8.".to_string()),
         }
     }
 }

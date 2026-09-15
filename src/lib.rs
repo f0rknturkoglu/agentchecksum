@@ -4,6 +4,7 @@
 //! regression gate for AI agents.
 
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod fingerprint;
 pub mod manifest;
