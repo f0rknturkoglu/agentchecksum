@@ -45,6 +45,11 @@ pub enum Error {
 
     #[error("dependency id collision: `{id}` is declared more than once")]
     DependencyCollision { id: String },
+
+    #[error(
+        "prompt path `{path}` must be relative, must not contain `..`, and must not contain a backslash"
+    )]
+    PromptPath { path: String },
 }
 
 impl Error {
@@ -66,6 +71,9 @@ impl Error {
                 Some("Upgrade agentchecksum, or set `version` to a supported value.".to_string())
             }
             Error::DependencyCollision { .. } => None,
+            Error::PromptPath { .. } => {
+                Some("Use a path relative to the config file, for example `prompts/system.md`.".to_string())
+            }
         }
     }
 }

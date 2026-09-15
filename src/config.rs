@@ -6,7 +6,7 @@
 //! something other than what the user believes they declared.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -166,11 +166,16 @@ impl Config {
             });
         }
 
-        let mut prompt_ids: BTreeSet<&str> = BTreeSet::new();
+        let mut prompt_ids: BTreeSet<String> = BTreeSet::new();
         for prompt in &self.prompts {
-            if !prompt_ids.insert(prompt.path.as_str()) {
+            // Keyed on the normalized path, because that is what becomes the
+            // dependency id: two declarations differing only in spelling
+            // (`prompts/a.md` and `./prompts/a.md`) would otherwise both pass and
+            // the lockfile would silently keep just one.
+            let normalized = normalize_rel_path(&prompt.path)?;
+            if !prompt_ids.insert(normalized.clone()) {
                 return Err(Error::DependencyCollision {
-                    id: format!("prompt:{}", prompt.path),
+                    id: format!("prompt:{normalized}"),
                 });
             }
         }
@@ -194,10 +199,42 @@ impl Config {
                         ),
                     });
                 }
+                Transport::Stdio if server.url.is_some() => {
+                    return Err(Error::ConfigInvalid {
+                        reason: format!(
+                            "MCP server `{}` uses the stdio transport but also declares `url`",
+                            server.name
+                        ),
+                    });
+                }
                 Transport::StreamableHttp if server.url.is_none() => {
                     return Err(Error::ConfigInvalid {
                         reason: format!(
                             "MCP server `{}` uses the streamable-http transport but declares no `url`",
+                            server.name
+                        ),
+                    });
+                }
+                Transport::StreamableHttp if server.command.is_some() => {
+                    return Err(Error::ConfigInvalid {
+                        reason: format!(
+                            "MCP server `{}` uses the streamable-http transport but also declares `command`",
+                            server.name
+                        ),
+                    });
+                }
+                Transport::StreamableHttp if !server.args.is_empty() => {
+                    return Err(Error::ConfigInvalid {
+                        reason: format!(
+                            "MCP server `{}` uses the streamable-http transport but also declares `args`",
+                            server.name
+                        ),
+                    });
+                }
+                Transport::StreamableHttp if !server.env.is_empty() => {
+                    return Err(Error::ConfigInvalid {
+                        reason: format!(
+                            "MCP server `{}` uses the streamable-http transport but also declares `env`",
                             server.name
                         ),
                     });
@@ -216,6 +253,53 @@ impl Config {
             .filter(|parent| !parent.as_os_str().is_empty())
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
+}
+
+/// Normalize a config-declared path into a stable, project-relative,
+/// forward-slash identity.
+///
+/// Absolute paths, `..`, and backslashes are rejected: an absolute path would
+/// make the lockfile depend on the machine it was produced on, and a backslash is
+/// a path separator on Windows but an ordinary filename character on Unix, so an
+/// id containing one would not mean the same thing everywhere.
+pub fn normalize_rel_path(path: &str) -> Result<String> {
+    if path.contains('\\') {
+        return Err(Error::PromptPath {
+            path: path.to_string(),
+        });
+    }
+
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Err(Error::PromptPath {
+            path: path.to_string(),
+        });
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => {
+                parts.push(part.to_str().ok_or_else(|| Error::PromptPath {
+                    path: path.to_string(),
+                })?);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::PromptPath {
+                    path: path.to_string(),
+                });
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(Error::PromptPath {
+            path: path.to_string(),
+        });
+    }
+
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -247,15 +331,15 @@ path = "prompts/system.md"
     }
 
     #[test]
-    fn a_typo_in_a_table_name_is_an_error_not_a_silent_ignore() {
-        let text = MINIMAL.replace("[agent]", "[agentt]");
+    fn an_unknown_field_next_to_a_known_one_is_rejected() {
+        let text = MINIMAL.replace("[agent]", "[agent]\nnaem = \"typo\"");
         assert!(parse(&text).is_err(), "unknown fields must be rejected");
     }
 
     #[test]
-    fn a_typo_in_a_field_name_is_an_error() {
-        let text = MINIMAL.replace("name = ", "naem = ");
-        assert!(parse(&text).is_err());
+    fn an_unknown_table_name_is_rejected() {
+        let text = format!("{MINIMAL}\n[modell]\nprovider = \"ollama\"\n");
+        assert!(parse(&text).is_err(), "unknown fields must be rejected");
     }
 
     #[test]
@@ -366,6 +450,70 @@ command = "b"
     }
 
     #[test]
+    fn a_stdio_server_that_also_declares_a_url_is_rejected() {
+        let text = format!(
+            r#"{MINIMAL}
+
+[[mcp.servers]]
+name = "github"
+transport = "stdio"
+command = "npx"
+url = "http://localhost:3000"
+"#
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_http_server_that_also_declares_a_command_is_rejected() {
+        let text = format!(
+            r#"{MINIMAL}
+
+[[mcp.servers]]
+name = "remote"
+transport = "streamable-http"
+url = "http://localhost:3000"
+command = "npx"
+"#
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_http_server_that_also_declares_args_is_rejected() {
+        let text = format!(
+            r#"{MINIMAL}
+
+[[mcp.servers]]
+name = "remote"
+transport = "streamable-http"
+url = "http://localhost:3000"
+args = ["-y"]
+"#
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_http_server_that_also_declares_env_is_rejected() {
+        let text = format!(
+            r#"{MINIMAL}
+
+[[mcp.servers]]
+name = "remote"
+transport = "streamable-http"
+url = "http://localhost:3000"
+env = {{ TOKEN = "x" }}
+"#
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { .. }), "{err:?}");
+    }
+
+    #[test]
     fn duplicate_prompt_paths_are_rejected_because_they_would_collide_in_the_lockfile() {
         let text = format!(
             r#"{MINIMAL}
@@ -376,5 +524,62 @@ path = "prompts/system.md"
         );
         let err = parse(&text).unwrap_err();
         assert!(matches!(err, Error::DependencyCollision { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn paths_that_differ_only_in_spelling_collide() {
+        let text = format!(
+            r#"{MINIMAL}
+
+[[prompts]]
+path = "./prompts/system.md"
+"#
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(matches!(err, Error::DependencyCollision { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn root_for_resolves_against_the_config_files_directory() {
+        assert_eq!(
+            Config::root_for(Path::new("agentchecksum.toml")),
+            Path::new(".")
+        );
+        assert_eq!(
+            Config::root_for(Path::new("/etc/agentchecksum.toml")),
+            Path::new("/etc")
+        );
+    }
+
+    #[test]
+    fn a_leading_current_directory_component_is_normalized_away() {
+        assert_eq!(
+            normalize_rel_path("./prompts/a.md").unwrap(),
+            "prompts/a.md"
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_is_rejected() {
+        let err = normalize_rel_path("/etc/prompts/a.md").unwrap_err();
+        assert!(matches!(err, Error::PromptPath { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_parent_directory_component_is_rejected() {
+        let err = normalize_rel_path("../prompts/a.md").unwrap_err();
+        assert!(matches!(err, Error::PromptPath { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_backslash_is_rejected() {
+        let err = normalize_rel_path("prompts\\a.md").unwrap_err();
+        assert!(matches!(err, Error::PromptPath { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_path_with_no_components_is_rejected() {
+        assert!(normalize_rel_path("").is_err());
+        assert!(normalize_rel_path(".").is_err());
     }
 }
