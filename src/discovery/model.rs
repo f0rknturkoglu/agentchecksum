@@ -157,6 +157,14 @@ pub fn dependency(
 
     let mut facets: BTreeMap<String, Facet> = BTreeMap::new();
 
+    // Which facets record their normalized payload: an external, un-versioned source
+    // records it, so a later `diff` can name WHAT changed rather than only THAT it
+    // changed (design spec §6.3). `identity`, `params`, and `capabilities` all
+    // qualify, and each is small and named by a specific row of the §8.3 risk table
+    // (in particular, naming which capability was lost is the whole point of the
+    // `tools` row). `template` stays digest-only: it is a large payload and its diff
+    // value is low, since "the chat template changed" is the entire message.
+
     match config.provider.as_str() {
         "ollama" => {
             if config.endpoint.is_none() {
@@ -209,7 +217,7 @@ pub fn dependency(
             if !capabilities.is_empty() {
                 let value =
                     serde_json::to_value(&capabilities).map_err(|source| Error::Json { source })?;
-                facets.insert("capabilities".to_string(), facet(&value)?);
+                facets.insert("capabilities".to_string(), recorded_facet(&value)?);
             }
         }
         "openai-compatible" => {
@@ -429,6 +437,13 @@ mod tests {
         assert_ne!(
             baseline.facets["capabilities"].digest,
             after.facets["capabilities"].digest
+        );
+        // A digest can only say that something changed; the risk table's `tools` row
+        // needs the diff to name the capability that was lost, so the normalized
+        // payload is recorded, in the sorted-and-deduped form the facet hashes.
+        assert_eq!(
+            baseline.facets["capabilities"].normalized.clone().unwrap(),
+            serde_json::json!(["completion", "tools"])
         );
     }
 
