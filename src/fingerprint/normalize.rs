@@ -2,11 +2,16 @@
 
 //! Text normalization for prompts and tool descriptions.
 //!
-//! Two different normalizations are needed. `normalize_text` removes
-//! differences that no human would call a change, and is what gets hashed.
-//! `shape_text` additionally collapses interior whitespace, and exists only so
-//! a formatting-only edit can be told apart from a semantic one without asking
-//! a model.
+//! Two different normalizations are needed.
+//!
+//! `normalize_text` is what gets hashed. It removes the byte-level differences a
+//! human would not call a change: a leading BOM, line endings, trailing
+//! whitespace on each line, and surrounding blank lines. It deliberately keeps
+//! interior whitespace runs.
+//!
+//! `shape_text` additionally collapses every whitespace run to a single space. It
+//! exists only so that a formatting-only edit can be told apart from a semantic
+//! one without asking a model.
 
 /// Strip a BOM and normalize line endings.
 fn unify(raw: &str) -> String {
@@ -69,7 +74,8 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_change_changes_the_shape() {
-        assert_ne!(shape_text("Be concise."), shape_text("Be thorough."));
+    fn shape_collapses_interior_whitespace_while_content_keeps_it() {
+        assert_eq!(shape_text("a\n\nb"), "a b");
+        assert_eq!(normalize_text("a\n\nb"), "a\n\nb");
     }
 }
