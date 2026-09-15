@@ -1,0 +1,12 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# AgentChecksum machine-local state.
+# NOTE: .agentchecksum/baseline.json is intentionally committed — CI compares
+# against the behavioral baseline recorded in the repository.
+.agentchecksum/runs/
+.agentchecksum/cache/
+
+# macOS
+.DS_Store
