@@ -123,24 +123,30 @@ pub fn dep_digest(facets: &BTreeMap<String, Facet>) -> Result<Digest> {
     Ok(Digest::sha256(&canonical::to_vec(&payload)?))
 }
 
-/// SHA-256 over the canonical form of the `(kind, id, dep_digest)` list, after
-/// sorting by `(kind, id)`. The sort is what makes the aggregate independent of
-/// discovery order; nothing downstream depends on iteration order.
+/// SHA-256 over the canonical form of `{"deps": [[kind, id, dep_digest], ...]}`,
+/// after sorting by `(kind, id, dep_digest)`.
+///
+/// The sort is what makes the aggregate independent of discovery order. The
+/// digest is part of the sort key so that two dependencies sharing a `(kind, id)`
+/// still aggregate deterministically: upstream validation rejects that case, and
+/// including it means the aggregate defends the invariant rather than relying on
+/// a check that lives somewhere else.
 pub fn agent_checksum(dependencies: &[Dependency]) -> Result<AgentChecksum> {
-    let mut sorted: Vec<&Dependency> = dependencies.iter().collect();
-    sorted.sort_by(|a, b| (a.kind, a.id.as_str()).cmp(&(b.kind, b.id.as_str())));
-
-    let mut entries: Vec<(DependencyKind, &str, Digest)> = Vec::with_capacity(sorted.len());
-    for dependency in sorted {
-        entries.push((
-            dependency.kind,
-            dependency.id.as_str(),
-            dependency.digest()?,
-        ));
+    let mut entries: Vec<(DependencyKind, String, Digest)> = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        entries.push((dependency.kind, dependency.id.clone(), dependency.digest()?));
     }
+    entries.sort();
 
-    let digest = Digest::sha256(&canonical::to_vec(&entries)?);
+    let digest = Digest::sha256(&canonical::to_vec(&Aggregate { deps: &entries })?);
     Ok(AgentChecksum::from_digest(&digest))
+}
+
+/// The aggregate payload shape is the committed `ac1` contract (design spec §8.1):
+/// `{"deps": [[kind, id, dep_digest], ...]}`.
+#[derive(Serialize)]
+struct Aggregate<'a> {
+    deps: &'a [(DependencyKind, String, Digest)],
 }
 
 #[cfg(test)]
@@ -255,7 +261,45 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_dependency_set_still_produces_a_stable_checksum() {
-        assert_eq!(agent_checksum(&[]).unwrap(), agent_checksum(&[]).unwrap());
+    fn the_empty_dependency_set_produces_the_documented_payload_shape() {
+        // Pinned by value rather than compared with itself: the payload shape is
+        // the committed `ac1` contract, and empty `deps` canonicalizes to
+        // `{"deps":[]}`.
+        let expected = Digest::sha256(b"{\"deps\":[]}");
+        assert_eq!(
+            agent_checksum(&[]).unwrap().as_str(),
+            format!("ac1:{}", expected.hex())
+        );
+    }
+
+    #[test]
+    fn the_aggregate_payload_shape_is_the_documented_contract() {
+        let dependency = dep(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]);
+        let expected = Digest::sha256(
+            format!(
+                "{{\"deps\":[[\"prompt\",\"prompt:a.md\",\"{}\"]]}}",
+                dependency.digest().unwrap().as_str()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            agent_checksum(std::slice::from_ref(&dependency))
+                .unwrap()
+                .as_str(),
+            format!("ac1:{}", expected.hex())
+        );
+    }
+
+    #[test]
+    fn the_aggregate_is_order_independent_even_for_duplicate_ids() {
+        // Upstream validation rejects duplicate ids; the aggregate defends the
+        // invariant anyway, so a duplicate cannot make the checksum depend on
+        // discovery order.
+        let v1 = dep(DependencyKind::Tool, "tool:s.t", &[("description", "v1")]);
+        let v2 = dep(DependencyKind::Tool, "tool:s.t", &[("description", "v2")]);
+        assert_eq!(
+            agent_checksum(&[v1.clone(), v2.clone()]).unwrap(),
+            agent_checksum(&[v2, v1]).unwrap()
+        );
     }
 }
