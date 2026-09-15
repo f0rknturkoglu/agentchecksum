@@ -200,7 +200,10 @@ pub mod digest;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// The project rule `rs-result-type` mandates the defaulted-parameter form.
+/// `Result<T>` still resolves to `std::result::Result<T, Error>`, so callers see
+/// the interface the plan specifies.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Error)]
 pub enum Error {
