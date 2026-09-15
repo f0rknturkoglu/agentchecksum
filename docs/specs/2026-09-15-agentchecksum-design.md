@@ -384,7 +384,7 @@ equivalence, not a judgement about importance.
 
 | Kind | Facets |
 |---|---|
-| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size), `params` (behavior-relevant inference parameters, parsed from Ollama's `parameters` text), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
+| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size), `params` (effective inference parameters: `configured` from `[model].params`, `reported` from Ollama's `parameters` text), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
 | `Prompt` | `content`, `shape` |
 | `Tool` | `input_schema`, `output_schema`, `description` (+ `shape`), `capabilities` |
 | `McpServer` | `identity` (era, protocol version, supported versions, server info) |

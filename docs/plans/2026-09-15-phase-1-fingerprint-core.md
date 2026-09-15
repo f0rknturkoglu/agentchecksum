@@ -2018,6 +2018,23 @@ git commit -m "Add prompt discovery with project-relative identities"
 The split is deliberate: parsing is a pure function over a fetched struct, so fingerprint logic is tested without HTTP,
 and HTTP is tested against a `wiremock` server separately. No mocking framework and no trait are introduced for this.
 
+**Post-implementation note (Task 7 shipped as commit b2d216c, corrected in the following fix round).** The code blocks
+below are the task's original specification. Two ruled changes were made during execution; both are recorded in the SDD
+ledger:
+
+1. **The `params` facet captures both sources of effective inference parameters.** The block below hashes only the
+   provider-reported `parameters` text, which contradicted design spec §5 ("`params` is hashed; it is behavior-relevant
+   by definition") and §11.2 (the probe runner sets `seed` and `temperature` from `[model].params`). As shipped, the
+   facet payload is `{"configured": <[model].params>, "reported": <parsed Ollama text>}`, with either key omitted when
+   its source is empty and the facet absent when both are. Without this, changing `temperature` in `agentchecksum.toml`
+   produced no dependency change at all — an invisible behavior change, the exact class this product exists to catch.
+   The spec's Model facet row was clarified to match.
+2. **The metadata-exclusion test was made load-bearing.** `timestamps_sizes_and_licenses_never_reach_the_dependency`
+   originally built both servers' responses from one fixture with hard-coded identical `modified_at`/`size`/`license`,
+   so the two responses were byte-identical and the assertion degenerated to `f(x) == f(x)` — mutation-testing showed a
+   leaky implementation still passed. The fixture is now parameterized so the second server returns distinct
+   non-behavioral values, which is the implementation the test exists to reject.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `src/discovery/model.rs`:
