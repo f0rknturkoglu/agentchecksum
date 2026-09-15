@@ -71,10 +71,18 @@ async fn no_absolute_path_appears_in_the_lockfile() {
         !text.contains(&root),
         "lockfile leaked the absolute path:\n{text}"
     );
+
+    if let Ok(canonical) = dir.path().canonicalize() {
+        let canonical = canonical.to_string_lossy().to_string();
+        assert!(
+            !text.contains(&canonical),
+            "lockfile leaked the canonicalized absolute path:\n{text}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn reformatting_the_lockfile_does_not_change_the_checksum() {
+async fn reformatting_the_lockfile_round_trips_to_an_equal_lockfile() {
     let dir = tempfile::tempdir().unwrap();
     write_project(dir.path());
 
@@ -95,11 +103,15 @@ async fn reformatting_the_lockfile_does_not_change_the_checksum() {
 async fn changing_a_prompt_changes_the_agent_checksum() {
     let dir = tempfile::tempdir().unwrap();
     write_project(dir.path());
-    let before = lock_bytes(dir.path()).await;
+    let before = lock_for(dir.path())
+        .await
+        .agent_checksum
+        .as_str()
+        .to_string();
 
     std::fs::write(dir.path().join("prompts/system.md"), "Be thorough.\n").unwrap();
 
-    assert_ne!(before, lock_bytes(dir.path()).await);
+    assert_ne!(before, lock_for(dir.path()).await.agent_checksum.as_str());
 }
 
 #[tokio::test]
@@ -117,6 +129,27 @@ async fn a_lockfile_with_a_newer_version_is_refused() {
         matches!(
             err,
             agentchecksum::error::Error::LockVersion { found: 99, .. }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_newer_lockfile_with_a_changed_structure_reports_the_version() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(dir.path());
+    let path = dir.path().join("agentchecksum.lock");
+
+    // A future format that also renamed its fields must still be refused as a
+    // version problem: reporting "not valid JSON" would invite the user to
+    // regenerate a file that is valid, only newer.
+    std::fs::write(&path, r#"{"lock_version": 2, "schema": "something-else"}"#).unwrap();
+
+    let err = Lockfile::read(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            agentchecksum::error::Error::LockVersion { found: 2, .. }
         ),
         "{err:?}"
     );

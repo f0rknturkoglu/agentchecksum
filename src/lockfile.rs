@@ -88,17 +88,29 @@ impl Lockfile {
             path: path.to_path_buf(),
             source,
         })?;
-        let lock: Self = serde_json::from_str(&text).map_err(|source| Error::LockParse {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if lock.lock_version > SUPPORTED_LOCK_VERSION {
+
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            lock_version: u32,
+        }
+
+        // Peek the version before the full parse. A newer lockfile whose structure
+        // also changed would otherwise be reported as a parse error, and the
+        // parse-error suggestion invites the user to regenerate a file that is
+        // perfectly valid — only newer than this binary understands.
+        if let Ok(probe) = serde_json::from_str::<VersionProbe>(&text)
+            && probe.lock_version > SUPPORTED_LOCK_VERSION
+        {
             return Err(Error::LockVersion {
                 path: path.to_path_buf(),
-                found: lock.lock_version,
+                found: probe.lock_version,
                 supported: SUPPORTED_LOCK_VERSION,
             });
         }
-        Ok(lock)
+
+        serde_json::from_str(&text).map_err(|source| Error::LockParse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
