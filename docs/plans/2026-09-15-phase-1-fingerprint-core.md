@@ -2829,6 +2829,32 @@ git commit -m "Add model discovery with quantization, template, and capability f
   `report::human::snapshot(&Lockfile, &Discovery) -> String`,
   `report::json::snapshot(&Lockfile, &Discovery) -> Result<String>`.
 
+**Post-implementation note (Task 8 shipped as commits 87f797b, 9d11c00, 53c360c, 3daecb6).** The code blocks below are
+the task's original specification. Five changes were ruled during execution; all are recorded in the SDD ledger:
+
+1. **The version gate moved before the full parse.** `Lockfile::read` originally deserialized the whole document and
+   only then compared `lock_version`, so a newer lockfile whose structure had also changed was reported as
+   `LockParse` — "not valid JSON", which is false — with the suggestion "Regenerate it with `agentchecksum snapshot`".
+   A shared module-level `VersionProbe` now peeks `lock_version` first and is the single version gate.
+2. **`snapshot` refuses to overwrite a newer lockfile.** Spec §14.1 requires "refuse to compare or extend, exit 3" for
+   a higher `lock_version`, and the write path honoured none of it: run against a v2 lockfile the command exited 0 and
+   replaced it with a v1 one. `Lockfile::ensure_writable` now runs at the top of `snapshot::run`, before `Config::load`
+   and discovery, so the refusal cannot be masked by a config or network error and nothing can write first. A current
+   or unrecognizable lockfile is still regenerated, which is what `snapshot` is for.
+3. **`the_lockfile_checksum_is_wired_from_the_dependency_inputs` was added.** Nothing pinned that
+   `Lockfile::from_dependencies` takes its checksum from the dependency inputs; a constant checksum, or one derived
+   from the lockfile's own serialization, passed the whole suite.
+4. **The unknown-field tolerance test now injects at every level** (top level, `generator`, `LockedDependency`,
+   `Facet`) with a guard proving the injections reach the written bytes, instead of one string replacement at the top
+   level.
+5. **Two test names were corrected to match what they prove**: `reformatting_the_lockfile_round_trips_to_an_equal_lockfile`
+   (a struct round-trip, not checksum independence) and `changing_a_prompt_changes_the_agent_checksum` (now compares the
+   checksum field rather than whole lockfile bytes, which a constant checksum would have satisfied).
+
+Deferred to the final review, not fixed here: `init`'s test asserts only the exit code rather than that the existing
+config is untouched; `--format json` is ignored by `init`; and `report::human::snapshot`'s warning and plural branches
+have no direct test.
+
 - [ ] **Step 1: Add the lockfile and composition error variants**
 
 In `src/error.rs`, add:
