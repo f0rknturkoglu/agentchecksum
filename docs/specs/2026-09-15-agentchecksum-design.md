@@ -416,13 +416,15 @@ different chat template changes prompt formatting without touching any source fi
 - **Ollama** exposes a real content `digest` (SHA-256), `quantization_level`, `parameter_size`,
   `family`, `template`, `capabilities`, and parsed `parameters` — a strong determinism signal.
 - **Generic OpenAI-compatible** endpoints expose no model digest (`/v1/models` returns only `id`, `created`,
-  `owned_by`), so the **endpoint is part of the identity** instead: two hosts serving a model with the same name can
-  be entirely different backends or weights, and leaving the host out would make moving between them look like no
-  change at all. The recorded form drops userinfo, the query string and the fragment, because they carry credentials
-  and the lockfile is committed (the same reason §5 refuses to write expanded `${VAR}` values). An endpoint is
-  therefore **required** for this provider: with none, there is nothing to fingerprint the model by. The remaining
-  false negative is declared in output rather than hidden — *a model swapped behind the same endpoint cannot be
-  detected.*
+  `owned_by`), so the **endpoint participates in model identity**: two hosts serving a model with the same name can
+  be entirely different deployments, and leaving the host out would make moving between them look like no change at
+  all. The endpoint must be an **HTTP(S) base URL with no userinfo, no query parameters and no fragment**; a trailing
+  slash is insignificant. Unsupported components are **rejected, never silently discarded**, because they may affect
+  routing or model selection — `?deployment=a` and `?deployment=b` can reach different deployments behind one host —
+  and because a sanitizer that parses a credential before discarding it still handles a secret that a committed
+  lockfile must never contain. An endpoint is therefore **required** for this provider: with none, there is nothing
+  to fingerprint the model by. The remaining false negative is declared in output rather than hidden — *a model
+  swapped behind the same endpoint cannot be detected.*
 
 This is a real class of false negative and is declared in output, not hidden.
 

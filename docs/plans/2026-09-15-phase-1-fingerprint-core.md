@@ -2044,10 +2044,14 @@ ledger:
    over-sensitively. The wording in the code, the spec and the PR says *sources*, not *effective*, so the
    implementation and the documents agree.
 4. **Identity is provider-aware.** `openai-compatible` exposes no content digest, so the endpoint joins its identity —
-   recorded without userinfo, query or fragment, since the lockfile is committed — and an endpoint is now required for
-   that provider, because with none there is nothing to fingerprint the model by. Ollama keeps its endpoint out of the
-   identity, because its content digest already pins the weights and hashing the host would turn moving the same model
-   to another machine into a change that says nothing about behavior. The test that claimed this globally
+   canonicalized strictly as an HTTP(S) base URL with no userinfo, query parameters or fragment, a trailing slash
+   treated as insignificant, and unsupported components **rejected rather than stripped**. Stripping was the first
+   cut and a later review showed why it is wrong: `?deployment=a` and `?deployment=b` can route to different
+   deployments behind one host, so dropping the query would fingerprint two models as one (hardened in
+   `hardening/openai-endpoint-identity`). An endpoint is required for this provider, because with none there is
+   nothing to fingerprint the model by. Ollama keeps its endpoint out of the identity, because its content digest
+   already pins the weights and hashing the host would turn moving the same model to another machine into a change
+   that says nothing about behavior. The test that claimed this globally
    (`the_endpoint_is_never_part_of_the_identity`) is now provider-specific, with a companion asserting the
    `openai-compatible` case.
 5. **Content and shape are separate digests.** `normalize_text` unifies line endings and strips a leading BOM and
