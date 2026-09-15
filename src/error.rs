@@ -79,6 +79,20 @@ pub enum Error {
         status: u16,
     },
 
+    #[error("the `{provider}` endpoint `{endpoint}` returned a body that is not valid Ollama JSON")]
+    ModelResponse {
+        provider: String,
+        endpoint: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("failed to build the HTTP client")]
+    ModelClient {
+        #[source]
+        source: reqwest::Error,
+    },
+
     #[error("unsupported model provider `{provider}`")]
     ModelProvider { provider: String },
 
@@ -137,6 +151,12 @@ impl Error {
             Error::ModelStatus { .. } => {
                 Some("Run `ollama list` to confirm the model server is healthy.".to_string())
             }
+            Error::ModelResponse { .. } => Some(
+                "Check that `endpoint` points at an Ollama server (the native API, not the OpenAI-compatible path), and that nothing is intercepting the connection.".to_string(),
+            ),
+            Error::ModelClient { .. } => Some(
+                "Retry, and if it persists, report it with the endpoint you configured.".to_string(),
+            ),
             Error::ModelProvider { .. } => Some(
                 "Providers supported in this version: `ollama`, `openai-compatible`.".to_string(),
             ),

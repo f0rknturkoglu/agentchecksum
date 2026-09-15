@@ -88,6 +88,14 @@ pub fn parse_ollama_parameters(text: &str) -> BTreeMap<String, Vec<String>> {
             .or_default()
             .push(value.trim_matches('"').to_string());
     }
+
+    // Repeated keys such as `stop` accumulate in line order, but the order of a
+    // stop-sequence set carries no meaning: sorting makes two Modelfiles that
+    // differ only in that order fingerprint identically (spec §18 invariant 2).
+    for values in parameters.values_mut() {
+        values.sort();
+    }
+
     parameters
 }
 
@@ -263,6 +271,18 @@ pub fn dependency(
     ))
 }
 
+/// How long any single model-metadata request may take. A black-holed endpoint
+/// must fail rather than hang `snapshot` in CI.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client used for model metadata requests.
+pub fn client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|source| Error::ModelClient { source })
+}
+
 /// Fetch metadata from an Ollama endpoint. Returns `Ok(None)` for providers that
 /// expose no metadata endpoint.
 pub async fn fetch(
@@ -281,10 +301,15 @@ pub async fn fetch(
         })?;
     let base = endpoint.trim_end_matches('/');
 
-    // Both closures capture only references, so they are `Copy` and can be handed to
+    // Every closure captures only references, so they are `Copy` and can be handed to
     // every `.map_err(...)` and error return below. Six hand-written constructions
     // meant a change to the error shape had to be made in six places.
     let endpoint_error = |source: reqwest::Error| Error::ModelEndpoint {
+        provider: config.provider.clone(),
+        endpoint: endpoint.clone(),
+        source,
+    };
+    let response_error = |source: reqwest::Error| Error::ModelResponse {
         provider: config.provider.clone(),
         endpoint: endpoint.clone(),
         source,
@@ -306,12 +331,18 @@ pub async fn fetch(
         return Err(status_error(status.as_u16()));
     }
 
-    let tags: TagsResponse = tags_response.json().await.map_err(endpoint_error)?;
+    let tags: TagsResponse = tags_response.json().await.map_err(response_error)?;
 
     let entry = tags
         .models
         .into_iter()
-        .find(|entry| entry.name == config.id || entry.model.as_deref() == Some(config.id.as_str()))
+        .find(|entry| {
+            entry.name == config.id
+                || entry.model.as_deref() == Some(config.id.as_str())
+                // Ollama resolves an untagged name to `:latest`, so a config
+                // saying `qwen3` must match a server reporting `qwen3:latest`.
+                || entry.name == format!("{}:latest", config.id)
+        })
         .ok_or_else(|| Error::ModelMissing {
             provider: config.provider.clone(),
             id: config.id.clone(),
@@ -330,7 +361,7 @@ pub async fn fetch(
         return Err(status_error(status.as_u16()));
     }
 
-    let show: ShowResponse = show_response.json().await.map_err(endpoint_error)?;
+    let show: ShowResponse = show_response.json().await.map_err(response_error)?;
 
     Ok(Some(OllamaMetadata {
         digest: entry.digest,
@@ -597,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    fn repeated_stop_values_produce_the_same_dependency_in_any_order() {
+        // `stop` is a set of sequences, so the order they happen to be written in
+        // has no behavioral meaning (spec §18 invariant 2): the two orderings must
+        // fingerprint identically.
+        let mut forward = metadata();
+        forward.parameters = Some("stop \"END\"\nstop \"STOP\"\ntemperature 0.7\n".to_string());
+        let mut reverse = metadata();
+        reverse.parameters = Some("stop \"STOP\"\nstop \"END\"\ntemperature 0.7\n".to_string());
+
+        assert_eq!(
+            build(&ollama_config(), Some(&forward)),
+            build(&ollama_config(), Some(&reverse))
+        );
+    }
+
+    #[test]
     fn an_openai_compatible_provider_records_identity_without_a_digest_and_warns() {
         let config = ModelConfig {
             provider: "openai-compatible".to_string(),
@@ -832,6 +879,69 @@ mod tests {
 
         let err = fetch(&reqwest::Client::new(), &config).await.unwrap_err();
         assert!(matches!(err, Error::ModelMissing { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_untagged_config_id_resolves_against_a_tagged_server_entry() {
+        // Ollama reports tagged names (`qwen3:latest`) and resolves an untagged
+        // config id to `:latest` itself, so `id = "qwen3"` must find the model.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "models": [{ "name": "qwen3:latest", "model": "qwen3:latest" }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/show"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let config = ModelConfig {
+            provider: "ollama".to_string(),
+            id: "qwen3".to_string(),
+            endpoint: Some(server.uri()),
+            params: BTreeMap::new(),
+        };
+        assert!(
+            fetch(&client().unwrap(), &config).await.unwrap().is_some(),
+            "`qwen3` must resolve against a server reporting `qwen3:latest`"
+        );
+
+        // The `:latest` fallback must stay an exact match, not a prefix match: a
+        // tag-qualified id naming a different tag is still missing.
+        let other = ModelConfig {
+            id: "qwen3:8b".to_string(),
+            ..config
+        };
+        let err = fetch(&client().unwrap(), &other).await.unwrap_err();
+        assert!(matches!(err, Error::ModelMissing { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_json_body_is_reported_as_a_response_problem() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/tags"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let config = ModelConfig {
+            provider: "ollama".to_string(),
+            id: "qwen3:8b".to_string(),
+            endpoint: Some(server.uri()),
+            params: BTreeMap::new(),
+        };
+
+        // A 200 with an unparseable body means the server answered; reporting the
+        // endpoint as unreachable sends the user to check the wrong thing.
+        let err = fetch(&client().unwrap(), &config).await.unwrap_err();
+        assert!(matches!(err, Error::ModelResponse { .. }), "{err:?}");
     }
 
     #[tokio::test]

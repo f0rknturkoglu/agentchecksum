@@ -28,8 +28,17 @@ path = "prompts/system.md"
 path = "probes"
 "#;
 
-/// Scaffold the config and the probe directory. Returns the config path written.
-pub fn run(root: &Path, config_path: &Path, force: bool) -> Result<PathBuf> {
+/// What `init` wrote, so the caller can report it without re-deriving paths.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InitOutcome {
+    /// The config path exactly as the user named it.
+    pub config: PathBuf,
+    /// The probe directory, resolved against the config's directory.
+    pub probes: PathBuf,
+}
+
+/// Scaffold the config and the probe directory.
+pub fn run(root: &Path, config_path: &Path, force: bool) -> Result<InitOutcome> {
     if config_path.exists() && !force {
         return Err(Error::AlreadyExists {
             path: config_path.to_path_buf(),
@@ -43,9 +52,12 @@ pub fn run(root: &Path, config_path: &Path, force: bool) -> Result<PathBuf> {
 
     let probes = root.join("probes");
     std::fs::create_dir_all(&probes).map_err(|source| Error::Write {
-        path: probes,
+        path: probes.clone(),
         source,
     })?;
 
-    Ok(config_path.to_path_buf())
+    Ok(InitOutcome {
+        config: config_path.to_path_buf(),
+        probes,
+    })
 }

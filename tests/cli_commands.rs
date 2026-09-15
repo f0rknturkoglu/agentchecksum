@@ -173,3 +173,49 @@ fn an_unknown_config_key_exits_with_code_3() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn an_unknown_config_key_names_the_offending_field_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path());
+    std::fs::write(
+        dir.path().join("agentchecksum.toml"),
+        "version = 1\n\n[agentt]\nname = \"typo\"\n",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("agentchecksum")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("snapshot")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("caused by:"), "{stderr}");
+    // The suggestion tells the user to fix the reported key, so the cause chain
+    // has to name it: `unknown field \`agentt\`` is the whole point of the report.
+    assert!(
+        stderr.contains("agentt"),
+        "the diagnostic must name the offending key: {stderr}"
+    );
+}
+
+#[test]
+fn init_json_output_is_valid_json_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::cargo_bin("agentchecksum")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["--format", "json", "init"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{:?}", output.status.code());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["config"], "agentchecksum.toml");
+    assert_eq!(value["probes"], "probes");
+}

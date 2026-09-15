@@ -127,12 +127,14 @@ impl Lockfile {
             return Ok(());
         }
 
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            // A file we cannot even read as bytes is not one this build wrote;
+            // leave it to `snapshot` to regenerate, which is what the user asked for.
+            Err(_) => return Ok(()),
+        };
 
-        if let Ok(probe) = serde_json::from_str::<VersionProbe>(&text)
+        if let Ok(probe) = serde_json::from_slice::<VersionProbe>(&bytes)
             && probe.lock_version > SUPPORTED_LOCK_VERSION
         {
             return Err(Error::LockVersion {

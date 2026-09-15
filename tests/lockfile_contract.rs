@@ -1,8 +1,54 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::BTreeMap;
+
 use agentchecksum::config::Config;
 use agentchecksum::discovery;
 use agentchecksum::lockfile::Lockfile;
+use agentchecksum::manifest::{Dependency, DependencyKind, Digest, Facet};
+
+/// A dependency with one facet, so a key-ordering pin needs no HTTP or config.
+fn one_facet(id: &str, kind: DependencyKind) -> Dependency {
+    let mut facets = BTreeMap::new();
+    facets.insert(
+        "content".to_string(),
+        Facet {
+            digest: Digest::sha256(id.as_bytes()),
+            shape: None,
+            normalized: None,
+        },
+    );
+    Dependency {
+        id: id.to_string(),
+        kind,
+        facets,
+        source: None,
+    }
+}
+
+#[test]
+fn the_written_lockfile_lists_dependencies_in_id_order() {
+    // The committed lockfile groups dependencies by id-prefixed key. Swapping the
+    // map for an order-preserving container would keep every other test green
+    // while rewriting every committed lockfile, so the rendered bytes are what
+    // have to be pinned, not the container's internals.
+    let lock = Lockfile::from_dependencies(&[
+        one_facet("model:ollama/qwen3:8b", DependencyKind::Model),
+        one_facet("prompt:b.md", DependencyKind::Prompt),
+        one_facet("prompt:a.md", DependencyKind::Prompt),
+    ])
+    .unwrap();
+
+    let text = String::from_utf8(lock.to_bytes().unwrap()).unwrap();
+    let model = text.find("model:ollama/qwen3:8b").unwrap();
+    let prompt_a = text.find("prompt:a.md").unwrap();
+    let prompt_b = text.find("prompt:b.md").unwrap();
+
+    assert!(
+        model < prompt_a && prompt_a < prompt_b,
+        "dependencies must be written in id order, got:\n{text}"
+    );
+}
 
 /// Replace every digest with a placeholder so the snapshot documents the shape
 /// rather than the input.

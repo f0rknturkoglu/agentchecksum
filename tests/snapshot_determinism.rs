@@ -261,6 +261,27 @@ async fn snapshot_overwrites_a_current_or_unrecognized_lockfile() {
         "an unrecognizable file is regenerated, which is what snapshot is for"
     );
 
+    // Not even UTF-8: a file this build cannot decode is not one it wrote, so it
+    // falls through to `snapshot` regenerating it rather than refusing to start.
+    std::fs::write(
+        &path,
+        [0xff, 0xfe, 0x00, 0x01, 0x62, 0x69, 0x6e, 0x61, 0x72, 0x79],
+    )
+    .unwrap();
+    assert!(
+        Lockfile::ensure_writable(&path).is_ok(),
+        "a non-UTF-8 lockfile is regenerated, which is what snapshot is for"
+    );
+
+    std::fs::write(&path, r#"{"lock_version": 2, "schema": "future"}"#).unwrap();
+    assert!(
+        matches!(
+            Lockfile::ensure_writable(&path),
+            Err(agentchecksum::error::Error::LockVersion { found: 2, .. })
+        ),
+        "a newer lockfile is still refused"
+    );
+
     assert!(Lockfile::ensure_writable(&dir.path().join("absent.lock")).is_ok());
 }
 

@@ -22,6 +22,16 @@ pub async fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             eprintln!("Error: {error}");
+
+            // Walk the cause chain. `thiserror`'s `#[source]` carries the reason
+            // ("unknown field `agentt`"), and without it the suggestion asks the
+            // user to fix a key the message never names.
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
+
             if let Some(suggestion) = error.suggestion() {
                 eprintln!("\nSuggested action:\n  {suggestion}");
             }
@@ -35,9 +45,14 @@ async fn dispatch(cli: &Cli) -> Result<ExitCode> {
 
     match &cli.command {
         Command::Init { force } => {
-            let path = cmd::init::run(&root, &cli.config, *force)?;
-            println!("Wrote {}", path.display());
-            println!("Next: add your prompts, then run `agentchecksum snapshot`.");
+            let outcome = cmd::init::run(&root, &cli.config, *force)?;
+            match cli.format {
+                OutputFormat::Human => {
+                    println!("Wrote {}", outcome.config.display());
+                    println!("Next: add your prompts, then run `agentchecksum snapshot`.");
+                }
+                OutputFormat::Json => print!("{}", report::json::init(&outcome)?),
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Snapshot => {

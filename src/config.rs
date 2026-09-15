@@ -149,10 +149,32 @@ impl Config {
     /// Parse and validate text. Parse errors are reported against `path` so the
     /// diagnostic can name the file without a separate code path.
     pub fn from_toml_at(text: &str, path: &Path) -> Result<Self> {
-        let config: Self = toml::from_str(text).map_err(|source| Error::ConfigParse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let config: Self = match toml::from_str(text) {
+            Ok(config) => config,
+            Err(source) => {
+                // A newer config that also carries keys this build does not know
+                // fails as an unknown field, which hides the real problem. Re-read
+                // only the version and report that instead.
+                #[derive(Deserialize)]
+                struct VersionProbe {
+                    version: u32,
+                }
+
+                if let Ok(probe) = toml::from_str::<VersionProbe>(text)
+                    && probe.version != SUPPORTED_CONFIG_VERSION
+                {
+                    return Err(Error::ConfigVersion {
+                        found: probe.version,
+                        supported: SUPPORTED_CONFIG_VERSION,
+                    });
+                }
+
+                return Err(Error::ConfigParse {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
         config.validate()?;
         Ok(config)
     }
@@ -345,6 +367,27 @@ path = "prompts/system.md"
     #[test]
     fn an_unsupported_version_is_an_error() {
         let text = MINIMAL.replace("version = 1", "version = 2");
+        let err = parse(&text).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ConfigVersion {
+                    found: 2,
+                    supported: 1
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_newer_version_alongside_an_unknown_key_is_reported_as_a_version_problem() {
+        // The unknown field is rejected first by serde, which would hide the real
+        // problem: the file is newer than this build, not malformed (spec §14.1).
+        let text = format!(
+            "{}\n[modell]\nprovider = \"ollama\"\n",
+            MINIMAL.replace("version = 1", "version = 2")
+        );
         let err = parse(&text).unwrap_err();
         assert!(
             matches!(

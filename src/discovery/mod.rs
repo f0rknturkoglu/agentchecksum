@@ -26,7 +26,7 @@ pub async fn run(config: &Config, root: &Path) -> Result<Discovery> {
     let mut warnings = Vec::new();
 
     if let Some(model) = &config.model {
-        let client = reqwest::Client::new();
+        let client = model::client()?;
         let metadata = model::fetch(&client, model).await?;
         let (dependency, model_warnings) = model::dependency(model, metadata.as_ref())?;
         dependencies.push(dependency);
