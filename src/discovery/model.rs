@@ -116,28 +116,53 @@ fn recorded_facet(value: &serde_json::Value) -> Result<Facet> {
     Ok(facet)
 }
 
-/// The endpoint form that participates in the identity: scheme, host, port and
-/// path, without a trailing slash.
+/// Canonicalize an `openai-compatible` endpoint for identity: an HTTP(S) base URL
+/// with a trailing slash removed.
 ///
-/// Userinfo and the query string are dropped on purpose. They carry credentials
-/// and per-request knobs rather than the identity of the model, and the lockfile is
-/// committed — the same reason spec §5 refuses to write expanded `${VAR}` values
-/// into it. Dropping them means rotating a token does not read as a model change,
-/// and means a token never reaches a public repository.
-///
-/// An endpoint that is not a URL at all is fingerprinted as written, minus a
-/// trailing slash, so two spellings of one thing do not read as a change.
-fn identity_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
-        return endpoint.trim_end_matches('/').to_string();
+/// Unsupported components are **rejected, never stripped**. A query string can
+/// select a different deployment behind the same host, so quietly dropping one
+/// would fingerprint two different models as the same — the false negative this
+/// tool exists to catch. Credentials are rejected for that reason and a second one:
+/// the lockfile is committed, and a sanitizer that parses a secret before
+/// discarding it is a habit worth not having. Refusing is the only fail-safe
+/// option, because a tool whose worse error is missing a change must not guess what
+/// an input it cannot represent was meant to mean.
+fn canonical_endpoint(provider: &str, endpoint: &str) -> Result<String> {
+    let invalid = |reason: &str| Error::EndpointInvalid {
+        provider: provider.to_string(),
+        reason: reason.to_string(),
     };
 
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
+    let url = reqwest::Url::parse(endpoint).map_err(|_| invalid("the value is not a valid URL"))?;
 
-    url.as_str().trim_end_matches('/').to_string()
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(invalid(&format!(
+                "the scheme `{scheme}` is not supported; use http or https"
+            )));
+        }
+    }
+
+    if url.host_str().is_none() {
+        return Err(invalid("the URL has no host"));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("URLs containing credentials are not supported"));
+    }
+
+    if url.query().is_some() {
+        return Err(invalid(
+            "query parameters are not supported; they can select a different deployment behind the same host",
+        ));
+    }
+
+    if url.fragment().is_some() {
+        return Err(invalid("fragments are not supported"));
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// Build the `params` facet payload from the two *sources* of inference
@@ -283,7 +308,7 @@ pub fn dependency(
 
             identity.insert(
                 "endpoint".to_string(),
-                serde_json::Value::String(identity_endpoint(endpoint)),
+                serde_json::Value::String(canonical_endpoint(&config.provider, endpoint)?),
             );
 
             warnings.push(format!(
@@ -761,54 +786,97 @@ mod tests {
     }
 
     #[test]
+    fn an_openai_compatible_base_url_is_accepted() {
+        let model = build(&openai_compatible_config("https://example.com/v1"), None);
+        let identity = model.facets["identity"].normalized.clone().unwrap();
+        assert_eq!(identity["endpoint"], "https://example.com/v1");
+
+        // `http` and a bare local origin are just as valid.
+        assert!(dependency(&openai_compatible_config("http://localhost:8000/v1"), None).is_ok());
+    }
+
+    #[test]
     fn an_openai_compatible_endpoint_is_part_of_the_identity() {
-        // No immutable digest exists for this provider, so two hosts offering a model
-        // with the same name can be entirely different backends. Moving between them
+        // No immutable digest exists for this provider, so two hosts — or two paths
+        // on one host — can be entirely different deployments. Moving between them
         // must not look like no change at all.
-        let a = build(
-            &openai_compatible_config("https://server-a.example/v1"),
+        let base = build(&openai_compatible_config("https://example.com/v1"), None);
+        let other_host = build(
+            &openai_compatible_config("https://other.example.com/v1"),
             None,
         );
-        let b = build(
-            &openai_compatible_config("https://server-b.example/v1"),
-            None,
-        );
+        let other_path = build(&openai_compatible_config("https://example.com/v2"), None);
 
-        assert_ne!(a.facets["identity"].digest, b.facets["identity"].digest);
-        assert_ne!(a.digest().unwrap(), b.digest().unwrap());
+        assert_ne!(
+            base.facets["identity"].digest,
+            other_host.facets["identity"].digest
+        );
+        assert_ne!(
+            base.facets["identity"].digest,
+            other_path.facets["identity"].digest
+        );
+        assert_ne!(base.digest().unwrap(), other_host.digest().unwrap());
     }
 
     #[test]
-    fn an_openai_compatible_endpoint_difference_of_only_a_trailing_slash_is_insignificant() {
+    fn a_trailing_slash_is_insignificant_in_an_openai_compatible_endpoint() {
         assert_eq!(
-            build(
-                &openai_compatible_config("https://server-a.example/v1/"),
-                None
-            ),
-            build(
-                &openai_compatible_config("https://server-a.example/v1"),
-                None
-            )
+            build(&openai_compatible_config("https://example.com/v1/"), None),
+            build(&openai_compatible_config("https://example.com/v1"), None)
         );
     }
 
-    #[test]
-    fn openai_compatible_credentials_never_reach_the_identity_payload() {
-        // The lockfile is committed, so userinfo and query strings must not be
-        // recorded — the rule spec §5 already applies to expanded `${VAR}` values.
-        let dependency = build(
-            &openai_compatible_config("https://user:secret@server-a.example/v1?token=abc"),
-            None,
-        );
-        let identity = dependency.facets["identity"].normalized.clone().unwrap();
-        let recorded = identity["endpoint"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+    /// The endpoint failures share a shape, so they share a helper.
+    fn endpoint_error(endpoint: &str) -> Error {
+        dependency(&openai_compatible_config(endpoint), None).unwrap_err()
+    }
 
-        assert_eq!(recorded, "https://server-a.example/v1");
-        assert!(!recorded.contains("secret"), "{recorded}");
-        assert!(!recorded.contains("token"), "{recorded}");
+    #[test]
+    fn a_query_parameter_is_rejected_rather_than_stripped() {
+        // `?deployment=a` and `?deployment=b` can route to different models behind one
+        // host, so stripping the query would fingerprint two deployments as one — the
+        // false negative this tool exists to catch.
+        let err = endpoint_error("https://example.com/v1?deployment=a");
+
+        assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("query"), "{err}");
+    }
+
+    #[test]
+    fn a_fragment_is_rejected_rather_than_stripped() {
+        let err = endpoint_error("https://example.com/v1#deployment-a");
+        assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn credentials_in_an_endpoint_are_rejected_and_never_echoed() {
+        // Refusing is also what keeps a secret out of the committed lockfile: a
+        // sanitizer would have parsed the credential before discarding it.
+        let err = endpoint_error("https://user:secret@example.com/v1");
+
+        assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
+
+        let rendered = format!("{err} {}", err.suggestion().unwrap_or_default());
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(!rendered.contains("user:"), "{rendered}");
+    }
+
+    #[test]
+    fn a_malformed_endpoint_is_rejected_rather_than_hashed_as_written() {
+        // Hashing the raw string on a parse failure would fingerprint a value nobody
+        // validated, and an unparsable value cannot be shown to mean one thing.
+        let err = endpoint_error("not a url");
+
+        assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("not a valid URL"), "{err}");
+    }
+
+    #[test]
+    fn an_unsupported_scheme_is_rejected() {
+        let err = endpoint_error("ftp://example.com/v1");
+
+        assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("ftp"), "{err}");
     }
 
     #[test]

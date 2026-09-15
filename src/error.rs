@@ -96,6 +96,9 @@ pub enum Error {
     #[error("unsupported model provider `{provider}`")]
     ModelProvider { provider: String },
 
+    #[error("invalid `{provider}` endpoint: {reason}")]
+    EndpointInvalid { provider: String, reason: String },
+
     #[error("`{path}` already exists")]
     AlreadyExists { path: PathBuf },
 
@@ -159,6 +162,12 @@ impl Error {
             ),
             Error::ModelProvider { .. } => Some(
                 "Providers supported in this version: `ollama`, `openai-compatible`.".to_string(),
+            ),
+            Error::EndpointInvalid { .. } => Some(
+                "Use a credential-free HTTP(S) base URL such as `https://api.example.com/v1`, with no query \
+                 parameters and no fragment, and supply authentication through the environment of the process \
+                 that runs your agent."
+                    .to_string(),
             ),
             Error::AlreadyExists { path } => {
                 Some(format!("Re-run with `--force` to overwrite `{}`.", path.display()))
