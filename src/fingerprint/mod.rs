@@ -5,3 +5,4 @@
 pub mod canonical;
 pub mod digest;
 pub mod normalize;
+pub mod schema;
