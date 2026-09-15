@@ -1,0 +1,25 @@
+---
+source: tests/lockfile_contract.rs
+expression: value
+---
+{
+  "agent_checksum": "<digest>",
+  "dependencies": {
+    "prompt:prompts/system.md": {
+      "facets": {
+        "content": {
+          "digest": "<digest>"
+        },
+        "shape": {
+          "digest": "<digest>"
+        }
+      },
+      "kind": "prompt"
+    }
+  },
+  "generator": {
+    "name": "agentchecksum",
+    "version": "<agentchecksum-version>"
+  },
+  "lock_version": 1
+}

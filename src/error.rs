@@ -81,6 +81,23 @@ pub enum Error {
 
     #[error("unsupported model provider `{provider}`")]
     ModelProvider { provider: String },
+
+    #[error("`{path}` already exists")]
+    AlreadyExists { path: PathBuf },
+
+    #[error("lockfile `{path}` is not valid JSON")]
+    LockParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("lockfile `{path}` uses lock_version {found}, but this build supports {supported}")]
+    LockVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl Error {
@@ -122,6 +139,15 @@ impl Error {
             }
             Error::ModelProvider { .. } => Some(
                 "Providers supported in this version: `ollama`, `openai-compatible`.".to_string(),
+            ),
+            Error::AlreadyExists { path } => {
+                Some(format!("Re-run with `--force` to overwrite `{}`.", path.display()))
+            }
+            Error::LockParse { .. } => {
+                Some("Regenerate it with `agentchecksum snapshot`, or restore it from git.".to_string())
+            }
+            Error::LockVersion { .. } => Some(
+                "Upgrade agentchecksum. A newer lockfile is never silently reinterpreted.".to_string(),
             ),
         }
     }

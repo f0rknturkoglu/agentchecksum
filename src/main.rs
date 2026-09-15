@@ -2,18 +2,16 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
-/// Subcommands arrive with the code that implements them; there are no stubs.
-#[derive(Debug, Parser)]
-#[command(
-    name = "agentchecksum",
-    version,
-    about = "Language-agnostic dependency fingerprint and behavioral regression gate for AI agents"
-)]
-struct Cli {}
+#[tokio::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
-fn main() -> ExitCode {
-    let _cli = Cli::parse();
-    ExitCode::SUCCESS
+    agentchecksum::cli::main().await
 }
