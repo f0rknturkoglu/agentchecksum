@@ -2,4 +2,6 @@
 
 //! Normalization, canonicalization, and digests.
 
+pub mod canonical;
 pub mod digest;
+pub mod normalize;

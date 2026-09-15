@@ -23,6 +23,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("failed to serialize a value to JSON")]
+    Json {
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl Error {
@@ -31,6 +37,10 @@ impl Error {
         match self {
             Error::Read { .. } => Some("Check that the path exists and is readable.".to_string()),
             Error::Write { .. } => Some("Check directory permissions.".to_string()),
+            Error::Json { .. } => Some(
+                "This is a bug in agentchecksum; please report it with the input that triggered it."
+                    .to_string(),
+            ),
         }
     }
 }
