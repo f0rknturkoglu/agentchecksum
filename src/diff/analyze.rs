@@ -366,32 +366,48 @@ fn schema_facet(
         return None;
     }
 
-    let analysis = match (before.normalized.as_ref(), after.normalized.as_ref()) {
+    let comparison = match (before.normalized.as_ref(), after.normalized.as_ref()) {
         (Some(before_schema), Some(after_schema)) => schema::compare(before_schema, after_schema),
-        // Without a payload there is nothing to interpret.
-        _ => schema::SchemaAnalysis::default(),
+        // Without a payload there is nothing to interpret: the fingerprints moved
+        // and this facet has nothing to explain them with.
+        _ => {
+            return Some(FacetChange::new(
+                name,
+                ChangeKind::Modified,
+                risk::schema(side, SchemaFact::Generic),
+            ));
+        }
     };
 
-    // Read before the differences are moved out, so the verdict can be taken
-    // afterwards without borrowing a partially moved value.
-    //
-    // The floor applies whenever anything about this facet is unclassified — and
-    // that includes the *mixed* case, where the analyzer named some differences and
-    // could not name others. A change that is part understood and part not is not a
-    // classified change: taking only the named facts is exactly how the unexplained
-    // part would disappear from the risk.
-    let unclassified = analysis.has_unclassified_change || analysis.found_nothing();
+    let schema::SchemaComparison::Changed {
+        differences,
+        has_unclassified_change,
+    } = comparison
+    else {
+        // Equivalence is a conclusion, not a gap. The two payloads say the same
+        // thing in the model this analyzer implements — `additionalProperties`
+        // absent against `{}`, say — so the fingerprint moved in bytes only.
+        // Applying the generic floor here would be a false alarm about behavior;
+        // reporting nothing at all would hide that the facet was examined. The
+        // fresh digests come along as the evidence that the bytes did move.
+        return Some(FacetChange::equivalent(
+            name,
+            before.digest.clone(),
+            after.digest.clone(),
+        ));
+    };
 
     let mut risks = Vec::new();
     let mut details = Vec::new();
-    for difference in analysis.differences {
+    for difference in differences {
         risks.push(risk::schema(side, difference.fact));
         details.push(difference.detail);
     }
 
-    // `found_nothing` is the remaining path — a payload that disagrees with its own
-    // digest — and the generic floor is the honest answer for it too.
-    if unclassified {
+    // The generic floor applies whenever any part of the difference is unclassified
+    // — and it composes with the named facts rather than replacing them. A change
+    // that is part understood and part not is not a classified change.
+    if has_unclassified_change {
         risks.push(risk::schema(side, SchemaFact::Generic));
     }
 
@@ -1335,35 +1351,198 @@ mod tests {
         assert_eq!(changes[0].details.len(), 2, "{:?}", changes[0].details);
     }
 
+    /// The schema facet `tool()` reported for a pair of payloads, if any.
+    fn schema_facet_of(name: &'static str, baseline: Value, current: Value) -> Option<FacetChange> {
+        tool(
+            &tool_with_schema(name, baseline),
+            &tool_with_schema(name, current),
+        )
+        .into_iter()
+        .find(|change| change.name == name)
+    }
+
     #[test]
-    fn a_permissive_form_change_claims_no_direction_but_is_not_silent_either() {
-        // `{}` and an absent key mean the same thing, so the analyzer asserts no
-        // direction — that is the false alarm this pass removes. The recorded
-        // digests still differ, though, and a fingerprint that moved without an
-        // explanation must not be reported as nothing happening: the facet takes the
-        // generic floor.
-        //
-        // Deliberate, and worth knowing: a semantically null edit like this is
-        // loud. The alternative — inventing an "insignificant difference" verdict
-        // that drops the facet — would buy quiet at the price of the one invariant
-        // this layer exists to keep.
+    fn permissive_additional_properties_forms_report_no_schema_change() {
+        // An absent key, `true`, and `{}` all permit arbitrary additional properties,
+        // so the analyzer concludes equivalence rather than "something I could not
+        // name". The fingerprints differ, which is why the facet is still *claimed* —
+        // and claimed as unchanged — instead of being left for the engine's
+        // unclaimed-facet sweep, which would put the generic HIGH straight back.
+        let absent = serde_json::json!({ "type": "object", "properties": {} });
+        let empty = serde_json::json!({
+            "type": "object", "properties": {}, "additionalProperties": {}
+        });
+        let yes = serde_json::json!({
+            "type": "object", "properties": {}, "additionalProperties": true
+        });
+
+        for (baseline, current) in [
+            (absent.clone(), empty.clone()),
+            (empty.clone(), absent.clone()),
+            (yes.clone(), empty.clone()),
+            (empty, yes.clone()),
+            (absent.clone(), yes.clone()),
+            (yes, absent),
+        ] {
+            let facet = schema_facet_of("input_schema", baseline.clone(), current.clone())
+                .unwrap_or_else(|| panic!("{baseline} -> {current}: not claimed at all"));
+            assert_eq!(
+                facet.change,
+                ChangeKind::Unchanged,
+                "{baseline} -> {current}"
+            );
+            assert_eq!(facet.risk, RiskLevel::None, "{baseline} -> {current}");
+            assert!(!facet.is_change(), "{baseline} -> {current}");
+            assert!(facet.details.is_empty(), "{baseline} -> {current}");
+            // Both fingerprints stay in the report: the bytes did move, and hiding
+            // that would be its own kind of lie.
+            assert!(facet.before_digest.is_some() && facet.after_digest.is_some());
+        }
+    }
+
+    #[test]
+    fn schema_contract_changes_keep_their_policy_rows() {
+        // The fix must not weaken a real contract change.
+        let open = serde_json::json!({ "type": "object", "properties": {} });
+        let closed = serde_json::json!({
+            "type": "object", "properties": {}, "additionalProperties": false
+        });
+
+        let tightened = schema_facet_of("input_schema", open.clone(), closed.clone()).unwrap();
+        assert_eq!(tightened.risk, RiskLevel::High);
+        assert!(tightened.is_change());
+
+        let loosened = schema_facet_of("input_schema", closed, open).unwrap();
+        assert_eq!(loosened.risk, RiskLevel::Medium);
+        assert!(loosened.is_change());
+    }
+
+    #[test]
+    fn a_schema_valued_form_is_never_declared_equivalent() {
+        // `{}` is permissive but `{"type": "string"}` is not something this analyzer
+        // will order against it, so the honest verdict is "unaccounted for" — HIGH,
+        // with no direction claimed.
+        let open = serde_json::json!({ "type": "object", "properties": {} });
+        let filtered = serde_json::json!({
+            "type": "object", "properties": {},
+            "additionalProperties": { "type": "string" }
+        });
+
+        for (baseline, current) in [
+            (open.clone(), filtered.clone()),
+            (filtered.clone(), open.clone()),
+        ] {
+            let facet = schema_facet_of("input_schema", baseline.clone(), current.clone())
+                .unwrap_or_else(|| panic!("{baseline} -> {current}"));
+            assert_eq!(facet.risk, RiskLevel::High, "{baseline} -> {current}");
+            assert!(facet.is_change(), "{baseline} -> {current}");
+            assert!(
+                facet.details.is_empty(),
+                "no direction is claimed: {:?}",
+                facet.details
+            );
+        }
+    }
+
+    #[test]
+    fn an_equivalent_form_does_not_hide_a_named_change() {
+        // The equivalence is absorbed inside the same facet analysis, so it must
+        // neither add risk nor subtract any: MEDIUM is exactly the description row.
         let baseline = tool_with_schema(
             "input_schema",
-            serde_json::json!({ "type": "object", "properties": {} }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "A." } }
+            }),
         );
         let current = tool_with_schema(
             "input_schema",
             serde_json::json!({
-                "type": "object", "properties": {}, "additionalProperties": {}
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "B." } },
+                "additionalProperties": {}
+            }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::Medium);
+        assert_eq!(
+            changes[0].details[0].path,
+            "properties.query.description".to_string()
+        );
+    }
+
+    #[test]
+    fn an_equivalent_form_does_not_hide_an_unclassified_change() {
+        // description (MEDIUM) + examples (unclassified) + absent → {} (equivalent).
+        // The equivalent part must disappear without suppressing either of the other
+        // two, so the facet is HIGH and still names the description.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "description": "A",
+                "properties": {}
+            }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "description": "B",
+                "properties": {},
+                "additionalProperties": {},
+                "examples": [{}]
             }),
         );
 
         let changes = tool(&baseline, &current);
         assert_eq!(changes[0].risk, RiskLevel::High);
-        assert!(
-            changes[0].details.is_empty(),
-            "no direction is claimed: {:?}",
-            changes[0].details
+        assert_eq!(changes[0].details.len(), 1, "{:?}", changes[0].details);
+        assert_eq!(changes[0].details[0].path, "description".to_string());
+    }
+
+    #[test]
+    fn a_malformed_required_value_is_never_declared_equivalent() {
+        // The set view of `required` maps both of these to the empty set, so without
+        // an explicit guard this pair would read as agreement — silence, not
+        // equivalence.
+        let malformed = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {}, "required": "query" }),
         );
+        let empty = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        );
+
+        let changes = tool(&malformed, &empty);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert!(changes[0].is_change());
+    }
+
+    #[test]
+    fn a_permissive_form_change_that_hides_nothing_reports_no_facet_at_all() {
+        // The end of the pipeline for this case: `tool()` sees a facet that was
+        // claimed and found unchanged, so a dependency whose only difference is this
+        // is not reported as changed by the engine.
+        let changes = tool(
+            &tool_with_schema(
+                "input_schema",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            ),
+            &tool_with_schema(
+                "input_schema",
+                serde_json::json!({
+                    "type": "object", "properties": {}, "additionalProperties": {}
+                }),
+            ),
+        );
+
+        assert!(
+            changes.iter().all(|change| !change.is_change()),
+            "{changes:?}"
+        );
+        assert!(changes.iter().all(|change| change.risk == RiskLevel::None));
     }
 }

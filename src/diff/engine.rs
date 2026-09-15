@@ -198,6 +198,23 @@ mod tests {
             .collect()
     }
 
+    /// A facet with a recorded payload, the way discovery writes schema facets: the
+    /// analyzer needs the payload to have an opinion at all.
+    fn recorded_facet(schema: serde_json::Value) -> Facet {
+        Facet {
+            digest: Digest::sha256(schema.to_string().as_bytes()),
+            shape: None,
+            normalized: Some(schema),
+        }
+    }
+
+    fn recorded_facets(pairs: Vec<(&str, serde_json::Value)>) -> BTreeMap<String, Facet> {
+        pairs
+            .into_iter()
+            .map(|(name, schema)| (name.to_string(), recorded_facet(schema)))
+            .collect()
+    }
+
     fn dependency(kind: DependencyKind, id: &str, pairs: &[(&str, &str)]) -> Dependency {
         Dependency {
             id: id.to_string(),
@@ -550,5 +567,80 @@ mod tests {
             report.overall_risk,
             max_risk(report.changes.iter().map(|change| change.risk))
         );
+    }
+
+    #[test]
+    fn a_semantically_equivalent_schema_is_not_swept_back_in_as_unknown() {
+        // The whole pipeline, including the engine's sweep of facets whose digests
+        // moved and which no analyzer claimed. If equivalence came back as "no facet
+        // change at all", that sweep would resurrect it as an unknown-facet HIGH —
+        // which is why the analyzer claims the facet and declares it unchanged.
+        let baseline = lockfile_with(
+            vec![(
+                "tool:github.search",
+                DependencyKind::Tool,
+                recorded_facets(vec![(
+                    "input_schema",
+                    serde_json::json!({ "type": "object" }),
+                )]),
+            )],
+            "before",
+        );
+        let current = lockfile_with(
+            vec![(
+                "tool:github.search",
+                DependencyKind::Tool,
+                recorded_facets(vec![(
+                    "input_schema",
+                    serde_json::json!({ "type": "object", "additionalProperties": {} }),
+                )]),
+            )],
+            "after",
+        );
+
+        let report = diff(&baseline, &current);
+        assert!(
+            !report.changed,
+            "a semantically null edit was reported: {:?}",
+            report.changes
+        );
+        assert!(report.changes.is_empty());
+        assert_eq!(report.overall_risk, RiskLevel::None);
+        // The aggregates still differ: the fingerprint layer is not being told
+        // anything untrue, only that its movement meant nothing semantic.
+        assert_ne!(report.baseline_checksum, report.current_checksum);
+    }
+
+    #[test]
+    fn a_genuinely_unknown_schema_change_is_still_swept_in() {
+        // The companion of the test above: the same shape with a difference the
+        // analyzer cannot name must still be reported, so the equivalence path cannot
+        // become a way to silence unknown drift.
+        let baseline = lockfile_with(
+            vec![(
+                "tool:github.search",
+                DependencyKind::Tool,
+                recorded_facets(vec![(
+                    "input_schema",
+                    serde_json::json!({ "type": "object" }),
+                )]),
+            )],
+            "before",
+        );
+        let current = lockfile_with(
+            vec![(
+                "tool:github.search",
+                DependencyKind::Tool,
+                recorded_facets(vec![(
+                    "input_schema",
+                    serde_json::json!({ "type": "object", "examples": [{}] }),
+                )]),
+            )],
+            "after",
+        );
+
+        let report = diff(&baseline, &current);
+        assert!(report.changed, "{report:?}");
+        assert_eq!(report.overall_risk, RiskLevel::High);
     }
 }

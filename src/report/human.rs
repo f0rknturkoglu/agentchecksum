@@ -128,6 +128,10 @@ fn describe(detail: &DetailChange) -> String {
 }
 
 /// A facet line: the name, then the fingerprint evidence.
+///
+/// `unchanged` also covers a facet whose fingerprints differ but whose meaning does
+/// not — the semantic layer concluded equivalence — which is why this branch matches
+/// on the change kind rather than on the digests agreeing.
 fn facet_line(facet: &FacetChange, width: usize) -> String {
     let evidence = match (&facet.before_digest, &facet.after_digest, facet.change) {
         (Some(_), Some(_), ChangeKind::Unchanged) => "unchanged".to_string(),

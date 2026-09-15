@@ -151,6 +151,24 @@ impl FacetChange {
         }
     }
 
+    /// A facet whose fingerprints differ but whose meaning does not.
+    ///
+    /// The semantic layer concluded that the two payloads say the same thing in the
+    /// model it implements — `additionalProperties` absent, `true`, and `{}`, for
+    /// instance — while the fingerprint layer, which answers a narrower question,
+    /// recorded two different digests. Both are true, so the report carries both:
+    /// the change state says nothing moved, the digests say the bytes did.
+    pub fn equivalent(name: impl Into<String>, before: Digest, after: Digest) -> Self {
+        Self {
+            name: name.into(),
+            change: ChangeKind::Unchanged,
+            risk: RiskLevel::None,
+            before_digest: Some(before),
+            after_digest: Some(after),
+            details: Vec::new(),
+        }
+    }
+
     pub fn with_details(mut self, details: Vec<DetailChange>) -> Self {
         self.details = details;
         self

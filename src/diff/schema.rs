@@ -73,45 +73,73 @@ impl SchemaDifference {
     }
 }
 
-/// What comparing two schemas produced.
+/// What comparing two schemas concluded.
 ///
-/// Two things, not one: the differences that could be named, and whether anything
-/// differed that could not be. The second field is what keeps a *mixed* change
-/// honest, and it is not derivable from the first.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SchemaAnalysis {
-    /// The named differences, sorted for stable output.
-    pub differences: Vec<SchemaDifference>,
-    /// Whether the schemas differ somewhere this analyzer cannot name: a key it
-    /// does not interpret, a construct it declines to order, or a subtree past its
-    /// depth bound.
+/// Three outcomes have to stay apart, because everything downstream treats them
+/// differently: a difference the analyzer can name (the policy table decides), a
+/// difference it cannot name (the caller's generic floor), and no difference of
+/// meaning at all (nothing to report, whatever the fingerprints say).
+///
+/// The first two are `Changed`; the third is `Equivalent`. Reporting an
+/// `Equivalent` pair as "the analyzer found nothing" is what let a semantically
+/// null edit — `additionalProperties` absent against `{}` — come out as a generic
+/// HIGH, so the distinction is carried in the type rather than inferred from an
+/// empty list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaComparison {
+    /// Every difference the analyzer could see is insignificant in the model it
+    /// implements: the two payloads differ in bytes, not in meaning.
     ///
-    /// The caller must apply the generic schema risk when this is set, **even when
-    /// `differences` is not empty**. A schema that changed in one place the
-    /// analyzer understands and in another place it does not is not a classified
-    /// change; reporting only the understood part is precisely the under-reporting
-    /// this flag exists to prevent.
-    pub has_unclassified_change: bool,
+    /// This is a conclusion, not the absence of one. The fingerprint layer answers
+    /// "did the normalized state change"; this layer answers "did that change mean
+    /// anything" — and here it did not.
+    Equivalent,
+    /// The analyzer did not conclude equivalence.
+    ///
+    /// `differences` are the named ones. `has_unclassified_change` says whether part
+    /// of the difference is beyond this analyzer, in which case the caller's generic
+    /// floor applies **on top of** whatever was named: a change that is part
+    /// understood and part not is not a classified change.
+    ///
+    /// Empty `differences` with the flag set is a real state: payloads this analyzer
+    /// cannot compare at all, or byte-identical payloads whose fingerprints disagree.
+    Changed {
+        differences: Vec<SchemaDifference>,
+        has_unclassified_change: bool,
+    },
 }
 
-impl SchemaAnalysis {
-    /// Whether the pair produced nothing at all: nothing named, nothing flagged.
-    ///
-    /// A caller only reaches this when the recorded digests differed, so it means a
-    /// payload disagrees with its own digest. That is a distinct case from "every
-    /// difference was classified", which is why the caller cannot spell this as
-    /// `differences.is_empty()`.
-    pub fn found_nothing(&self) -> bool {
-        self.differences.is_empty() && !self.has_unclassified_change
-    }
+/// What the walk collected.
+///
+/// Private on purpose: it can represent "no differences and nothing unclassified",
+/// which is a conclusion (`Equivalent`) rather than a result, and `compare` is the
+/// only place that decides which of the two it is.
+#[derive(Debug, Default)]
+struct Findings {
+    differences: Vec<SchemaDifference>,
+    has_unclassified_change: bool,
 }
 
 /// Compare two schemas.
-pub fn compare(baseline: &Value, current: &Value) -> SchemaAnalysis {
-    let mut analysis = SchemaAnalysis::default();
-    compare_node(baseline, current, "", 0, &mut analysis);
+pub fn compare(baseline: &Value, current: &Value) -> SchemaComparison {
+    // Identical payloads with disagreeing fingerprints are neither equivalent nor a
+    // difference: there is nothing to compare, and the two layers contradict each
+    // other. For a lockfile this project wrote it cannot happen — a facet's digest is
+    // taken over the payload stored beside it — so it means the file was edited by
+    // hand or written by something else, and the caller's floor is the honest answer.
+    // (Cross-validating a digest against its payload on load is separate,
+    // deliberately deferred work.)
+    if baseline == current {
+        return SchemaComparison::Changed {
+            differences: Vec::new(),
+            has_unclassified_change: true,
+        };
+    }
 
-    analysis.differences.sort_by(|a, b| {
+    let mut findings = Findings::default();
+    compare_node(baseline, current, "", 0, &mut findings);
+
+    findings.differences.sort_by(|a, b| {
         let key = |d: &SchemaDifference| {
             (
                 d.detail.path.clone(),
@@ -122,7 +150,16 @@ pub fn compare(baseline: &Value, current: &Value) -> SchemaAnalysis {
         key(a).cmp(&key(b))
     });
 
-    analysis
+    if findings.differences.is_empty() && !findings.has_unclassified_change {
+        // Every difference was examined and judged insignificant in the model this
+        // analyzer implements.
+        SchemaComparison::Equivalent
+    } else {
+        SchemaComparison::Changed {
+            differences: findings.differences,
+            has_unclassified_change: findings.has_unclassified_change,
+        }
+    }
 }
 
 /// A stable rendering of a detail value, used only for ordering.
@@ -135,7 +172,7 @@ fn compare_node(
     current: &Value,
     path: &str,
     depth: usize,
-    analysis: &mut SchemaAnalysis,
+    findings: &mut Findings,
 ) {
     // Equal subtrees cannot contain a difference. Returning here is also what makes
     // the depth rule below exact: a subtree is only "too deep" when it differs.
@@ -147,14 +184,14 @@ fn compare_node(
     // exactly the failure this analyzer must not have, since it would make a deep
     // change *quieter* than a shallow one.
     if depth > MAX_DEPTH {
-        analysis.has_unclassified_change = true;
+        findings.has_unclassified_change = true;
         return;
     }
 
     let (Some(baseline), Some(current)) = (baseline.as_object(), current.as_object()) else {
         // A boolean schema, or a malformed node: nothing here is interpreted, so the
         // difference is unclassified rather than silent.
-        analysis.has_unclassified_change = true;
+        findings.has_unclassified_change = true;
         return;
     };
 
@@ -166,7 +203,7 @@ fn compare_node(
             continue;
         }
         if baseline.get(key) != current.get(key) {
-            analysis.has_unclassified_change = true;
+            findings.has_unclassified_change = true;
         }
     }
 
@@ -187,7 +224,7 @@ fn compare_node(
     if baseline.get("properties") != current.get("properties")
         && (not_an_object(baseline.get("properties")) || not_an_object(current.get("properties")))
     {
-        analysis.has_unclassified_change = true;
+        findings.has_unclassified_change = true;
     }
 
     let baseline_required = string_set(baseline.get("required"));
@@ -196,7 +233,7 @@ fn compare_node(
     // Properties that disappeared.
     for name in baseline_properties.keys() {
         if !current_properties.contains_key(name) {
-            analysis.differences.push(SchemaDifference::new(
+            findings.differences.push(SchemaDifference::new(
                 SchemaFact::PropertyRemoved,
                 DetailChange::new(
                     child_path(path, &format!("properties.{name}")),
@@ -209,7 +246,7 @@ fn compare_node(
             // disappeared", and the removal must not erase the requirement: the
             // policy table decides from both facts.
             if baseline_required.contains(name.as_str()) {
-                analysis.differences.push(SchemaDifference::new(
+                findings.differences.push(SchemaDifference::new(
                     SchemaFact::RequiredRemoved,
                     DetailChange::one_sided(
                         child_path(path, "required"),
@@ -227,7 +264,7 @@ fn compare_node(
             continue;
         }
         if current_required.contains(name.as_str()) {
-            analysis.differences.push(SchemaDifference::new(
+            findings.differences.push(SchemaDifference::new(
                 SchemaFact::RequiredAdded,
                 DetailChange::one_sided(
                     child_path(path, "required"),
@@ -236,7 +273,7 @@ fn compare_node(
                 ),
             ));
         } else {
-            analysis.differences.push(SchemaDifference::new(
+            findings.differences.push(SchemaDifference::new(
                 SchemaFact::OptionalPropertyAdded,
                 DetailChange::new(
                     child_path(path, &format!("properties.{name}")),
@@ -250,7 +287,7 @@ fn compare_node(
     // existing calls, so it gets its own decision.
     for name in current_required.difference(&baseline_required) {
         if baseline_properties.contains_key(name.as_str()) {
-            analysis.differences.push(SchemaDifference::new(
+            findings.differences.push(SchemaDifference::new(
                 SchemaFact::RequiredAdded,
                 DetailChange::one_sided(
                     child_path(path, "required"),
@@ -266,7 +303,7 @@ fn compare_node(
     // dropped while the property itself stayed.
     for name in baseline_required.difference(&current_required) {
         if current_properties.contains_key(name.as_str()) {
-            analysis.differences.push(SchemaDifference::new(
+            findings.differences.push(SchemaDifference::new(
                 SchemaFact::RequiredRemoved,
                 DetailChange::one_sided(
                     child_path(path, "required"),
@@ -277,16 +314,30 @@ fn compare_node(
         }
     }
 
+    // The two loops above work on the *set* of names, which is what the keyword
+    // means and what the fingerprint layer normalizes. A raw difference they cannot
+    // see is therefore either a reordering (insignificant, §7.3 rule 1) or something
+    // this analyzer does not model — a `required` that is not an array at all, or one
+    // holding entries that are not strings. The second kind must not read as
+    // agreement: `required: "query"` against `required: []` produces no facts and no
+    // set difference, and silence there would be a fail-safe loss.
+    if baseline.get("required") != current.get("required")
+        && (holds_unmodelled_entries(baseline.get("required"))
+            || holds_unmodelled_entries(current.get("required")))
+    {
+        findings.has_unclassified_change = true;
+    }
+
     // Each keyword comparison reports whether it classified the difference it saw.
     // One that did not leaves this node with something unexplained, and that
     // verdict has to survive whatever else was classified here.
-    let mut classified = compare_type(baseline, current, path, &mut analysis.differences);
-    classified &= compare_description(baseline, current, path, &mut analysis.differences);
-    classified &= compare_enum(baseline, current, path, &mut analysis.differences);
-    classified &= compare_additional_properties(baseline, current, path, &mut analysis.differences);
-    classified &= compare_items(baseline, current, path, depth, analysis);
+    let mut classified = compare_type(baseline, current, path, &mut findings.differences);
+    classified &= compare_description(baseline, current, path, &mut findings.differences);
+    classified &= compare_enum(baseline, current, path, &mut findings.differences);
+    classified &= compare_additional_properties(baseline, current, path, &mut findings.differences);
+    classified &= compare_items(baseline, current, path, depth, findings);
     if !classified {
-        analysis.has_unclassified_change = true;
+        findings.has_unclassified_change = true;
     }
 
     for (name, baseline_child) in baseline_properties {
@@ -294,7 +345,7 @@ fn compare_node(
             continue;
         };
         let child = child_path(path, &format!("properties.{name}"));
-        compare_node(baseline_child, current_child, &child, depth + 1, analysis);
+        compare_node(baseline_child, current_child, &child, depth + 1, findings);
     }
 }
 
@@ -533,7 +584,7 @@ fn compare_items(
     current: &serde_json::Map<String, Value>,
     path: &str,
     depth: usize,
-    analysis: &mut SchemaAnalysis,
+    findings: &mut Findings,
 ) -> bool {
     let before = baseline.get("items");
     let after = current.get("items");
@@ -549,8 +600,21 @@ fn compare_items(
     };
 
     let child = child_path(path, "items");
-    compare_node(before_items, after_items, &child, depth + 1, analysis);
+    compare_node(before_items, after_items, &child, depth + 1, findings);
     true
+}
+
+/// Whether a `required` value carries anything the set view drops: entries that are
+/// not strings, or a value that is not an array at all.
+///
+/// A difference in those is a real difference this analyzer does not model, which is
+/// why it is reported as unclassified rather than silently dropped.
+fn holds_unmodelled_entries(value: Option<&Value>) -> bool {
+    match value {
+        None => false,
+        Some(Value::Array(items)) => items.iter().any(|item| !item.is_string()),
+        Some(_) => true,
+    }
 }
 
 /// The `required` keyword as a set of names, ignoring anything that is not a
@@ -574,17 +638,36 @@ mod tests {
     use crate::diff::risk::SchemaFact;
     use serde_json::json;
 
+    /// The named facts. An equivalent pair names none, which is the point.
     fn facts(baseline: Value, current: Value) -> Vec<SchemaFact> {
-        compare(&baseline, &current)
-            .differences
+        differences(baseline, current)
             .into_iter()
             .map(|difference| difference.fact)
             .collect()
     }
 
+    /// The named differences, whatever state the comparison reached.
+    fn differences(baseline: Value, current: Value) -> Vec<SchemaDifference> {
+        match compare(&baseline, &current) {
+            SchemaComparison::Changed { differences, .. } => differences,
+            SchemaComparison::Equivalent => Vec::new(),
+        }
+    }
+
     /// Whether the analyzer found something it could not name.
     fn unclassified(baseline: Value, current: Value) -> bool {
-        compare(&baseline, &current).has_unclassified_change
+        match compare(&baseline, &current) {
+            SchemaComparison::Changed {
+                has_unclassified_change,
+                ..
+            } => has_unclassified_change,
+            SchemaComparison::Equivalent => false,
+        }
+    }
+
+    /// Whether the analyzer concluded that the two payloads mean the same thing.
+    fn equivalent(baseline: Value, current: Value) -> bool {
+        matches!(compare(&baseline, &current), SchemaComparison::Equivalent)
     }
 
     /// Nest a schema inside `depth` object properties, for the depth-bound tests.
@@ -597,8 +680,7 @@ mod tests {
     }
 
     fn paths(baseline: Value, current: Value) -> Vec<String> {
-        compare(&baseline, &current)
-            .differences
+        differences(baseline, current)
             .into_iter()
             .map(|difference| difference.detail.path)
             .collect()
@@ -616,7 +698,7 @@ mod tests {
             json!(["query", "owner"]),
         );
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::RequiredAdded);
         assert_eq!(differences[0].detail.path, "required");
@@ -642,7 +724,7 @@ mod tests {
         let baseline = input_schema(json!({}), json!([]));
         let current = input_schema(json!({ "note": { "type": "string" } }), json!([]));
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::OptionalPropertyAdded);
         assert_eq!(differences[0].detail.path, "properties.note");
@@ -679,7 +761,7 @@ mod tests {
         let baseline = input_schema(json!({ "per_page": { "type": "string" } }), json!([]));
         let current = input_schema(json!({ "per_page": { "type": "integer" } }), json!([]));
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::TypeChanged);
         assert_eq!(differences[0].detail.path, "properties.per_page.type");
@@ -728,7 +810,7 @@ mod tests {
             json!([]),
         );
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::RequiredAdded);
         assert_eq!(differences[0].detail.path, "properties.filter.required");
@@ -746,7 +828,7 @@ mod tests {
             json!([]),
         );
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::TypeChanged);
         assert_eq!(differences[0].detail.path, "properties.ids.items.type");
@@ -762,11 +844,14 @@ mod tests {
         let mut current = baseline.clone();
         current["examples"] = json!([{ "query": "postgres vector search" }]);
 
-        let analysis = compare(&baseline, &current);
-        assert!(analysis.differences.is_empty());
+        assert!(differences(baseline.clone(), current.clone()).is_empty());
         assert!(
-            analysis.has_unclassified_change,
+            unclassified(baseline.clone(), current.clone()),
             "nothing named is not the same as nothing there"
+        );
+        assert!(
+            !equivalent(baseline, current),
+            "unclassified is not equivalence"
         );
     }
 
@@ -775,12 +860,12 @@ mod tests {
         // `true` accepts anything and `false` accepts nothing: the analyzer names
         // nothing for boolean schemas, so the difference must be flagged instead of
         // reported as no difference at all.
-        let analysis = compare(&json!(true), &json!(false));
-        assert!(analysis.differences.is_empty());
-        assert!(analysis.has_unclassified_change);
+        assert!(differences(json!(true), json!(false)).is_empty());
+        assert!(unclassified(json!(true), json!(false)));
+        assert!(!equivalent(json!(true), json!(false)));
 
         // Two malformed nodes are the same story.
-        assert!(compare(&json!("a"), &json!("b")).has_unclassified_change);
+        assert!(unclassified(json!("a"), json!("b")));
     }
 
     #[test]
@@ -791,13 +876,12 @@ mod tests {
         let baseline = nested(MAX_DEPTH + 4, json!({ "type": "string" }));
         let current = nested(MAX_DEPTH + 4, json!({ "type": "integer" }));
 
-        let analysis = compare(&baseline, &current);
         assert!(
-            analysis.differences.is_empty(),
+            differences(baseline.clone(), current.clone()).is_empty(),
             "the walk reported a node past its bound: {:?}",
-            analysis.differences
+            differences(baseline.clone(), current.clone())
         );
-        assert!(analysis.has_unclassified_change);
+        assert!(unclassified(baseline, current));
     }
 
     #[test]
@@ -841,7 +925,7 @@ mod tests {
             json!(["query"]),
         );
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::DescriptionChanged);
         assert_eq!(differences[0].detail.path, "properties.query.description");
@@ -860,7 +944,7 @@ mod tests {
         );
         let current = input_schema(json!({ "query": { "type": "string" } }), json!(["query"]));
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         assert_eq!(differences.len(), 1, "{differences:?}");
         assert_eq!(differences[0].fact, SchemaFact::DescriptionChanged);
         assert_eq!(differences[0].detail.change, ChangeKind::Removed);
@@ -882,7 +966,7 @@ mod tests {
 
         // An absent key means `true`, so it is shown as such rather than as
         // nothing.
-        let differences = compare(&loose, &tight).differences;
+        let differences = differences(loose.clone(), tight.clone());
         assert_eq!(differences[0].detail.before, Some(json!(true)));
         assert_eq!(differences[0].detail.after, Some(json!(false)));
         assert_eq!(
@@ -892,10 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn two_schema_valued_forms_are_left_to_the_generic_fallback() {
-        // Ranking two schema-valued forms needs reasoning this analyzer does not
-        // do. The verdict is "unclassified", not "no change": the caller's generic
-        // floor is the honest answer, and it is never quieter than the named rows.
+    fn two_schema_valued_forms_are_unclassified_not_equivalent() {
+        // Ranking two schema-valued forms needs reasoning this analyzer does not do.
+        // The verdict is "I cannot account for this", which is not the same statement
+        // as "these mean the same thing": the caller's generic floor applies, and it
+        // is never quieter than the named rows.
         let closed = json!({ "type": "object", "additionalProperties": false });
         let filtered = json!({ "type": "object", "additionalProperties": { "type": "string" } });
         let open = json!({ "type": "object", "additionalProperties": {} });
@@ -907,31 +992,85 @@ mod tests {
             (open.clone(), filtered.clone()),
             (filtered, other),
         ] {
-            let analysis = compare(&baseline, &current);
-            assert!(analysis.differences.is_empty(), "{baseline} -> {current}");
-            assert!(analysis.has_unclassified_change, "{baseline} -> {current}");
+            assert!(
+                differences(baseline.clone(), current.clone()).is_empty(),
+                "{baseline} -> {current}"
+            );
+            assert!(
+                unclassified(baseline.clone(), current.clone()),
+                "{baseline} -> {current}"
+            );
+            assert!(
+                !equivalent(baseline.clone(), current.clone()),
+                "{baseline} -> {current}"
+            );
         }
     }
 
     #[test]
-    fn permissive_additional_properties_forms_are_the_same_statement() {
+    fn permissive_additional_properties_forms_are_equivalent() {
         // An absent key means `true`, and `{}` constrains nothing, so all three say
-        // the same thing. Reporting a direction between them would be a false alarm
-        // on a change that cannot affect behavior.
+        // the same thing. The conclusion is equivalence — not "no named difference",
+        // which is what let the pipeline report a generic HIGH for these before:
+        // nothing here is unaccounted for and nothing here differs in meaning.
         let absent = json!({ "type": "object" });
         let empty = json!({ "type": "object", "additionalProperties": {} });
         let yes = json!({ "type": "object", "additionalProperties": true });
 
         for (baseline, current) in [
             (absent.clone(), empty.clone()),
-            (empty.clone(), absent),
+            (empty.clone(), absent.clone()),
             (yes.clone(), empty.clone()),
-            (empty, yes),
+            (empty, yes.clone()),
+            (absent.clone(), yes.clone()),
+            (yes, absent),
         ] {
-            let analysis = compare(&baseline, &current);
-            assert!(analysis.differences.is_empty(), "{baseline} -> {current}");
-            assert!(!analysis.has_unclassified_change, "{baseline} -> {current}");
+            assert!(
+                equivalent(baseline.clone(), current.clone()),
+                "{baseline} -> {current}"
+            );
+            assert!(
+                differences(baseline.clone(), current.clone()).is_empty(),
+                "{baseline} -> {current}"
+            );
+            assert!(
+                !unclassified(baseline.clone(), current.clone()),
+                "{baseline} -> {current}"
+            );
         }
+    }
+
+    #[test]
+    fn identical_payloads_with_disagreeing_fingerprints_are_not_equivalence() {
+        // A facet's digest is taken over the payload stored beside it, so this pair
+        // cannot come from a lockfile this project wrote: it means the file was
+        // edited or written by something else. There is nothing to compare and the two
+        // layers contradict each other, so it is unaccounted for rather than
+        // equivalent — equivalence is a conclusion about a difference that was read.
+        let schema = json!({ "type": "object", "properties": {} });
+        assert!(!equivalent(schema.clone(), schema.clone()));
+        assert!(unclassified(schema.clone(), schema.clone()));
+        assert!(differences(schema.clone(), schema).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_required_value_does_not_read_as_agreement() {
+        // `required: "query"` and `required: []` both reduce to the empty set, which
+        // is what the keyword means, so the set comparison sees no difference at all.
+        // Silently calling that agreement would be a fail-safe loss: the value itself
+        // is not something this analyzer models.
+        let malformed = json!({ "type": "object", "properties": {}, "required": "query" });
+        let empty = json!({ "type": "object", "properties": {}, "required": [] });
+
+        assert!(differences(malformed.clone(), empty.clone()).is_empty());
+        assert!(unclassified(malformed.clone(), empty.clone()));
+        assert!(!equivalent(malformed, empty));
+
+        // A reordering, by contrast, is insignificant: the fingerprint layer
+        // normalizes `required` order, so two orderings say the same thing.
+        let first = json!({ "type": "object", "properties": {}, "required": ["a", "b"] });
+        let second = json!({ "type": "object", "properties": {}, "required": ["b", "a"] });
+        assert!(equivalent(first, second));
     }
 
     #[test]
@@ -954,7 +1093,7 @@ mod tests {
         let baseline = input_schema(json!({ "id": { "type": "string" } }), json!(["id"]));
         let current = input_schema(json!({}), json!([]));
 
-        let differences = compare(&baseline, &current).differences;
+        let differences = differences(baseline.clone(), current.clone());
         let facts: Vec<SchemaFact> = differences.iter().map(|d| d.fact).collect();
         assert!(
             facts.contains(&SchemaFact::PropertyRemoved),

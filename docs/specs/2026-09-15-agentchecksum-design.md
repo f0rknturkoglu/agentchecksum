@@ -495,6 +495,15 @@ more than one place, so they are stated rather than implied:
   `true` says, so a difference between those permissive forms is not a change at all. Two
   schema-valued forms are compared but not ordered — ranking them needs reasoning this analyzer does
   not do — so they fall to the generic floor rather than claiming a direction they cannot support.
+- **A moved fingerprint is not by itself a change.** The fingerprint layer answers "did the normalized
+  state change"; the semantic layer answers "did that change mean anything". When two supported forms
+  are equivalent — `additionalProperties` absent, `true`, and `{}` are one such family — the analyzer
+  concludes **equivalence**: the facet is reported as unchanged with both fingerprints kept as
+  evidence, and no risk is attached. An aggregate checksum can therefore differ while the semantic
+  diff reports nothing, and that is a valid state rather than a stale one. Meaning is never inferred
+  from an empty list of named differences: "no difference in meaning" and "a difference this analyzer
+  cannot account for" are separate conclusions, and only the second one takes the floor. Unknown or
+  unsupported differences are unaffected by this and still fall to the generic risk floor.
 
 ```text
 AgentChecksum diff
@@ -647,6 +656,10 @@ consumer reads structure, not sentences.
 - `before`/`after` inside `details` appear only where the baseline recorded a normalized payload to
   read a value from. `before_digest`/`after_digest` are absent when the facet does not exist on that
   side.
+- `"change": "unchanged"` with **differing** digests is not a contradiction: the facet was compared
+  and found semantically equal — `additionalProperties` absent against `{}`, say — while its
+  fingerprint moved. Both facts are carried, because reporting the risk would be a false alarm and
+  dropping the facet would hide a fingerprint the lockfile itself still disagrees on.
 - `status: "ok"` means the comparison ran, regardless of risk. A runtime failure is exit 3 with the
   diagnostic on stderr and nothing on stdout, so `agentchecksum diff --format json | jq` is always
   parseable.
