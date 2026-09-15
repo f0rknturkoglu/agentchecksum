@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::config::RiskLevel;
 use crate::diff::model::{ChangeKind, DetailChange, FacetChange, child_path, max_risk};
-use crate::diff::risk::{self, McpFact, ModelFact, PromptFact, SchemaSide, ToolFact};
+use crate::diff::risk::{self, McpFact, ModelFact, PromptFact, SchemaFact, SchemaSide, ToolFact};
 use crate::diff::schema;
 use crate::lockfile::LockedDependency;
 use crate::manifest::{DependencyKind, Facet};
@@ -366,27 +366,33 @@ fn schema_facet(
         return None;
     }
 
-    let differences = match (before.normalized.as_ref(), after.normalized.as_ref()) {
+    let analysis = match (before.normalized.as_ref(), after.normalized.as_ref()) {
         (Some(before_schema), Some(after_schema)) => schema::compare(before_schema, after_schema),
         // Without a payload there is nothing to interpret.
-        _ => Vec::new(),
+        _ => schema::SchemaAnalysis::default(),
     };
 
-    if differences.is_empty() {
-        // The digests differ and the analyzer could not name why. This is the
-        // path that keeps an uninterpreted construct visible.
-        return Some(FacetChange::new(
-            name,
-            ChangeKind::Modified,
-            risk::schema(side, crate::diff::risk::SchemaFact::Generic),
-        ));
-    }
+    // Read before the differences are moved out, so the verdict can be taken
+    // afterwards without borrowing a partially moved value.
+    //
+    // The floor applies whenever anything about this facet is unclassified — and
+    // that includes the *mixed* case, where the analyzer named some differences and
+    // could not name others. A change that is part understood and part not is not a
+    // classified change: taking only the named facts is exactly how the unexplained
+    // part would disappear from the risk.
+    let unclassified = analysis.has_unclassified_change || analysis.found_nothing();
 
     let mut risks = Vec::new();
     let mut details = Vec::new();
-    for difference in differences {
+    for difference in analysis.differences {
         risks.push(risk::schema(side, difference.fact));
         details.push(difference.detail);
+    }
+
+    // `found_nothing` is the remaining path — a payload that disagrees with its own
+    // digest — and the generic floor is the honest answer for it too.
+    if unclassified {
+        risks.push(risk::schema(side, SchemaFact::Generic));
     }
 
     Some(FacetChange::new(name, ChangeKind::Modified, max_risk(risks)).with_details(details))
@@ -1119,5 +1125,213 @@ mod tests {
     #[test]
     fn max_risk_helper_is_used_by_analyzers() {
         assert_eq!(max_risk([RiskLevel::Low, RiskLevel::High]), RiskLevel::High);
+    }
+
+    // ------------------------------------------- schema fail-safe composition
+
+    /// A schema nested inside `depth` object properties.
+    fn nested(depth: usize, leaf: Value) -> Value {
+        let mut schema = leaf;
+        for _ in 0..depth {
+            schema = serde_json::json!({
+                "type": "object", "properties": { "next": schema }
+            });
+        }
+        schema
+    }
+
+    fn tool_with_schema(name: &'static str, schema: Value) -> LockedDependency {
+        tool_with(vec![(name, schema_facet_value(schema))])
+    }
+
+    #[test]
+    fn a_named_change_beside_an_unnamed_one_keeps_the_generic_floor() {
+        // A property description is MEDIUM; `examples` is unclassified and forces
+        // HIGH. The bug this guards against reported MEDIUM, because only the part
+        // the analyzer could name ever reached the risk calculation.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "A plain phrase." } }
+            }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "A search expression." }
+                },
+                "examples": [{ "query": "postgres vector search" }]
+            }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        // The floor adds to the report rather than replacing what was named.
+        assert_eq!(
+            changes[0].details[0].path,
+            "properties.query.description".to_string()
+        );
+    }
+
+    #[test]
+    fn an_optional_property_addition_beside_an_unnamed_change_keeps_the_floor() {
+        // Optional property added is LOW on its own — the weakest row in the table,
+        // and therefore the one a lost fallback hides most efficiently.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "note": { "type": "string" } },
+                "title": "Not interpreted"
+            }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert_eq!(changes[0].details[0].path, "properties.note".to_string());
+    }
+
+    #[test]
+    fn a_change_past_the_depth_bound_keeps_the_generic_floor() {
+        // The leaf must genuinely differ: an identical deep subtree short-circuits,
+        // and only a real difference past the bound is what the walk cannot reach.
+        let baseline = tool_with_schema(
+            "input_schema",
+            nested(
+                9,
+                serde_json::json!({ "type": "string", "examples": ["a"] }),
+            ),
+        );
+        let mut current_schema = nested(
+            9,
+            serde_json::json!({ "type": "string", "examples": ["b"] }),
+        );
+        current_schema["description"] = serde_json::json!("Root description.");
+
+        let changes = tool(&baseline, &tool_with_schema("input_schema", current_schema));
+
+        // The named root change would be MEDIUM on its own.
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert_eq!(
+            changes[0].details[0].path,
+            "description".to_string(),
+            "the named difference is still reported"
+        );
+    }
+
+    #[test]
+    fn a_named_only_change_keeps_its_policy_row() {
+        // The other half of the invariant: when every difference is classified, the
+        // generic floor must *not* appear. Otherwise the fix would just make
+        // everything HIGH.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "A." } }
+            }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "B." } }
+            }),
+        );
+
+        assert_eq!(tool(&baseline, &current)[0].risk, RiskLevel::Medium);
+    }
+
+    #[test]
+    fn an_unclassified_only_change_is_still_high() {
+        // The behaviour that already worked, kept next to the new one so a fix that
+        // dropped either path is visible.
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object", "properties": {},
+                "examples": [{ "query": "postgres vector search" }]
+            }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert!(changes[0].details.is_empty());
+    }
+
+    #[test]
+    fn a_required_output_property_removed_entirely_is_critical() {
+        let baseline = tool_with_schema(
+            "output_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        );
+        let current = tool_with_schema(
+            "output_schema",
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        );
+
+        // Two facts, not one: the property is gone (HIGH) and a required output is
+        // gone (CRITICAL). The removal must not erase the requirement.
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::Critical);
+        assert_eq!(changes[0].details.len(), 2, "{:?}", changes[0].details);
+        assert_eq!(changes[0].details[0].path, "properties.id".to_string());
+        assert_eq!(changes[0].details[1].path, "required".to_string());
+    }
+
+    #[test]
+    fn an_optional_output_property_removed_is_high() {
+        let baseline = tool_with_schema(
+            "output_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "note": { "type": "string" } },
+                "required": []
+            }),
+        );
+        let current = tool_with_schema(
+            "output_schema",
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        );
+
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert_eq!(changes[0].details.len(), 1, "{:?}", changes[0].details);
+    }
+
+    #[test]
+    fn a_required_input_property_removed_entirely_follows_the_input_rows() {
+        let baseline = tool_with_schema(
+            "input_schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        );
+        let current = tool_with_schema(
+            "input_schema",
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        );
+
+        // max(PropertyRemoved: HIGH, RequiredRemoved: MEDIUM) on the input side.
+        let changes = tool(&baseline, &current);
+        assert_eq!(changes[0].risk, RiskLevel::High);
+        assert_eq!(changes[0].details.len(), 2, "{:?}", changes[0].details);
     }
 }

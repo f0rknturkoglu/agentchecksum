@@ -480,6 +480,22 @@ formatting-only change.
 Anything outside this set is reported as a generic schema change. Classification is fail-safe:
 an unrecognized change never scores below MEDIUM.
 
+Two details of that fail-safe decide what "an unrecognized change" means once a schema differs in
+more than one place, so they are stated rather than implied:
+
+- **The floor composes with whatever was named.** A schema whose property description changed *and*
+  whose `examples` changed is not a MEDIUM change with a footnote. The analyzer reports the
+  differences it can name and, *separately*, whether anything differed that it could not name; the
+  risk is the maximum of the named rows and the generic floor. A change that is part understood and
+  part not is not a classified change, and reporting only the understood half is precisely the
+  under-reporting this rule exists to prevent. The same applies to a difference sitting past the
+  analyzer's depth bound: unreached is not unchanged.
+- **`additionalProperties` is ordered only where a bounded analyzer can order it.** `false` against an
+  absent key, `true`, or `{}` is a direction. `{}` constrains nothing and therefore says exactly what
+  `true` says, so a difference between those permissive forms is not a change at all. Two
+  schema-valued forms are compared but not ordered — ranking them needs reasoning this analyzer does
+  not do — so they fall to the generic floor rather than claiming a direction they cannot support.
+
 ```text
 AgentChecksum diff
 
@@ -574,6 +590,9 @@ Two consequences of the tables above that are easy to miss:
 - **A kind mismatch is CRITICAL and stands alone.** Facet maps produced under different kinds are not
   comparable, so reporting it as "some facets changed" would be a silent reinterpretation of state we
   do not understand.
+- **Removing a required property keeps both facts.** The property is gone (HIGH) and a required field
+  is gone (CRITICAL on the output side), and the maximum decides — so a removed required output is
+  CRITICAL, not HIGH. A removal must not erase the requirement it carried.
 
 Overall risk for a diff is the **maximum** across changes, and is connectable to the gate via
 `fail_on_risk`.
