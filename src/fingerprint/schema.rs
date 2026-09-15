@@ -24,6 +24,11 @@ const SUBSCHEMA_SINGLE: &[&str] = &[
     "additionalItems",
     "additionalProperties",
     "contains",
+    // `contentSchema` describes the *content* of a string, and is a schema position
+    // like any other. MCP tool schemas use it, and without it here an ordering
+    // difference inside `contentSchema.required` or `.enum` would fingerprint as a
+    // real change — the same false positive rule 1 and rule 2 exist to prevent.
+    "contentSchema",
     "else",
     "if",
     "items",
@@ -47,15 +52,25 @@ const SUBSCHEMA_MAP: &[&str] = &[
 /// Keywords whose value is a list of subschemas.
 const SUBSCHEMA_LIST: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
 
-/// Canonical bytes for a JSON Schema document.
-pub fn canonical_schema(schema: &Value) -> Result<Vec<u8>> {
+/// The schema in the form a facet records as its payload.
+///
+/// A facet's digest is taken over exactly this value, which is what makes a stored
+/// payload re-hashable from the lockfile alone
+/// (`digest == sha256(canonical(payload))`). Normalizing an already-normalized
+/// schema is a no-op, so the check is stable.
+pub fn normalized_schema(schema: &Value) -> Value {
     let mut value = schema.clone();
     if let Value::Object(map) = &mut value {
         map.entry("$schema")
             .or_insert_with(|| Value::String(DEFAULT_DIALECT.to_string()));
     }
     normalize_schema(&mut value);
-    canonical::to_vec(&value)
+    value
+}
+
+/// Canonical bytes for a JSON Schema document.
+pub fn canonical_schema(schema: &Value) -> Result<Vec<u8>> {
+    canonical::to_vec(&normalized_schema(schema))
 }
 
 fn normalize_schema(node: &mut Value) {
@@ -215,5 +230,75 @@ mod tests {
     fn a_root_schema_that_is_not_an_object_is_handled() {
         // JSON Schema permits `true` and `false` as whole schemas.
         assert_eq!(canon(json!(true)), "true");
+    }
+
+    #[test]
+    fn required_order_inside_content_schema_is_not_a_change() {
+        // `contentSchema` is a schema position, not data. Sorting inside it is what
+        // keeps a reordered `required` there from reading as a contract change.
+        assert_eq!(
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "object", "required": ["b", "a"] }
+            })),
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "object", "required": ["a", "b"] }
+            }))
+        );
+    }
+
+    #[test]
+    fn enum_order_inside_content_schema_is_not_a_change() {
+        assert_eq!(
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "enum": ["b", "a"] }
+            })),
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "enum": ["a", "b"] }
+            }))
+        );
+    }
+
+    #[test]
+    fn a_semantic_change_inside_content_schema_still_changes_the_digest() {
+        // Normalization must not flatten the position into insignificance: the
+        // ordering rules apply, the content rules do not.
+        assert_ne!(
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "object", "required": ["a"] }
+            })),
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "object", "required": ["a", "b"] }
+            }))
+        );
+        assert_ne!(
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "object" }
+            })),
+            canon(json!({
+                "type": "string",
+                "contentSchema": { "type": "array" }
+            }))
+        );
+    }
+
+    #[test]
+    fn the_recorded_payload_is_the_normalized_form() {
+        // The integrity verifier re-hashes a stored payload, so the payload a facet
+        // records has to be the exact form the digest was taken over — and
+        // normalizing it twice must change nothing.
+        let raw = json!({"type":"object","required":["b","a"]});
+        let payload = normalized_schema(&raw);
+        assert_eq!(
+            canonical_schema(&payload).unwrap(),
+            canonical_schema(&raw).unwrap()
+        );
+        assert_eq!(normalized_schema(&payload), payload);
     }
 }

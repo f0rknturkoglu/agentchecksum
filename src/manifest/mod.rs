@@ -68,6 +68,18 @@ pub enum DependencyKind {
     Model,
     Prompt,
     Tool,
+    /// The serialized token is `mcp`, matching `as_str()` and the `mcp:` id prefix.
+    ///
+    /// Before Phase 3 this variant serialized as `mcp_server` while `as_str()` and
+    /// every dependency id said `mcp`, because `rename_all` derives the token from
+    /// the variant name. No lockfile containing a real MCP dependency had been
+    /// written at that point, so the token is pinned rather than migrated:
+    /// coherence between the lockfile, the JSON report, and human output is worth
+    /// more than preserving a spelling nothing depended on.
+    ///
+    /// `mcp_server` still *reads*, so state written by an early build — or by hand —
+    /// does not become a parse error. New state is always written as `mcp`.
+    #[serde(rename = "mcp", alias = "mcp_server")]
     McpServer,
 }
 
@@ -301,5 +313,46 @@ mod tests {
             agent_checksum(&[v1.clone(), v2.clone()]).unwrap(),
             agent_checksum(&[v2, v1]).unwrap()
         );
+    }
+
+    #[test]
+    fn the_mcp_kind_token_is_pinned_to_mcp() {
+        // One vocabulary across the lockfile, the JSON report, and human output.
+        // The id prefix (`mcp:`), `as_str()`, and the serialized token all have to
+        // agree, or a reader comparing them has to learn two spellings for one
+        // thing.
+        assert_eq!(
+            serde_json::to_string(&DependencyKind::McpServer).unwrap(),
+            "\"mcp\""
+        );
+        assert_eq!(DependencyKind::McpServer.as_str(), "mcp");
+        assert_eq!(
+            serde_json::from_str::<DependencyKind>("\"mcp\"").unwrap(),
+            DependencyKind::McpServer
+        );
+        // The pre-Phase-3 spelling still reads: it is what this enum produced
+        // before the contract was pinned, and refusing it would turn an early
+        // lockfile into a parse error for no gain.
+        assert_eq!(
+            serde_json::from_str::<DependencyKind>("\"mcp_server\"").unwrap(),
+            DependencyKind::McpServer
+        );
+    }
+
+    #[test]
+    fn every_other_kind_token_matches_its_id_prefix() {
+        // The same coherence rule, checked across the enum rather than only for the
+        // variant that changed.
+        for kind in [
+            DependencyKind::Model,
+            DependencyKind::Prompt,
+            DependencyKind::Tool,
+            DependencyKind::McpServer,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{}\"", kind.as_str())
+            );
+        }
     }
 }

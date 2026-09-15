@@ -18,11 +18,26 @@ name = "my-agent"
 [[prompts]]
 path = "prompts/system.md"
 
+# MCP servers are discovered by `snapshot` and `diff`. Discovery reads the tool
+# catalog; it never calls a tool.
+#
+# stdio: the command is executed directly, without a shell, so it must be an
+# executable and every argument its own array entry. `env` values are passed to
+# the server and are never written to the lockfile.
 # [[mcp.servers]]
 # name = "github"
 # transport = "stdio"
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-github"]
+# env = { GITHUB_TOKEN = "..." }
+#
+# streamable-http: the url must be http or https, with no credentials, no query
+# string, and no fragment. Configure the exact endpoint; redirects are not
+# followed.
+# [[mcp.servers]]
+# name = "remote"
+# transport = "streamable-http"
+# url = "https://example.com/mcp"
 
 [probes]
 path = "probes"

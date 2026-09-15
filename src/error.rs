@@ -43,7 +43,7 @@ pub enum Error {
     #[error("unsupported config version {found}; this build supports version {supported}")]
     ConfigVersion { found: u32, supported: u32 },
 
-    #[error("dependency id collision: `{id}` is declared more than once")]
+    #[error("dependency identity collision: `{id}` is claimed more than once")]
     DependencyCollision { id: String },
 
     #[error(
@@ -127,6 +127,37 @@ pub enum Error {
         recorded: String,
         computed: String,
     },
+
+    #[error(
+        "lockfile `{path}` records the wrong digest for `{facet}` of `{id}` (recorded {recorded}, computed from its payload {computed})"
+    )]
+    FacetPayloadMismatch {
+        path: PathBuf,
+        id: String,
+        facet: String,
+        recorded: String,
+        computed: String,
+    },
+
+    /// One variant for the whole discovery path, with the stage carried as a field
+    /// rather than folded into the message: "MCP failed" tells a user nothing, while
+    /// "failed during reading the tool catalog" is the difference between a broken
+    /// server and a broken configuration.
+    #[error("MCP server `{server}` ({transport}) failed during {stage}: {reason}")]
+    McpFailed {
+        server: String,
+        transport: String,
+        stage: String,
+        reason: String,
+    },
+
+    #[error("MCP server `{server}` ({transport}) did not complete {stage} within {seconds}s")]
+    McpTimeout {
+        server: String,
+        transport: String,
+        stage: String,
+        seconds: u64,
+    },
 }
 
 impl Error {
@@ -147,7 +178,12 @@ impl Error {
             Error::ConfigVersion { .. } => {
                 Some("Upgrade agentchecksum, or set `version` to a supported value.".to_string())
             }
-            Error::DependencyCollision { .. } => None,
+            Error::DependencyCollision { .. } => Some(
+                "Two declarations produced one identity. Rename the configured MCP server alias, or \
+                 fix the duplicate declaration — a lockfile that silently kept one of two declared \
+                 dependencies would describe an agent nobody configured."
+                    .to_string(),
+            ),
             Error::PromptPath { .. } => {
                 Some("Use a path relative to the config file, for example `prompts/system.md`.".to_string())
             }
@@ -200,6 +236,36 @@ impl Error {
                  snapshot`."
                     .to_string(),
             ),
+            Error::FacetPayloadMismatch { .. } => Some(
+                "A recorded payload no longer matches the digest beside it, so the file was edited \
+                 by hand or written by another tool. Restore it from version control, or \
+                 regenerate it deliberately with `agentchecksum snapshot`."
+                    .to_string(),
+            ),
+            Error::McpFailed { stage, .. } if stage.contains("starting the server") => Some(
+                "Check `command` and `args` in `[[mcp.servers]]`. The command is executed directly, \
+                 without a shell, so it must be an executable and each argument its own entry."
+                    .to_string(),
+            ),
+            Error::McpFailed { stage, .. } if stage.contains("connecting") => Some(
+                "Check that the server is reachable at the configured address, and that it speaks \
+                 a supported MCP protocol revision."
+                    .to_string(),
+            ),
+            Error::McpFailed { stage, .. } if stage.contains("tool catalog") => Some(
+                "Fix the server's tool catalog, or exclude the server from `[[mcp.servers]]`. \
+                 AgentChecksum never fingerprints a partial catalog."
+                    .to_string(),
+            ),
+            Error::McpFailed { .. } => Some(
+                "Run the server on its own to see what it reports, then re-run `agentchecksum \
+                 snapshot`."
+                    .to_string(),
+            ),
+            Error::McpTimeout { stage, .. } => Some(format!(
+                "The server did not finish {stage}. Check that it responds to MCP requests, or \
+                 point `[[mcp.servers]]` at a server that does."
+            )),
         }
     }
 }

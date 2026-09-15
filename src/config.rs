@@ -62,6 +62,59 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
+/// The longest an MCP server alias may be. The alias prefixes every dependency id
+/// that server produces, so this bounds the ids as well as the name.
+pub const MAX_ALIAS_BYTES: usize = 64;
+
+/// Whether a configured MCP server alias is one this build will use.
+///
+/// An alias is a namespace, not a display name. It becomes the prefix of every
+/// dependency id the server produces, so it has to be stable, portable, and — the
+/// load-bearing part — unable to contain the tool separator. `tool:<alias>.<tool>`
+/// splits on the first dot, so an alias containing one would let two different
+/// servers produce the same tool identity.
+pub fn is_valid_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= MAX_ALIAS_BYTES
+        && alias.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
+/// Why an MCP endpoint URL is not one this build will use.
+///
+/// Returns the component that is wrong, never the URL itself: an endpoint is the one
+/// configuration value that can carry a credential, and a diagnostic is the wrong
+/// place to repeat one. Every unsupported component is *rejected* rather than
+/// stripped — a query string can select a different deployment behind the same host,
+/// so removing it would fingerprint a server the user did not configure.
+fn endpoint_problem(url: &str) -> Option<&'static str> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Some("it is not an absolute URL with a scheme");
+    };
+    if scheme != "http" && scheme != "https" {
+        return Some("only `http` and `https` endpoints are supported");
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Some("it names no host");
+    }
+    if authority.contains('@') {
+        return Some("it contains embedded credentials, which are not supported");
+    }
+    if url.contains('?') {
+        return Some(
+            "it contains a query string, which can select a different deployment behind the same \
+             host; configure the exact endpoint instead",
+        );
+    }
+    if url.contains('#') {
+        return Some("it contains a fragment");
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -204,6 +257,19 @@ impl Config {
 
         let mut server_names: BTreeSet<&str> = BTreeSet::new();
         for server in &self.mcp.servers {
+            // The grammar is checked before the collision set, so a name that could
+            // not be an identity is reported as such rather than as a duplicate.
+            if !is_valid_alias(&server.name) {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "MCP server name `{}` is not a usable alias: use letters, digits, `-` and \
+                         `_`, at most {MAX_ALIAS_BYTES} characters, and no `.` (the alias prefixes \
+                         every dependency id the server produces, and a dot would make two \
+                         different servers able to claim one tool identity)",
+                        server.name
+                    ),
+                });
+            }
             if !server_names.insert(server.name.as_str()) {
                 return Err(Error::ConfigInvalid {
                     reason: format!(
@@ -233,6 +299,20 @@ impl Config {
                     return Err(Error::ConfigInvalid {
                         reason: format!(
                             "MCP server `{}` uses the streamable-http transport but declares no `url`",
+                            server.name
+                        ),
+                    });
+                }
+                // The URL itself is never repeated in the reason: an endpoint is the
+                // one configuration value that can carry a credential.
+                Transport::StreamableHttp
+                    if endpoint_problem(server.url.as_deref().unwrap_or_default()).is_some() =>
+                {
+                    let problem = endpoint_problem(server.url.as_deref().unwrap_or_default())
+                        .unwrap_or("it is not usable");
+                    return Err(Error::ConfigInvalid {
+                        reason: format!(
+                            "MCP server `{}` has an unusable `url`: {problem}",
                             server.name
                         ),
                     });
@@ -624,5 +704,111 @@ path = "./prompts/system.md"
     fn a_path_with_no_components_is_rejected() {
         assert!(normalize_rel_path("").is_err());
         assert!(normalize_rel_path(".").is_err());
+    }
+
+    // ------------------------------------------------------------ MCP aliases
+
+    fn with_server(server: &str) -> String {
+        format!("{MINIMAL}\n[[mcp.servers]]\n{server}\n")
+    }
+
+    #[test]
+    fn an_alias_may_not_contain_the_tool_separator() {
+        // The whole reason the grammar exists: `tool:<alias>.<tool>` separates on the
+        // first dot, so an alias with a dot would let two servers claim one identity.
+        let err = parse(&with_server(
+            "name = \"github.prod\"\ntransport = \"stdio\"\ncommand = \"server\"",
+        ))
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("github.prod"), "{message}");
+        assert!(message.contains("no `.`"), "{message}");
+        // The reason carries the fix, which is what a suggestion would say.
+        assert!(message.contains("use letters, digits"), "{message}");
+    }
+
+    #[test]
+    fn the_alias_grammar_is_exactly_letters_digits_dash_and_underscore() {
+        for alias in ["github", "github-prod", "a_1", "A-B_c9"] {
+            assert!(is_valid_alias(alias), "{alias}");
+            parse(&with_server(&format!(
+                "name = \"{alias}\"\ntransport = \"stdio\"\ncommand = \"server\""
+            )))
+            .unwrap_or_else(|error| panic!("{alias}: {error}"));
+        }
+
+        for alias in [
+            "",
+            ".",
+            "a.b",
+            "a b",
+            "a/b",
+            "server:1",
+            &"x".repeat(MAX_ALIAS_BYTES + 1),
+        ] {
+            assert!(!is_valid_alias(alias), "{alias:?} should be refused");
+        }
+    }
+
+    // ----------------------------------------------------------- MCP endpoints
+
+    #[test]
+    fn an_endpoint_with_embedded_credentials_is_refused_without_echoing_them() {
+        // A URL is the one configuration value that can carry a credential, so the
+        // diagnostic names the component and never the value.
+        let err = parse(&with_server(
+            "name = \"remote\"\ntransport = \"streamable-http\"\nurl = \"https://user:SECRET@example.com/mcp\"",
+        ))
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("embedded credentials"), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+        assert!(!message.contains("user"), "{message}");
+    }
+
+    #[test]
+    fn an_endpoint_with_a_query_or_fragment_is_refused() {
+        for (url, expected) in [
+            ("https://example.com/mcp?deployment=a", "query string"),
+            ("https://example.com/mcp#frag", "fragment"),
+        ] {
+            let err = parse(&with_server(&format!(
+                "name = \"remote\"\ntransport = \"streamable-http\"\nurl = \"{url}\""
+            )))
+            .unwrap_err();
+            assert!(err.to_string().contains(expected), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_must_be_absolute_http_or_https() {
+        for url in [
+            "example.com/mcp",
+            "ftp://example.com/mcp",
+            "ws://example.com/mcp",
+            "https:///mcp",
+        ] {
+            let err = parse(&with_server(&format!(
+                "name = \"remote\"\ntransport = \"streamable-http\"\nurl = \"{url}\""
+            )))
+            .unwrap_err();
+            assert!(matches!(err, Error::ConfigInvalid { .. }), "{url}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_endpoint_is_accepted() {
+        let config = parse(&with_server(
+            "name = \"remote\"\ntransport = \"streamable-http\"\nurl = \"http://127.0.0.1:8123/mcp\"",
+        ))
+        .unwrap();
+
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(
+            config.mcp.servers[0].url.as_deref(),
+            Some("http://127.0.0.1:8123/mcp")
+        );
     }
 }

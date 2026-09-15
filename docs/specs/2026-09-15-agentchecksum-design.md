@@ -74,8 +74,8 @@ Additional terms used by this specification:
 2. `agentchecksum.toml` + generated `agentchecksum.lock`, byte-deterministic for identical semantic input.
 3. Canonicalization rule set for JSON/JSON Schema and text (§7).
 4. Semantic `diff` with facet-level reporting and deterministic heuristic risk classification (§8).
-5. MCP discovery over **stdio** first, then **Streamable HTTP**: era determination, `tools/list`
-   with full cursor pagination, tool facet extraction (§9).
+5. MCP discovery over **stdio** and **Streamable HTTP**: protocol era, `tools/list` with full cursor
+   pagination, tool facet extraction (§9).
 6. Behavioral probes in TOML with five expectation types; six deterministically derived metrics (§10).
 7. Trace-based evaluation with a model runner (OpenAI-compatible), on-disk trace cache, and an
    offline `--trace` evaluation path (§11).
@@ -670,74 +670,245 @@ consumer reads structure, not sentences.
 
 ## 9. MCP integration
 
-### 9.1 Protocol era — the `2026-07-28` lifecycle
+Implemented in `src/discovery/mcp/`, in the shape the rest of the crate uses: `client.rs` is the only
+I/O (connect, introspect, close), `normalize.rs` is pure and turns the SDK's model into plain data,
+`limits.rs` holds every bound in one place, and `mod.rs` turns a `DiscoveredServer` into dependencies.
+Nothing in the module decides severity: discovery reports what a server declared, and the risk policy
+(§8.3) decides what that means, exactly as it does for models and prompts.
+
+### 9.1 Protocol era and lifecycle
 
 The current MCP revision (`2026-07-28`) has **no negotiation handshake**. Every request declares the
 protocol version, client identity, and client capabilities in its own `_meta` field; the server
-accepts or rejects each request independently. Servers **MUST** implement `server/discover`. Clients
-**MAY** call it before other requests.
+accepts or rejects each request independently. Servers **MUST** implement `server/discover`.
 
-| Era | Revisions | Lifecycle |
+| Era | Revisions | Lifecycle | Recorded `era` token |
+|---|---|---|---|
+| **Stateless** | `2026-07-28` and later | Per-request `_meta`; no session; `server/discover` available | `stateless` |
+| **Legacy** | `2025-11-25` and earlier | `initialize` / `notifications/initialized` handshake | `legacy` |
+
+**How the session is established.** `serve_with_lifecycle(transport, ClientLifecycleMode::Auto { … })`,
+with `2026-07-28` preferred and `2025-11-25` as the legacy version. `Auto` is the SDK's compatibility
+path: it probes with `server/discover`, and falls back to the legacy handshake when the probe returns a
+*correlated* JSON-RPC error whose code is not a modern-era rejection — a legacy server saying it does
+not know the method — or when the server does not answer the probe at all. Version negotiation inside
+that probe is the SDK's own retry loop: an `UnsupportedProtocolVersionError` (code `-32022`, `data`
+carrying `supported` and `requested`) makes it re-ask with a mutually supported version, and a server
+whose list intersects ours in nothing fails the discovery. Everything else propagates — a transport
+failure, a TLS or authorization rejection, an uncorrelated or malformed response. Retrying those as
+legacy would turn an outage into a fingerprint of something else.
+
+The stateless revision is named explicitly rather than taken from the SDK's `LATEST`, which still points
+at `2025-11-25`: asking for `LATEST` would negotiate a session protocol against a server that supports
+both, and the fingerprint would then describe an era the server does not have to be in.
+
+**What is recorded.** The version this session actually *negotiated*, never the preferred one. `era` is
+derived from that version alone, and the comparison is "at least `2026-07-28`" rather than equality, so a
+newer revision is stateless as well. `supported_versions` is the server's own list from
+`server/discover`, sorted and deduplicated because order and repetition carry no meaning there; when the
+server does not report it, the field is omitted and discovery continues with a warning — a server that
+exposes no discovery metadata still has a tool contract worth fingerprinting.
+
+Recording the era is what makes a migration visible: the era decides how a server's declarations are
+read, so a legacy-to-stateless switch is a detectable dependency change even when every tool schema stays
+byte-identical.
+
+**Client identity.** `agentchecksum` plus the crate version, with client capabilities left at their empty
+default. No hostname, user, working directory, or random value: a server that groups or rate-limits
+clients by identity must see the same client on every run, and a fingerprint must not depend on which
+machine produced it. Declaring no capabilities is the smallest statement that is true — discovery does not
+sample, does not offer roots, and does not render UI, and a server is entitled to change what it exposes
+based on what a client says it supports.
+
+### 9.2 Transports
+
+| `transport` | Configuration | How it is started | Endpoint rules |
+|---|---|---|---|
+| `stdio` | `command`, `args`, `env` | The configured command is executed directly with the configured argument vector (`TokioChildProcess`) | — |
+| `streamable-http` | `url` | `StreamableHttpClientTransport` over `http` or `https` | userinfo, query strings, and fragments are rejected rather than stripped; redirects are not followed |
+
+- **stdio.** No shell is involved and none is searched for, so a command carrying shell syntax stays an
+  argument instead of becoming a second command. The configured `env` is passed to the child. The child's
+  stderr goes to `Stdio::null()`: a server is free to log whatever it likes, including the credentials it
+  was started with, and a server's log line must never reach a diagnostic.
+- **streamable-http.** The endpoint is validated by the config layer (§5) and an unsupported component is
+  *rejected*, not removed — a query string can select a different deployment behind the same host, so
+  stripping it would fingerprint a server the user did not configure. A redirect moves the trust boundary,
+  so the endpoint a user needs is the one they configure.
+- **Both.** One server at a time, one connection, closed before the next one starts. Closing is awaited
+  under its own timeout, and a session that will not close cleanly is a warning rather than a failure.
+  Nothing else about the session — PIDs, ports, session ids, cache TTLs, timings — reaches a fingerprint.
+
+Config validation (§5) settles the combinations before discovery runs: `stdio` requires a `command` and
+refuses a `url`, `streamable-http` requires a `url` and refuses `command`, `args`, and `env`, and a
+duplicate alias is an error. A mistyped server therefore fails as configuration rather than as a server
+that will not talk.
+
+### 9.3 Identity and dependency ids
+
+| Unit | Dependency id | Lockfile `kind` token |
 |---|---|---|
-| **Modern** | `2026-07-28` and later | Per-request `_meta`; no session; `server/discover` available |
-| **Legacy** | `2025-11-25` and earlier | `initialize` / `notifications/initialized` handshake |
+| Configured server | `mcp:<alias>` | `mcp` |
+| Tool | `tool:<alias>.<name>` | `tool` |
 
-A version mismatch is reported as `UnsupportedProtocolVersionError` (JSON-RPC code `-32022`) whose
-`data` carries `supported` and `requested` versions; a client **SHOULD** retry with a mutually
-supported version.
+The alias is the user's config `name`, and it is a namespace rather than a display name: it prefixes every
+dependency id the server produces. The grammar is `[A-Za-z0-9_-]+`, at most 64 bytes
+(`MAX_ALIAS_BYTES`), and the load-bearing exclusion is the dot — `tool:<alias>.<name>` splits on the first
+dot, so an alias containing one would let two different servers produce one tool identity. Renaming an
+alias is deliberately an *identity change*: every id changes with it, so the old dependencies are removed
+and the new ones added, which is the honest description of what happened. `serverInfo.name` never
+determines identity, because the protocol does not guarantee it is unique; it is recorded as metadata
+only.
 
-**Era determination** (spec-defined, transport-specific):
+A tool name is quoted into the id by percent-encoding, with `%` escaped first: bytes in `[A-Za-z0-9._-]`
+pass through and everything else becomes `%XX`. The mapping is injective — two distinct names cannot
+produce one id, and a literal `%` cannot be mistaken for the start of an escape — while a name that
+already follows the protocol's plain-identifier guidance comes through unchanged. Encoded names are
+counted and reported as one warning for the category, not one per tool; the names themselves are already
+in the lockfile.
 
-- **stdio:** probe with `server/discover` first; a recognized modern JSON-RPC error (such as
-  `UnsupportedProtocolVersionError`) identifies a modern server → retry with a supported version.
-  Any other error identifies a legacy server → fall back to `initialize`.
-- **Streamable HTTP:** attempt a modern request and inspect the body of a `400 Bad Request` before
-  falling back to `initialize`.
+### 9.4 Facets
 
-Era is a property of the server, not of an individual request, and is cached for the lifetime of the
-stdio process or HTTP origin.
+| Dependency | Facets |
+|---|---|
+| `mcp:<alias>` | `identity` |
+| `tool:<alias>.<name>` | `description`, `input_schema`, `output_schema` (only when declared), `capabilities` |
 
-**AgentChecksum implementation choice.** We use `rmcp`'s `ClientLifecycleMode::Discover` and perform
-the spec-defined fallback explicitly rather than using `ClientLifecycleMode::Auto`. Rationale:
-`Auto` resolves the era internally and hides it, but **the era is behavior-relevant state** — a
-server's upgrade from legacy to modern changes request semantics, error behavior, and version
-negotiation while tool schemas stay byte-identical. By performing the probe ourselves we can record
-`era`, `protocol_version`, and `supported_versions` in the `mcp:<alias>` identity facet, which makes
-an era migration a *detectable dependency change*.
+**`identity`** (server) is a small object: `era`, the negotiated `protocol_version`, `supported_versions`
+and `server_info` (`name` + `version`) when the server reported them, and `capabilities` when it declared
+any. Optional fields are *omitted* rather than filled with an empty default, because "the server did not
+tell us" is not the same statement as "the server told us nothing". Declared capabilities are recorded by
+name with their declared flags (`list_changed`, `subscribe`), defaulting an absent flag to `false`, so an
+undeclared flag and a declared `false` read the same; `logging` and `completions` are recorded as presence
+only.
 
-Note that `rmcp`'s `ServiceExt::serve` defaults to **legacy** initialization; the modern path is
-selected through `serve_client_with_lifecycle(service, transport, ClientLifecycleMode::…)`.
+**`description`** records a digest over the normalized description text plus a `shape` digest over the
+whitespace-collapsed text, and no `normalized` payload. This is the contract a prompt's `content`/`shape`
+pair already uses, and for the same reason: a tool description is model input, so a reflow and a rewrite
+must be distinguishable and Phase 2 makes that call.
 
-### 9.2 Discovery scope in v0.1
+**`input_schema`** and **`output_schema`** record the normalized schema as their payload, with the digest
+taken over exactly that value, so a stored payload can be re-hashed from the lockfile alone. `output_schema`
+exists only when the server declares one. The schema's `type` is never rewritten: an output schema may
+legitimately describe an array or a scalar, and forcing `type: object` would misdescribe the contract.
 
-1. Connect (stdio via `TokioChildProcess`; Streamable HTTP via `StreamableHttpClientTransport`).
-2. Determine era; obtain `DiscoverResult` (`supported_versions`, `capabilities`, server info) or the
-   legacy `initialize` result.
-3. `tools/list`, following **cursor pagination to exhaustion**. Ignoring cursors would silently
-   truncate the inventory and produce false negatives.
-4. Per tool, extract `name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`.
+**`capabilities`** is the effective annotation token set (§9.5), recorded sorted.
 
-Not in v0.1: `tools/call` (we never invoke tools), `resources/*`, `prompts/*`, sampling,
-subscriptions, `listChanged` (snapshots are static).
+Both dependencies carry `source` = the alias: provenance only, never hashed.
 
-### 9.3 Two specification facts that shape the design
+### 9.5 Annotation vocabulary
 
-- **`serverInfo.name` uniqueness is not guaranteed.** Dependency identity therefore comes from the
-  user's config alias (`github`); `serverInfo.name` is recorded as metadata only.
-- **The tool set may vary by authorization.** A snapshot may reflect the credentials used. Output
-  carries the warning *inventory may be scoped to the credentials used* rather than silently
-  presenting a partial inventory as complete.
+`annotations` are four protocol-defined hints, and the fingerprint records their *effective* value with the
+protocol's own defaults folded in:
 
-Tool name collisions across servers are disambiguated in dependency ids by alias prefix
-(`tool:github.search` vs `tool:gitlab.search`). When probing, the model receives the **original**
-names, because that is what a real agent would see; a collision produces a warning.
+| Hint | Default | Tokens |
+|---|---|---|
+| `readOnlyHint` | `false` | `read-only` / `write` |
+| `destructiveHint` | `true` | `destructive` / `non-destructive` |
+| `idempotentHint` | `false` | `idempotent` / `non-idempotent` |
+| `openWorldHint` | `true` | `open-world` / `closed-world` |
 
-### 9.4 Sequencing
+Folding the defaults in is what keeps "declared the default" from reading as a change: a tool with no
+annotations, a tool that declares `false`/`true`/`false`/`true` explicitly, and a tool whose hints are all
+absent produce one and the same token set. `destructive`/`non-destructive` and
+`idempotent`/`non-idempotent` appear only for a tool that writes, because the protocol defines them as
+meaningful only there — so a read-only tool is `read-only` plus one world token, and declaring write-only
+hints on it creates nothing to diff.
 
-The transport abstraction (stdio and Streamable HTTP) is designed up front, but implementation
-order is: **stdio vertical slice first**, Streamable HTTP immediately after the first working MCP
-flow. The reasoning is that the transport seam should be exercised by a second implementation early
-enough that stdio-specific assumptions do not harden into the source boundary.
+These are declarations, not guarantees (§8.3): a server that declares `read-only` may still write.
+AgentChecksum reports that the hint says so and claims nothing further.
+
+### 9.6 Deliberate exclusions
+
+| Excluded | Why |
+|---|---|
+| Tool `title`, `icons` | Presentation. They cannot change how a tool behaves, so fingerprinting them would turn a cosmetic edit into a dependency change |
+| Tool `_meta`, and the *settings* of extension and experimental capabilities | Opaque, server-controlled data; copying it into a committed lockfile turns a capture of arbitrary values into a dependency fingerprint. Extension and experimental capabilities are reduced to their sorted identifiers, with one aggregated warning |
+| Server `instructions`, and implementation `title`, `description`, `websiteUrl` | Prose and presentation rather than declarations about the tool contract; only an implementation's `name` and `version` are recorded |
+| Configured `command`, `args`, `env` | Connection material, not contract. `env` is where a credential lives |
+| Transport and session plumbing | PIDs, ports, session ids, cache hints (`ttlMs`, `cacheScope`), and timings are machine- or run-specific; §6.2 excludes them already |
+| Server stderr | The server's own log, discarded and never read (§9.2) |
+
+### 9.7 Bounds and failure policy
+
+Every bound lives in `limits.rs`, and each one is the point where AgentChecksum refuses to be led by a
+server that is broken, hostile, or merely enormous:
+
+| Bound | Value | Applies to |
+|---|---|---|
+| `CONNECT_TIMEOUT` | 60 s | Connecting, spawning, and protocol negotiation for one server |
+| `PAGE_TIMEOUT` | 30 s | One `tools/list` page, and the `server/discover` probe |
+| `SHUTDOWN_TIMEOUT` | 10 s | Closing the session; expiry is a warning, not a failure |
+| `MAX_TOOL_PAGES` | 200 | Pages followed before the catalog is called malformed |
+| `MAX_TOOLS_PER_SERVER` | 10 000 | Tools accepted from one server |
+| `MAX_TOOL_NAME_BYTES` | 256 | A tool name (the protocol's own naming guidance is far below this) |
+| `MAX_TEXT_BYTES` | 64 KiB | A tool description, or a server implementation name/version |
+| `MAX_SCHEMA_BYTES` | 512 KiB | One serialized tool schema |
+| `MAX_SCHEMA_DEPTH` | 32 | Nesting inside one tool schema — tighter than the parser's own limit, deliberately, because the normalizer recurses |
+
+Exceeding a bound **fails** the discovery; it never truncates. A truncated catalog would produce a
+lockfile describing a server that does not exist, and a wrong checksum is worse than no checksum. Any
+failure inside one server aborts the run and names the stage (`connecting and negotiating`, `reading the
+server identity`, `reading the tool catalog`, …) as `McpFailed` or `McpTimeout` (§14).
+
+Two catalog pathologies are errors rather than coincidences: a cursor the server has already returned
+(the loop would otherwise be indistinguishable from real pagination), and one tool name declared twice by
+one server (taking the first or the last would hide one dependency behind another).
+
+**Ordering and atomicity.** Servers are visited in alias order — sequential on purpose, because a
+configuration holds a handful of servers and a deterministic order is worth more than a shorter wall
+clock — so the same configuration produces the same first failure and the same warnings, each warning
+tagged with the server it came from. Inside one server, tools are sorted by name: a server answers in
+whatever order it likes, and discovery order must never reach a fingerprint. Discovery is fail-closed. The
+first server that cannot be fully discovered fails the command, no partial lockfile is written, and
+`snapshot` writes nothing on any failure — it checks writability before discovery even starts. Every
+dependency id is checked for uniqueness across all sources before a lockfile is built; two dependencies
+with one id is an error, not a silent choice of one of them.
+
+**One path.** `snapshot` and `diff` run the same discovery pass, so what `diff` compares against is
+exactly what `snapshot` would record.
+
+### 9.8 Integrity of recorded payloads
+
+For every facet that records a payload, `digest == sha256(canonical(payload))` — and that is checked, not
+assumed. A baseline lockfile is verified as it is loaded, before any semantic comparison reads a payload,
+so a hand-edited payload that disagrees with its own digest is rejected instead of being allowed to steer
+a risk decision. Facets without a payload (a prompt's `content`/`shape`, a tool's `description`) are
+skipped: their digest covers text the lockfile deliberately does not store, so there is nothing to
+recompute from. The check is bounded and documented as such: it is not a general proof that every digest
+in a hand-written lockfile is honest.
+
+### 9.9 Schema handling
+
+- **`contentSchema` is a schema position.** The normalizer descends into it like `properties` or `items`,
+  so a reordered `required` or `enum` inside it is not a change. Without that, an MCP tool's structured
+  content schema would produce the very false positive rules 1 and 2 (§7.3) exist to prevent.
+- **External `$ref` is never fetched.** No resolver exists; a reference is preserved as written and no
+  request is made to dereference it.
+- **Unknown keywords are preserved.** Normalization reorders arrays and fills in a missing root
+  `$schema`; it never drops a keyword it does not recognize, so Phase 2's generic floor can still see a
+  change it has no named classification for.
+- **A non-object type root is preserved.** A schema whose `type` is an array or a scalar is recorded as
+  the server declared it.
+
+### 9.10 Scope and security posture
+
+**Read-only.** Discovery is introspection: `tools/call` is never issued and no tool is ever executed. A
+fingerprint of what a server declares is worth having on its own, and calling a tool to obtain one is not
+something a lockfile step may do. Prompts, resources, resource templates, tasks, sampling, roots,
+elicitation, and subscriptions are out of scope; `listChanged` is not tracked, because a snapshot is a
+point-in-time statement and not a subscription.
+
+**No secret-derived material.** The configured environment and the endpoint never reach the lockfile, so a
+credential rotation that leaves the declared contract unchanged produces the same fingerprint and the same
+agent checksum. When credentials do change what a server declares — a narrower authorized tool set, for
+instance — that is a real dependency change and is reported as one.
+
+**Redaction.** The values in `[mcp.servers.env]` are redacted out of every diagnostic, including text that
+came from the server, because a server may echo back whatever it was started with. A failed spawn reports
+the operating system's reason and never the environment the server would have been given; an endpoint
+diagnostic names the component that is wrong rather than repeating the URL. Values shorter than six bytes
+are not redacted: hiding `1` or `true` would mangle diagnostics without protecting anything.
 
 ---
 

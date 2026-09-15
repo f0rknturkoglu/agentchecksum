@@ -21,7 +21,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::lockfile::Lockfile;
-use crate::manifest::{Dependency, agent_checksum};
+use crate::manifest::{Dependency, Digest, agent_checksum};
 
 pub use engine::diff;
 pub use model::{ChangeKind, DependencyChange, DetailChange, DiffReport, FacetChange, max_risk};
@@ -40,6 +40,10 @@ pub fn load_baseline(path: &Path) -> Result<Lockfile> {
 
     let lockfile = Lockfile::read(path)?;
     verify_baseline_checksum(path, &lockfile)?;
+    // Before any payload is read for semantic comparison: a payload that disagrees
+    // with its own digest must not be allowed to influence a risk decision, even
+    // for the moment it takes to reject the file.
+    verify_facet_payloads(path, &lockfile)?;
     Ok(lockfile)
 }
 
@@ -76,6 +80,40 @@ pub fn verify_baseline_checksum(path: &Path, lockfile: &Lockfile) -> Result<()> 
             recorded: lockfile.agent_checksum.as_str().to_string(),
             computed: computed.as_str().to_string(),
         });
+    }
+
+    Ok(())
+}
+
+/// Recompute every recorded payload's digest and refuse a lockfile that disagrees.
+///
+/// A facet's digest is taken over the canonical form of the payload recorded beside
+/// it, so the two can be checked against each other after the fact. Without this,
+/// editing a payload while leaving the digest alone would let a hand-written file
+/// steer the semantic diff — the analysis reads payloads, and Phase 2's decisions
+/// (risk, details, equivalence) hang off what it finds there.
+///
+/// Facets without a payload are skipped: their digest covers something the lockfile
+/// deliberately does not store (a prompt's text, a tool description), so there is
+/// nothing to recompute from. That is a bounded check, not a general one.
+pub fn verify_facet_payloads(path: &Path, lockfile: &Lockfile) -> Result<()> {
+    for (id, dependency) in &lockfile.dependencies {
+        for (name, facet) in &dependency.facets {
+            let Some(payload) = facet.normalized.as_ref() else {
+                continue;
+            };
+
+            let computed = Digest::sha256(&crate::fingerprint::canonical::to_vec(payload)?);
+            if computed != facet.digest {
+                return Err(Error::FacetPayloadMismatch {
+                    path: path.to_path_buf(),
+                    id: id.clone(),
+                    facet: name.clone(),
+                    recorded: facet.digest.as_str().to_string(),
+                    computed: computed.as_str().to_string(),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -161,5 +199,88 @@ mod tests {
         let lockfile = Lockfile::read(&path).unwrap();
 
         assert!(verify_baseline_checksum(&path, &lockfile).is_ok());
+        assert!(verify_facet_payloads(&path, &lockfile).is_ok());
+    }
+
+    /// A dependency whose facet records a payload, the way external sources do.
+    fn recorded_dependency(id: &str, payload: serde_json::Value) -> Dependency {
+        let mut facets = BTreeMap::new();
+        facets.insert(
+            "identity".to_string(),
+            Facet {
+                digest: Digest::sha256(&crate::fingerprint::canonical::to_vec(&payload).unwrap()),
+                shape: None,
+                normalized: Some(payload),
+            },
+        );
+        Dependency {
+            id: id.to_string(),
+            kind: DependencyKind::Model,
+            facets,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn a_payload_that_contradicts_its_digest_is_refused() {
+        // The digest is taken over the payload recorded beside it, so the two can be
+        // checked against each other. Without this, editing a payload while leaving
+        // its digest alone would steer the semantic diff: risk, details, and
+        // equivalence are all read from payloads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentchecksum.lock");
+
+        let lockfile = Lockfile::from_dependencies(&[recorded_dependency(
+            "model:ollama/m",
+            serde_json::json!({
+                "provider": "ollama",
+                "id": "m"
+            }),
+        )])
+        .unwrap();
+        lockfile.write(&path).unwrap();
+        assert!(verify_facet_payloads(&path, &lockfile).is_ok());
+
+        let mut tampered = lockfile.clone();
+        tampered
+            .dependencies
+            .get_mut("model:ollama/m")
+            .unwrap()
+            .facets
+            .get_mut("identity")
+            .unwrap()
+            .normalized = Some(serde_json::json!({ "provider": "ollama", "id": "something-else" }));
+        tampered.write(&path).unwrap();
+
+        // The aggregate is computed from digests, so tampering with a payload leaves
+        // it intact — which is exactly why this check has to exist separately.
+        assert!(verify_baseline_checksum(&path, &tampered).is_ok());
+
+        let error = load_baseline(&path).unwrap_err();
+        assert!(
+            matches!(error, Error::FacetPayloadMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(error.suggestion().is_some());
+        assert!(error.to_string().contains("identity"), "{error}");
+        assert!(error.to_string().contains("model:ollama/m"), "{error}");
+    }
+
+    #[test]
+    fn a_facet_without_a_payload_is_not_checked() {
+        // A prompt's digest covers text the lockfile deliberately does not store, so
+        // there is nothing to recompute from. That is a bounded check, not a general
+        // one, and it must not turn into a refusal of every prompt dependency.
+        let dir = tempfile::tempdir().unwrap();
+        let path = written_lock(dir.path());
+        let lockfile = Lockfile::read(&path).unwrap();
+
+        assert!(
+            lockfile.dependencies["prompt:a.md"]
+                .facets
+                .values()
+                .all(|facet| facet.normalized.is_none())
+        );
+        assert!(verify_facet_payloads(&path, &lockfile).is_ok());
     }
 }

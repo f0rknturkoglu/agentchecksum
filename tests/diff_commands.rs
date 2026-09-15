@@ -297,6 +297,64 @@ fn from_compares_against_a_supplied_lockfile() {
     );
 }
 
+#[test]
+fn a_baseline_whose_payload_contradicts_its_digest_is_refused() {
+    // Phase 2 deferred this check until external payloads were real. A payload is
+    // what the semantic diff reads, so it must be shown to belong to its digest
+    // before any risk, detail, or equivalence decision can depend on it.
+    use agentchecksum::lockfile::Lockfile;
+    use agentchecksum::manifest::{Dependency, DependencyKind, Digest, Facet};
+    use std::collections::BTreeMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path());
+    let lock = dir.path().join("agentchecksum.lock");
+
+    let payload = serde_json::json!({ "era": "stateless", "protocol_version": "2026-07-28" });
+    let mut facets = BTreeMap::new();
+    facets.insert(
+        "identity".to_string(),
+        Facet {
+            digest: Digest::sha256(
+                &agentchecksum::fingerprint::canonical::to_vec(&payload).unwrap(),
+            ),
+            shape: None,
+            normalized: Some(payload),
+        },
+    );
+    let dependency = Dependency {
+        id: "mcp:github".to_string(),
+        kind: DependencyKind::McpServer,
+        facets,
+        source: Some("github".to_string()),
+    };
+
+    let mut lockfile = Lockfile::from_dependencies(&[dependency]).unwrap();
+    // Edit the payload and leave the digest alone. The aggregate is computed from
+    // digests, so it still matches — which is exactly why this needs its own check.
+    lockfile
+        .dependencies
+        .get_mut("mcp:github")
+        .unwrap()
+        .facets
+        .get_mut("identity")
+        .unwrap()
+        .normalized =
+        Some(serde_json::json!({ "era": "legacy", "protocol_version": "2025-11-25" }));
+    lockfile.write(&lock).unwrap();
+
+    let output = run(dir.path(), &["diff"]);
+
+    assert_eq!(output.status.code(), Some(3), "{}", stdout(&output));
+    assert!(stdout(&output).is_empty(), "stdout must stay clean");
+    let message = stderr(&output);
+    assert!(message.contains("identity"), "{message}");
+    assert!(message.contains("mcp:github"), "{message}");
+    // The tampered payload must not be echoed, and must not have been read.
+    assert!(!message.contains("2025-11-25"), "{message}");
+    assert!(!message.contains("legacy"), "{message}");
+}
+
 /// The rendered report is a reviewed artifact: the demo's PR comment is this
 /// layout, so a change to it should be a deliberate, visible diff.
 #[test]

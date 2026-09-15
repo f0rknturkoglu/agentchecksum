@@ -29,10 +29,10 @@ This is a young project; the table says exactly what runs today.
 | Capability | State |
 |---|---|
 | `init` — config + probe scaffolding | **works** |
-| `snapshot` — Model + Prompt discovery, byte-deterministic `agentchecksum.lock` | **works** |
+| `snapshot` — Model, Prompt, MCP server and MCP tool discovery; byte-deterministic `agentchecksum.lock` | **works** |
 | `diff` — semantic dependency diff, per-facet risk, human and JSON output | **works** |
-| MCP discovery — server identity, tool inventory, schemas, descriptions | next |
-| Behavioral probes, `check`, the regression gate | planned |
+| MCP discovery — server era, tool contracts, declared annotation capabilities | **works** |
+| Behavioral probes, `check`, the regression gate | next |
 | Demo project, GitHub Action, prebuilt releases | planned |
 
 Design decisions live in [`docs/specs`](docs/specs); the implementation plan for the current phase
@@ -97,9 +97,8 @@ at. And the risk is labelled a heuristic, because it is one.
 
 ### The diff this project exists for
 
-Once MCP discovery lands (next phase), the same mechanism runs over tool definitions. This is the
-shape from the design spec's primary demo — a "harmless documentation edit" that passes code review
-and passes API-compatibility checks:
+The same mechanism runs over MCP tool definitions. This is the shape from the design spec's primary
+demo — a "harmless documentation edit" that passes code review and passes API-compatibility checks:
 
 ```text
 TOOL  demo-tools.search_repos                MEDIUM
@@ -118,11 +117,65 @@ The API did not break. The agent did.
 |---|---|
 | `model` | identity (provider, id, content digest, quantization, family, size), inference parameters, chat template, capabilities |
 | `prompt` | content, whitespace-collapsed shape |
-| `tool` | input schema, output schema, description (+ shape), capabilities |
-| `mcp_server` | identity (protocol era, protocol version, supported versions, server info) |
+| `mcp` | server identity — era, negotiated protocol version, supported versions, server info, declared capabilities |
+| `tool` | input schema, output schema, description (+ shape), annotation capabilities |
 
 `shape` exists so that a whitespace-only change (LOW) is distinguished from a semantic change
 (MEDIUM) deterministically, with no LLM in the loop.
+
+## MCP servers and tools
+
+An MCP server is fingerprinted where it is declared in `agentchecksum.toml`:
+
+```toml
+[[mcp.servers]]
+name = "demo-tools"           # the alias: it prefixes every dependency id
+transport = "stdio"
+command = "uvx"               # executed directly, never through a shell
+args = ["demo-tools-server"]
+# env = { DEMO_TOKEN = "…" }  # passed to the child, never fingerprinted, redacted in diagnostics
+
+# or a remote server:
+# [[mcp.servers]]
+# name = "remote"
+# transport = "streamable-http"
+# url = "https://example.com/mcp"
+```
+
+Both transports are supported: **`stdio`** (the configured command is executed directly, with the
+configured argument vector — never through a shell) and **`streamable-http`** (`http`/`https` only;
+credentials, query strings, and fragments in the URL are rejected rather than stripped, and redirects
+are not followed).
+
+Each server becomes a dependency `mcp:<alias>` carrying its identity, and each declared tool becomes
+`tool:<alias>.<name>` — the name is percent-encoded, so two distinct names can never produce one id —
+carrying its description, its input schema, its output schema when it declares one, and its annotation
+capabilities. The alias is a namespace, not a display name: renaming it is an identity change, and it is
+deliberately restricted to `[A-Za-z0-9_-]+` because a dot would collide with the separator between alias
+and tool.
+
+**Discovery never calls a tool.** It connects, asks the server what it declares, and closes: no tool is
+ever invoked on your behalf, so a snapshot cannot exercise the side effects a tool call would have.
+`prompts/*`, `resources/*`, tasks, sampling, roots, elicitation, and subscriptions are out of scope.
+
+What is deliberately left out of the fingerprint is as settled as what goes in: transport and session
+plumbing (PIDs, ports, session ids, cache hints, timings), configured commands and environment variables,
+server stderr, cosmetic metadata (`title`, `icons`), opaque `_meta` and extension settings (only
+extension identifiers are recorded), and the server's prose `instructions`. The bounds on discovery —
+timeouts, page count, tool count, schema size and nesting depth — live in a single file, and exceeding one
+fails the run rather than truncating the inventory: a lockfile that describes a partial server is worse
+than no lockfile. Discovery is fail-closed. One server that cannot be fully discovered fails the command,
+nothing is written, and a duplicate id stops the run before a lockfile exists.
+
+Tool annotations are recorded as declared: AgentChecksum folds in the protocol defaults and reports the
+effective tokens (`read-only`/`write`, `destructive`/`non-destructive`, `idempotent`/`non-idempotent`,
+`open-world`/`closed-world`). They are hints a server declares about itself, not guarantees — a server
+that says `read-only` may still write, and nothing in the output claims otherwise.
+
+Because no credential-derived value is fingerprinted, rotating a token that does not change what the
+server declares produces the same checksum. When credentials do change the declared contract — a
+narrower set of authorized tools, for example — that is a real dependency change, and it is reported as
+one.
 
 ## Exit codes
 
@@ -149,12 +202,14 @@ in [spec §8.4](docs/specs).
 
 ## How it stays deterministic
 
-- Every digest is **SHA-256 over RFC 8785 canonical JSON**, so key order, whitespace, and number
-  formatting can never influence a checksum.
+- Every JSON digest is **SHA-256 over RFC 8785 canonical JSON**, so key order, whitespace, and number
+  formatting can never influence a checksum. Text facets — prompt content, prompt shape, tool
+  descriptions — digest normalized text instead, because that is what a model reads.
 - A narrow, individually tested normalization layer above JCS: `required` order, `enum` order,
   parameter-set order, CRLF/LF, missing-versus-empty.
-- Behavior-relevant content is **never** treated as insignificant: `description`, `title`,
-  `examples`, `default`, chat templates, and capabilities all move the fingerprint.
+- Behavior-relevant content is **never** treated as insignificant: schema `description`, `title`,
+  `examples` and `default`, prompts, tool descriptions, chat templates, and capabilities all move the
+  fingerprint.
 - Timestamps, absolute paths, machine identifiers, discovery order, and vendor metadata
   (`modified_at`, `size`, `license`) are excluded by an explicit, tested list.
 - The agent checksum is a function of dependency inputs only — never of lockfile serialization.
@@ -162,7 +217,10 @@ in [spec §8.4](docs/specs).
 ## How it treats your project
 
 AgentChecksum reads, parses, normalizes, hashes, and compares. It does **not** import or execute the
-project it inspects. That matters when CI is examining an untrusted pull request.
+project it inspects: the only process it starts is the MCP server you configured in
+`agentchecksum.toml`, and only to ask what that server declares. That matters when CI is examining an
+untrusted pull request — the configuration file is the trust boundary, which is why it is committed and
+reviewed like any other input.
 
 ## License
 
