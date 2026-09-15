@@ -242,6 +242,9 @@ pub fn dependency(
             .map(parse_ollama_parameters),
         _ => None,
     };
+    // An endpoint that writes an empty `parameters` block describes the same state as
+    // one that omits it, so the two must not hash differently (spec §18 invariant 2).
+    let reported = reported.filter(|reported| !reported.is_empty());
     if let Some(payload) = params_payload(&config.params, reported.as_ref())? {
         facets.insert("params".to_string(), recorded_facet(&payload)?);
     }
@@ -278,33 +281,32 @@ pub async fn fetch(
         })?;
     let base = endpoint.trim_end_matches('/');
 
+    // Both closures capture only references, so they are `Copy` and can be handed to
+    // every `.map_err(...)` and error return below. Six hand-written constructions
+    // meant a change to the error shape had to be made in six places.
+    let endpoint_error = |source: reqwest::Error| Error::ModelEndpoint {
+        provider: config.provider.clone(),
+        endpoint: endpoint.clone(),
+        source,
+    };
+    let status_error = |status: u16| Error::ModelStatus {
+        provider: config.provider.clone(),
+        endpoint: endpoint.clone(),
+        status,
+    };
+
     let tags_response = client
         .get(format!("{base}/api/tags"))
         .send()
         .await
-        .map_err(|source| Error::ModelEndpoint {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            source,
-        })?;
+        .map_err(endpoint_error)?;
 
     let status = tags_response.status();
     if !status.is_success() {
-        return Err(Error::ModelStatus {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            status: status.as_u16(),
-        });
+        return Err(status_error(status.as_u16()));
     }
 
-    let tags: TagsResponse = tags_response
-        .json()
-        .await
-        .map_err(|source| Error::ModelEndpoint {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            source,
-        })?;
+    let tags: TagsResponse = tags_response.json().await.map_err(endpoint_error)?;
 
     let entry = tags
         .models
@@ -321,29 +323,14 @@ pub async fn fetch(
         .json(&ShowRequest { model: &config.id })
         .send()
         .await
-        .map_err(|source| Error::ModelEndpoint {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            source,
-        })?;
+        .map_err(endpoint_error)?;
 
     let status = show_response.status();
     if !status.is_success() {
-        return Err(Error::ModelStatus {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            status: status.as_u16(),
-        });
+        return Err(status_error(status.as_u16()));
     }
 
-    let show: ShowResponse = show_response
-        .json()
-        .await
-        .map_err(|source| Error::ModelEndpoint {
-            provider: config.provider.clone(),
-            endpoint: endpoint.clone(),
-            source,
-        })?;
+    let show: ShowResponse = show_response.json().await.map_err(endpoint_error)?;
 
     Ok(Some(OllamaMetadata {
         digest: entry.digest,
@@ -550,6 +537,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_reported_parameters_block_produces_no_facet() {
+        // A provider answering with an empty `parameters` string describes the same
+        // state as one omitting the field: no reported parameters. The two must not
+        // hash differently (spec §18 invariant 2).
+        let mut empty_string = metadata();
+        empty_string.parameters = Some(String::new());
+
+        let mut whitespace_only = metadata();
+        whitespace_only.parameters = Some("  \n\t".to_string());
+
+        let mut absent = metadata();
+        absent.parameters = None;
+
+        let from_empty = build(&ollama_config(), Some(&empty_string));
+        let from_whitespace = build(&ollama_config(), Some(&whitespace_only));
+        let from_absent = build(&ollama_config(), Some(&absent));
+
+        assert_eq!(from_empty, from_absent);
+        assert_eq!(from_whitespace, from_absent);
+        assert!(!from_absent.facets.contains_key("params"));
+    }
+
+    #[test]
     fn a_chat_template_change_changes_the_template_digest() {
         let baseline = build(&ollama_config(), Some(&metadata()));
         let mut retemplated = metadata();
@@ -681,7 +691,7 @@ mod tests {
                     "template": "{{ .Prompt }}",
                     "capabilities": ["completion", "tools"],
                     "license": license,
-                    "modified_at": "2025-08-14T15:49:43Z"
+                    "modified_at": modified_at
                 })),
             )
             .mount(server)
@@ -822,5 +832,27 @@ mod tests {
 
         let err = fetch(&reqwest::Client::new(), &config).await.unwrap_err();
         assert!(matches!(err, Error::ModelMissing { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_does_not_contact_a_non_ollama_provider() {
+        let server = wiremock::MockServer::start().await;
+        let config = ModelConfig {
+            provider: "openai-compatible".to_string(),
+            id: "gpt-4o".to_string(),
+            endpoint: Some(server.uri()),
+            params: BTreeMap::new(),
+        };
+
+        assert!(
+            fetch(&reqwest::Client::new(), &config)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "fetch must not issue any request for a non-ollama provider"
+        );
     }
 }
