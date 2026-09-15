@@ -1,0 +1,17 @@
+---
+source: tests/diff_commands.rs
+expression: redact(&text)
+---
+AgentChecksum diff
+
+Baseline: ac1:…
+Current:  ac1:…
+
+1 dependency changed.
+
+PROMPT  prompts/system.md  LOW
+  content  sha256:… → sha256:…
+    classification: formatting-only
+  shape    unchanged
+
+Overall behavioral risk: LOW (heuristic)
