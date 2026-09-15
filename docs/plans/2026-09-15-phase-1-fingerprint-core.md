@@ -370,6 +370,16 @@ git commit -m "Bootstrap crate, hashing primitive, and CI"
 - Produces: `fingerprint::canonical::to_vec<T: Serialize>(&T) -> Result<Vec<u8>>`,
   `fingerprint::normalize::normalize_text(&str) -> String`, `fingerprint::normalize::shape_text(&str) -> String`.
 
+**Post-implementation note (ruled during review).** The code blocks below give `normalize_text` a much wider job than
+it keeps: they have it strip trailing whitespace per line and trim leading and trailing blank lines before the content
+digest is taken. As shipped, `normalize_text` unifies line endings and strips a leading BOM, and does nothing else.
+Trailing spaces, leading and trailing blank lines, a trailing newline and interior whitespace all change what the
+model receives, so all of them change the `content` digest; treating them as insignificant would have hidden real
+runtime differences. Deciding that a difference is *formatting-only* is Phase 2's job, and it makes that call from the
+`shape` digest, which still collapses every whitespace run. The spec's §7.3 rule 4 and §7.5 Prompt row were corrected
+to match. Catching this at fingerprint time would have cost the product its fail-safe property: the worse error here
+is missing a change, not reporting one.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `src/fingerprint/canonical.rs`:
@@ -2022,13 +2032,29 @@ and HTTP is tested against a `wiremock` server separately. No mocking framework 
 below are the task's original specification. Two ruled changes were made during execution; both are recorded in the SDD
 ledger:
 
-1. **The `params` facet captures both sources of effective inference parameters.** The block below hashes only the
+1. **The `params` facet captures both parameter sources.** The block below hashes only the
    provider-reported `parameters` text, which contradicted design spec §5 ("`params` is hashed; it is behavior-relevant
    by definition") and §11.2 (the probe runner sets `seed` and `temperature` from `[model].params`). As shipped, the
    facet payload is `{"configured": <[model].params>, "reported": <parsed Ollama text>}`, with either key omitted when
    its source is empty and the facet absent when both are. Without this, changing `temperature` in `agentchecksum.toml`
    produced no dependency change at all — an invisible behavior change, the exact class this product exists to catch.
    The spec's Model facet row was clarified to match.
+   The payload is deliberately **not** an "effective" merge: modelling provider override semantics correctly is more
+   than this phase can promise, and a wrong merge hides changes while a conservative non-merge only reports
+   over-sensitively. The wording in the code, the spec and the PR says *sources*, not *effective*, so the
+   implementation and the documents agree.
+4. **Identity is provider-aware.** `openai-compatible` exposes no content digest, so the endpoint joins its identity —
+   recorded without userinfo, query or fragment, since the lockfile is committed — and an endpoint is now required for
+   that provider, because with none there is nothing to fingerprint the model by. Ollama keeps its endpoint out of the
+   identity, because its content digest already pins the weights and hashing the host would turn moving the same model
+   to another machine into a change that says nothing about behavior. The test that claimed this globally
+   (`the_endpoint_is_never_part_of_the_identity`) is now provider-specific, with a companion asserting the
+   `openai-compatible` case.
+5. **Content and shape are separate digests.** `normalize_text` unifies line endings and strips a leading BOM and
+   nothing else; trailing spaces, blank lines, a trailing newline and interior whitespace all change the `content`
+   digest, while `shape_text` still collapses them so Phase 2 can classify a reflow as formatting-only. The same rule
+   applies to the chat template, which is what the model is rendered through, so trailing whitespace there is a real
+   change. Spec §7.3 rule 4 and the §7.5 rows were corrected to match.
 2. **The metadata-exclusion test was made load-bearing.** `timestamps_sizes_and_licenses_never_reach_the_dependency`
    originally built both servers' responses from one fixture with hard-coded identical `modified_at`/`size`/`license`,
    so the two responses were byte-identical and the assertion degenerated to `f(x) == f(x)` — mutation-testing showed a
