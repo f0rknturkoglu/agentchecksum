@@ -380,32 +380,62 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Field declaration order is fixed by the type, so this value reaches the
+    /// serializer as `z, a` no matter how `serde_json` backs its maps. A
+    /// `json!({...})` literal cannot test key sorting: without the
+    /// `preserve_order` feature a serde_json map is a BTreeMap, so the literal is
+    /// already sorted and `to_vec(&a) == to_vec(&b)` degenerates to `f(x) == f(x)`.
+    #[derive(serde::Serialize)]
+    struct OutOfOrder {
+        z: u8,
+        a: u8,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Inner {
+        y: u8,
+        b: u8,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Outer {
+        z: u8,
+        a: Inner,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Nested {
+        list: Vec<u8>,
+    }
+
     #[test]
-    fn object_key_order_does_not_affect_canonical_bytes() {
-        let a = json!({ "b": 1, "a": 2 });
-        let b = json!({ "a": 2, "b": 1 });
-        assert_eq!(to_vec(&a).unwrap(), to_vec(&b).unwrap());
+    fn object_keys_are_sorted_into_canonical_order() {
+        let value = OutOfOrder { z: 1, a: 2 };
         assert_eq!(
-            String::from_utf8(to_vec(&a).unwrap()).unwrap(),
-            r#"{"a":2,"b":1}"#
+            String::from_utf8(to_vec(&value).unwrap()).unwrap(),
+            r#"{"a":2,"z":1}"#
         );
     }
 
     #[test]
     fn nested_object_keys_are_sorted_recursively() {
-        let value = json!({ "outer": { "z": 1, "a": { "y": 1, "b": 2 } } });
+        let value = Outer {
+            z: 1,
+            a: Inner { y: 1, b: 2 },
+        };
         assert_eq!(
             String::from_utf8(to_vec(&value).unwrap()).unwrap(),
-            r#"{"outer":{"a":{"b":2,"y":1},"z":1}}"#
+            r#"{"a":{"b":2,"y":1},"z":1}"#
         );
     }
 
     #[test]
-    fn whitespace_in_the_source_text_cannot_influence_the_digest() {
-        let compact: serde_json::Value = serde_json::from_str(r#"{"a":[1,2,3]}"#).unwrap();
-        let spaced: serde_json::Value =
-            serde_json::from_str("{\n  \"a\": [ 1, 2,\n 3 ]\n}").unwrap();
-        assert_eq!(to_vec(&compact).unwrap(), to_vec(&spaced).unwrap());
+    fn canonical_output_carries_no_insignificant_whitespace() {
+        let value = Nested { list: vec![1, 2, 3] };
+        assert_eq!(
+            String::from_utf8(to_vec(&value).unwrap()).unwrap(),
+            r#"{"list":[1,2,3]}"#
+        );
     }
 
     #[test]
@@ -456,8 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn a_semantic_change_changes_the_shape() {
-        assert_ne!(shape_text("Be concise."), shape_text("Be thorough."));
+    fn shape_collapses_interior_whitespace_while_content_keeps_it() {
+        assert_eq!(shape_text("a\n\nb"), "a b");
+        assert_eq!(normalize_text("a\n\nb"), "a\n\nb");
     }
 }
 ```
@@ -521,11 +552,16 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 //! Text normalization for prompts and tool descriptions.
 //!
-//! Two different normalizations are needed. `normalize_text` removes
-//! differences that no human would call a change, and is what gets hashed.
-//! `shape_text` additionally collapses interior whitespace, and exists only so
-//! a formatting-only edit can be told apart from a semantic one without asking
-//! a model.
+//! Two different normalizations are needed.
+//!
+//! `normalize_text` is what gets hashed. It removes the byte-level differences a
+//! human would not call a change: a leading BOM, line endings, trailing
+//! whitespace on each line, and surrounding blank lines. It deliberately keeps
+//! interior whitespace runs.
+//!
+//! `shape_text` additionally collapses every whitespace run to a single space. It
+//! exists only so that a formatting-only edit can be told apart from a semantic
+//! one without asking a model.
 
 /// Strip a BOM and normalize line endings.
 fn unify(raw: &str) -> String {
