@@ -120,19 +120,22 @@ impl Lockfile {
     ///
     /// `snapshot` regenerates the lockfile from live state, so writing over a
     /// newer format would silently discard fields this build cannot reproduce.
-    /// A file this build cannot recognize as our format at all is left to
-    /// `snapshot` to regenerate, which is what the user asked for.
+    /// A file that reads but is not our format at all is left to `snapshot` to
+    /// regenerate, which is what the user asked for. A file we cannot read at all
+    /// is refused instead: we cannot verify what we would be destroying, so
+    /// "unreadable" must not be mistaken for "not our format".
     pub fn ensure_writable(path: &Path) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
 
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            // A file we cannot even read as bytes is not one this build wrote;
-            // leave it to `snapshot` to regenerate, which is what the user asked for.
-            Err(_) => return Ok(()),
-        };
+        // Reading bytes rather than text is what keeps a non-UTF-8 file on the
+        // regenerate path: it reads successfully and only the version probe below
+        // can reject it.
+        let bytes = std::fs::read(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         if let Ok(probe) = serde_json::from_slice::<VersionProbe>(&bytes)
             && probe.lock_version > SUPPORTED_LOCK_VERSION

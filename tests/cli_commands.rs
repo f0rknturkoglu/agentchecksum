@@ -219,3 +219,46 @@ fn init_json_output_is_valid_json_on_stdout() {
     assert_eq!(value["config"], "agentchecksum.toml");
     assert_eq!(value["probes"], "probes");
 }
+
+/// A lockfile that exists and could be overwritten but cannot be read is the one
+/// case where refusing is the only safe direction: we cannot tell which format we
+/// would be destroying, so "unreadable" must not be treated as "not our format".
+#[cfg(unix)]
+#[test]
+fn snapshot_refuses_a_newer_lockfile_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path());
+    write_config(dir.path());
+
+    let path = dir.path().join("agentchecksum.lock");
+    let future = r#"{"lock_version": 2, "schema": "future"}"#;
+    std::fs::write(&path, future).unwrap();
+
+    // Write-only: present, writable, and not readable.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let read_was_denied = std::fs::read(&path).is_err();
+
+    let output = Command::cargo_bin("agentchecksum")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("snapshot")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "an unreadable lockfile must be refused rather than overwritten (this \
+         interpreter read it despite the mode, so only the version probe applied: {})",
+        !read_was_denied,
+    );
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        future,
+        "the refusal must leave the file untouched"
+    );
+}
