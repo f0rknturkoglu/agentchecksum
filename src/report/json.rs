@@ -3,6 +3,8 @@
 use serde::Serialize;
 
 use crate::cli::cmd::init::InitOutcome;
+use crate::config::RiskLevel;
+use crate::diff::{DependencyChange, DiffReport};
 use crate::discovery::Discovery;
 use crate::error::{Error, Result};
 use crate::lockfile::Lockfile;
@@ -55,6 +57,35 @@ pub fn init(outcome: &InitOutcome) -> Result<String> {
     };
     let mut text =
         serde_json::to_string_pretty(&report).map_err(|source| Error::Json { source })?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// Machine-readable `diff` report (design spec §8.4).
+///
+/// Typed rather than assembled, so field order is stable, risk values serialise
+/// lowercase, and nothing needs a human sentence to be parsed. The nested change
+/// types come from the diff model and already define this shape.
+#[derive(Serialize)]
+struct DiffReportJson<'a> {
+    status: &'static str,
+    changed: bool,
+    overall_risk: RiskLevel,
+    baseline_checksum: &'a str,
+    current_checksum: &'a str,
+    changes: &'a [DependencyChange],
+}
+
+pub fn diff(report: &DiffReport) -> Result<String> {
+    let json = DiffReportJson {
+        status: "ok",
+        changed: report.changed,
+        overall_risk: report.overall_risk,
+        baseline_checksum: report.baseline_checksum.as_str(),
+        current_checksum: report.current_checksum.as_str(),
+        changes: &report.changes,
+    };
+    let mut text = serde_json::to_string_pretty(&json).map_err(|source| Error::Json { source })?;
     text.push('\n');
     Ok(text)
 }

@@ -29,6 +29,14 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "agentchecksum.lock")]
     pub lock: PathBuf,
 
+    /// Compare against a different lockfile instead of the committed one.
+    ///
+    /// This is how CI compares a pull request against the base revision: the
+    /// binary has no git integration, so the caller supplies the old lockfile
+    /// (`git show HEAD:agentchecksum.lock > /tmp/old.lock`).
+    #[arg(long, global = true)]
+    pub from: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -50,4 +58,9 @@ pub enum Command {
     },
     /// Discover dependencies and write agentchecksum.lock.
     Snapshot,
+    /// Compare the committed baseline against current dependency state.
+    ///
+    /// Informational: it never writes the lockfile and never fails merely because
+    /// a change is risky. Turning risk into a non-zero exit is the CI gate's job.
+    Diff,
 }
