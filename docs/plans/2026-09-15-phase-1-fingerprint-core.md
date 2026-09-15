@@ -1787,6 +1787,13 @@ mod tests {
         assert_eq!(deps[0].kind, DependencyKind::Prompt);
         assert!(deps[0].facets.contains_key("content"));
         assert!(deps[0].facets.contains_key("shape"));
+        assert!(
+            deps[0]
+                .facets
+                .values()
+                .all(|facet| facet.normalized.is_none()),
+            "repo-local prompt facets are digest-only: git already versions the content"
+        );
         assert_eq!(deps[0].source, None);
     }
 
