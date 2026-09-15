@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Text normalization for prompts and tool descriptions.
+//! Text normalization for prompts, tool descriptions, and chat templates.
 //!
-//! Two different normalizations are needed.
+//! Two different normalizations, with deliberately different jobs.
 //!
-//! `normalize_text` is what gets hashed. It removes the byte-level differences a
-//! human would not call a change: a leading BOM, line endings, trailing
-//! whitespace on each line, and surrounding blank lines. It deliberately keeps
-//! interior whitespace runs.
+//! `normalize_text` feeds the **content** digest, which stays faithful to the text
+//! that actually reaches the model. It removes only what a platform introduces on
+//! its own: a leading BOM and CRLF line endings. Trailing spaces, leading and
+//! trailing blank lines, a trailing newline, and interior whitespace all change
+//! what the model sees, so all of them stay significant.
 //!
-//! `shape_text` additionally collapses every whitespace run to a single space. It
-//! exists only so that a formatting-only edit can be told apart from a semantic
-//! one without asking a model.
+//! `shape_text` feeds the **shape** digest. It collapses every whitespace run to a
+//! single space so a formatting-only edit can be told apart from a semantic one
+//! without asking a model. That is what lets Phase 2 classify a reflow as a
+//! formatting change instead of having this layer decide on the user's behalf that
+//! it was insignificant.
 
-/// Strip a BOM and normalize line endings.
+/// Strip a leading BOM and unify line endings.
 fn unify(raw: &str) -> String {
     raw.strip_prefix('\u{feff}')
         .unwrap_or(raw)
@@ -21,22 +24,13 @@ fn unify(raw: &str) -> String {
         .replace('\r', "\n")
 }
 
-/// Normalize text for hashing: line endings unified, trailing whitespace per
-/// line removed, leading and trailing blank lines removed.
+/// The text as the model receives it, modulo a leading BOM and platform line
+/// endings — and nothing else.
 pub fn normalize_text(raw: &str) -> String {
-    let unified = unify(raw);
-    let mut lines: Vec<&str> = unified.lines().map(str::trim_end).collect();
-    while lines.first().is_some_and(|line| line.is_empty()) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
+    unify(raw)
 }
 
-/// Collapse every whitespace run to a single space. Used to detect that a
-/// change touched only formatting.
+/// Collapse every whitespace run to a single space, for formatting-only detection.
 pub fn shape_text(raw: &str) -> String {
     unify(raw).split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -46,13 +40,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crlf_and_lf_produce_the_same_normalized_text() {
+    fn crlf_and_lf_produce_the_same_content() {
         assert_eq!(normalize_text("a\r\nb\r\n"), normalize_text("a\nb\n"));
     }
 
     #[test]
-    fn trailing_whitespace_on_a_line_is_insignificant() {
-        assert_eq!(normalize_text("a   \nb\t\n"), normalize_text("a\nb\n"));
+    fn a_lone_carriage_return_is_a_line_ending() {
+        assert_eq!(normalize_text("a\rb"), normalize_text("a\nb"));
     }
 
     #[test]
@@ -61,21 +55,49 @@ mod tests {
     }
 
     #[test]
-    fn surrounding_blank_lines_are_insignificant() {
-        assert_eq!(normalize_text("\n\n  \na\nb\n\n"), "a\nb");
+    fn a_leading_blank_line_changes_the_content_but_not_the_shape() {
+        assert_ne!(normalize_text("a\nb"), normalize_text("\na\nb"));
+        assert_eq!(shape_text("a\nb"), shape_text("\na\nb"));
     }
 
     #[test]
-    fn a_formatting_only_change_keeps_the_same_shape_but_changes_the_content() {
-        let v1 = "Summarize   the repository.\n\nBe concise.";
-        let v2 = "Summarize the repository.\n\nBe concise.\n";
-        assert_eq!(shape_text(v1), shape_text(v2));
-        assert_ne!(normalize_text(v1), normalize_text(v2));
+    fn a_trailing_blank_line_changes_the_content_but_not_the_shape() {
+        assert_ne!(normalize_text("a\nb"), normalize_text("a\nb\n\n"));
+        assert_eq!(shape_text("a\nb"), shape_text("a\nb\n\n"));
     }
 
     #[test]
-    fn shape_collapses_interior_whitespace_while_content_keeps_it() {
-        assert_eq!(shape_text("a\n\nb"), "a b");
-        assert_eq!(normalize_text("a\n\nb"), "a\n\nb");
+    fn a_trailing_newline_is_significant() {
+        // The most common accidental edit there is. It changes what the model
+        // receives, so it is a content change; the shape digest stays equal, which
+        // is what lets Phase 2 call it formatting-only rather than ignoring it here.
+        assert_ne!(normalize_text("a\nb"), normalize_text("a\nb\n"));
+        assert_eq!(shape_text("a\nb"), shape_text("a\nb\n"));
+    }
+
+    #[test]
+    fn trailing_spaces_change_the_content_but_not_the_shape() {
+        assert_ne!(normalize_text("a\nb"), normalize_text("a   \nb\t"));
+        assert_eq!(shape_text("a\nb"), shape_text("a   \nb\t"));
+    }
+
+    #[test]
+    fn interior_whitespace_changes_the_content_but_not_the_shape() {
+        assert_ne!(normalize_text("a  b"), normalize_text("a b"));
+        assert_eq!(shape_text("a  b"), shape_text("a b"));
+    }
+
+    #[test]
+    fn a_semantic_edit_changes_both() {
+        assert_ne!(
+            normalize_text("Be concise."),
+            normalize_text("Be thorough.")
+        );
+        assert_ne!(shape_text("Be concise."), shape_text("Be thorough."));
+    }
+
+    #[test]
+    fn shape_collapses_every_whitespace_run() {
+        assert_eq!(shape_text("a\n\nb\tc"), "a b c");
     }
 }

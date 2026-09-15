@@ -116,11 +116,44 @@ fn recorded_facet(value: &serde_json::Value) -> Result<Facet> {
     Ok(facet)
 }
 
-/// Build the `params` facet payload from both sources of effective inference
+/// The endpoint form that participates in the identity: scheme, host, port and
+/// path, without a trailing slash.
+///
+/// Userinfo and the query string are dropped on purpose. They carry credentials
+/// and per-request knobs rather than the identity of the model, and the lockfile is
+/// committed — the same reason spec §5 refuses to write expanded `${VAR}` values
+/// into it. Dropping them means rotating a token does not read as a model change,
+/// and means a token never reaches a public repository.
+///
+/// An endpoint that is not a URL at all is fingerprinted as written, minus a
+/// trailing slash, so two spellings of one thing do not read as a change.
+fn identity_endpoint(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return endpoint.trim_end_matches('/').to_string();
+    };
+
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+
+    url.as_str().trim_end_matches('/').to_string()
+}
+
+/// Build the `params` facet payload from the two *sources* of inference
 /// parameters: the ones this project configures, and the ones the provider
-/// reports as model defaults. Both are behavior-relevant (design spec §5,
-/// §11.2). Returns `None` when neither source has anything, so a model with no
-/// parameters at all carries no `params` facet.
+/// reports as model defaults.
+///
+/// These are deliberately fingerprinted separately rather than merged into an
+/// "effective" set. Modelling provider override semantics correctly is more than
+/// Phase 1 can promise, and a wrong merge is worse than a conservative one: it
+/// would hide a change the user needs to see. The price of the conservative choice
+/// is the opposite error — a `reported` change that `configured` overrides still
+/// reads as a dependency change — which is a false positive the spec §8.3 risk
+/// table already classifies as MEDIUM.
+///
+/// Returns `None` when neither source has anything, so a model with no parameters
+/// at all carries no `params` facet.
 fn params_payload(
     configured: &BTreeMap<String, serde_json::Value>,
     reported: Option<&BTreeMap<String, Vec<String>>>,
@@ -229,8 +262,32 @@ pub fn dependency(
             }
         }
         "openai-compatible" => {
+            // This provider exposes no immutable content digest, so the endpoint is
+            // the only thing that says *which* model is actually running: two hosts
+            // serving a model with the same name can be entirely different backends
+            // or weights. Leaving it out of the identity would make moving between
+            // them look like no change at all, which is the false negative this tool
+            // exists to catch.
+            //
+            // Ollama is the opposite case: it reports a content digest that already
+            // pins the weights, so hashing the host there would turn a routine move
+            // to another machine into a dependency change that says nothing about
+            // behavior.
+            let endpoint =
+                config
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| Error::ModelEndpointMissing {
+                        provider: config.provider.clone(),
+                    })?;
+
+            identity.insert(
+                "endpoint".to_string(),
+                serde_json::Value::String(identity_endpoint(endpoint)),
+            );
+
             warnings.push(format!(
-                "model `{}`: digest unavailable for the `openai-compatible` provider; upstream model updates may go undetected",
+                "model `{}`: the `openai-compatible` provider exposes no content digest, so a model swapped behind the same endpoint cannot be detected; the endpoint is part of the identity instead",
                 config.id
             ));
         }
@@ -241,9 +298,9 @@ pub fn dependency(
         }
     }
 
-    // Configured parameters are half of the effective inference behavior: they are
-    // what the probe runner sends. Provider-reported parameters are the other half:
-    // they are the defaults the model uses when the config says nothing.
+    // Both parameter sources are fingerprinted, not merged: `configured` is what the
+    // probe runner will send, `reported` is what the provider says its defaults are.
+    // See `params_payload` for why the merge is deliberately not attempted.
     let reported = match config.provider.as_str() {
         "ollama" => metadata
             .and_then(|meta| meta.parameters.as_deref())
@@ -603,12 +660,16 @@ mod tests {
     }
 
     #[test]
-    fn a_template_difference_that_is_only_trailing_whitespace_is_insignificant() {
+    fn trailing_whitespace_in_the_chat_template_changes_its_digest() {
+        // The template is what the model is actually rendered through, so trailing
+        // whitespace there is real content, not formatting. The template facet is
+        // digest-only, so this surfaces as a change — the conservative direction: a
+        // template reflow that mattered must not be invisible.
         let mut reflowed = metadata();
         reflowed.template = Some("{{ .Prompt }}   ".to_string());
-        assert_eq!(
-            build(&ollama_config(), Some(&metadata())),
-            build(&ollama_config(), Some(&reflowed))
+        assert_ne!(
+            build(&ollama_config(), Some(&metadata())).facets["template"].digest,
+            build(&ollama_config(), Some(&reflowed)).facets["template"].digest
         );
     }
 
@@ -644,20 +705,23 @@ mod tests {
     }
 
     #[test]
-    fn an_openai_compatible_provider_records_identity_without_a_digest_and_warns() {
-        let config = ModelConfig {
-            provider: "openai-compatible".to_string(),
-            id: "gpt-4o".to_string(),
-            endpoint: Some("http://localhost:8000".to_string()),
-            params: BTreeMap::new(),
-        };
-        let (dependency, warnings) = dependency(&config, None).unwrap();
+    fn an_openai_compatible_provider_records_the_endpoint_and_warns() {
+        let (dependency, warnings) = dependency(
+            &openai_compatible_config("https://server-a.example/v1"),
+            None,
+        )
+        .unwrap();
 
-        assert_eq!(dependency.id, "model:openai-compatible/gpt-4o");
+        assert_eq!(dependency.id, "model:openai-compatible/same-model");
         assert!(!dependency.facets.contains_key("template"));
         assert!(!dependency.facets.contains_key("params"));
-        assert_eq!(warnings.len(), 1, "a missing digest must be surfaced");
-        assert!(warnings[0].contains("digest unavailable"), "{warnings:?}");
+
+        // With no digest to fingerprint, the endpoint is what identifies the model.
+        let identity = dependency.facets["identity"].normalized.clone().unwrap();
+        assert_eq!(identity["endpoint"], "https://server-a.example/v1");
+
+        assert_eq!(warnings.len(), 1, "the missing digest must be surfaced");
+        assert!(warnings[0].contains("no content digest"), "{warnings:?}");
     }
 
     #[test]
@@ -674,14 +738,88 @@ mod tests {
         assert!(matches!(err, Error::ModelMissing { .. }), "{err:?}");
     }
 
+    fn openai_compatible_config(endpoint: &str) -> ModelConfig {
+        ModelConfig {
+            provider: "openai-compatible".to_string(),
+            id: "same-model".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            params: BTreeMap::new(),
+        }
+    }
+
     #[test]
-    fn the_endpoint_is_never_part_of_the_identity() {
+    fn an_ollama_endpoint_is_not_part_of_the_identity() {
+        // Ollama reports a content digest that already pins the weights, so hashing
+        // the host as well would turn moving the same model to another machine into
+        // a dependency change that says nothing about behavior.
         let mut moved = ollama_config();
         moved.endpoint = Some("http://other-host:11434".to_string());
         assert_eq!(
             build(&ollama_config(), Some(&metadata())),
             build(&moved, Some(&metadata()))
         );
+    }
+
+    #[test]
+    fn an_openai_compatible_endpoint_is_part_of_the_identity() {
+        // No immutable digest exists for this provider, so two hosts offering a model
+        // with the same name can be entirely different backends. Moving between them
+        // must not look like no change at all.
+        let a = build(
+            &openai_compatible_config("https://server-a.example/v1"),
+            None,
+        );
+        let b = build(
+            &openai_compatible_config("https://server-b.example/v1"),
+            None,
+        );
+
+        assert_ne!(a.facets["identity"].digest, b.facets["identity"].digest);
+        assert_ne!(a.digest().unwrap(), b.digest().unwrap());
+    }
+
+    #[test]
+    fn an_openai_compatible_endpoint_difference_of_only_a_trailing_slash_is_insignificant() {
+        assert_eq!(
+            build(
+                &openai_compatible_config("https://server-a.example/v1/"),
+                None
+            ),
+            build(
+                &openai_compatible_config("https://server-a.example/v1"),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn openai_compatible_credentials_never_reach_the_identity_payload() {
+        // The lockfile is committed, so userinfo and query strings must not be
+        // recorded — the rule spec §5 already applies to expanded `${VAR}` values.
+        let dependency = build(
+            &openai_compatible_config("https://user:secret@server-a.example/v1?token=abc"),
+            None,
+        );
+        let identity = dependency.facets["identity"].normalized.clone().unwrap();
+        let recorded = identity["endpoint"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        assert_eq!(recorded, "https://server-a.example/v1");
+        assert!(!recorded.contains("secret"), "{recorded}");
+        assert!(!recorded.contains("token"), "{recorded}");
+    }
+
+    #[test]
+    fn an_openai_compatible_provider_without_an_endpoint_is_an_error() {
+        // With no endpoint there is nothing to fingerprint this provider's model by,
+        // so accepting the config would mean silently fingerprinting nothing at all.
+        let mut config = openai_compatible_config("https://server-a.example/v1");
+        config.endpoint = None;
+
+        let err = dependency(&config, None).unwrap_err();
+        assert!(matches!(err, Error::ModelEndpointMissing { .. }), "{err:?}");
     }
 
     #[test]

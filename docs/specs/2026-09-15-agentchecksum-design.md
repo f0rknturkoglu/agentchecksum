@@ -226,7 +226,9 @@ max = 0.0
 
 Notes:
 
-- `params` is hashed; it is behavior-relevant by definition.
+- `params` is hashed as a **source**: the configured values are fingerprinted separately from the provider's
+  reported defaults rather than merged into an effective set (§7.5 explains why the merge is deliberately not
+  attempted).
 - `${VAR}` expansion is supported for `env` values only. Expanded values are **never** written to the
   lockfile.
 - The `name` alias — not MCP `serverInfo.name` — determines dependency identity, because the MCP
@@ -372,7 +374,15 @@ A short, documented, individually tested rule list:
 | 1 | Sort `required` arrays | Order is meaningless in JSON Schema |
 | 2 | Sort `enum` arrays | Order is meaningless for validation |
 | 3 | Resolve a missing `$schema` to the 2020-12 default | The MCP specification defaults to 2020-12 when `$schema` is absent |
-| 4 | Text: CRLF→LF, strip trailing whitespace per line, strip BOM, strip leading and trailing blank lines | Invisible differences |
+| 4 | Text: unify line endings (CRLF→LF) and strip a leading BOM — nothing else | The only differences a platform introduces on its own |
+
+**Content and shape are separate digests, and the split is deliberate.** A text facet carries a `content` digest and a
+`shape` digest. `content` stays faithful to the text the model actually receives, so trailing spaces, leading and
+trailing blank lines, a trailing newline and interior whitespace all change it — each of them changes what the model
+sees, and assuming otherwise would hide a real runtime difference. `shape` collapses every whitespace run to one space,
+which is what lets a formatting-only edit be *classified*, in Phase 2's diff and risk table, instead of being silently
+discarded at fingerprint time. A platform-only line-ending difference is the one case where `content` may stay
+identical.
 
 ### 7.4 Deliberately **not** normalized
 
@@ -389,8 +399,8 @@ equivalence, not a judgement about importance.
 
 | Kind | Facets |
 |---|---|
-| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size), `params` (effective inference parameters: `configured` from `[model].params`, `reported` from Ollama's `parameters` text), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
-| `Prompt` | `content`, `shape` |
+| `Model` | `identity` (provider, id, content `digest`, quantization level, family, parameter size, and — for a provider that exposes no content digest — `endpoint`), `params` (**parameter sources**: `configured` from `[model].params`, `reported` from Ollama's `parameters` text, fingerprinted separately rather than merged), `template` (chat template), `capabilities` (e.g. `completion`, `tools`) |
+| `Prompt` | `content` (faithful to the text the model receives), `shape` (whitespace-collapsed, for formatting-only detection) |
 | `Tool` | `input_schema`, `output_schema`, `description` (+ `shape`), `capabilities` |
 | `McpServer` | `identity` (era, protocol version, supported versions, server info) |
 
@@ -405,9 +415,14 @@ different chat template changes prompt formatting without touching any source fi
 
 - **Ollama** exposes a real content `digest` (SHA-256), `quantization_level`, `parameter_size`,
   `family`, `template`, `capabilities`, and parsed `parameters` — a strong determinism signal.
-- **Generic OpenAI-compatible** endpoints expose no model digest (`/v1/models` returns only `id`,
-  `created`, `owned_by`). In that case `revision` is recorded as `null` and the diff output carries an
-  explicit warning: *digest unavailable — upstream model updates may go undetected.*
+- **Generic OpenAI-compatible** endpoints expose no model digest (`/v1/models` returns only `id`, `created`,
+  `owned_by`), so the **endpoint is part of the identity** instead: two hosts serving a model with the same name can
+  be entirely different backends or weights, and leaving the host out would make moving between them look like no
+  change at all. The recorded form drops userinfo, the query string and the fragment, because they carry credentials
+  and the lockfile is committed (the same reason §5 refuses to write expanded `${VAR}` values). An endpoint is
+  therefore **required** for this provider: with none, there is nothing to fingerprint the model by. The remaining
+  false negative is declared in output rather than hidden — *a model swapped behind the same endpoint cannot be
+  detected.*
 
 This is a real class of false negative and is declared in output, not hidden.
 
