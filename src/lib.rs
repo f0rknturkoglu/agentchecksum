@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod diff;
 pub mod discovery;
 pub mod error;
 pub mod fingerprint;
