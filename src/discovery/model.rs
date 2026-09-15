@@ -108,6 +108,35 @@ fn recorded_facet(value: &serde_json::Value) -> Result<Facet> {
     Ok(facet)
 }
 
+/// Build the `params` facet payload from both sources of effective inference
+/// parameters: the ones this project configures, and the ones the provider
+/// reports as model defaults. Both are behavior-relevant (design spec §5,
+/// §11.2). Returns `None` when neither source has anything, so a model with no
+/// parameters at all carries no `params` facet.
+fn params_payload(
+    configured: &BTreeMap<String, serde_json::Value>,
+    reported: Option<&BTreeMap<String, Vec<String>>>,
+) -> Result<Option<serde_json::Value>> {
+    if configured.is_empty() && reported.is_none() {
+        return Ok(None);
+    }
+
+    let mut payload = serde_json::Map::new();
+    if !configured.is_empty() {
+        payload.insert(
+            "configured".to_string(),
+            serde_json::to_value(configured).map_err(|source| Error::Json { source })?,
+        );
+    }
+    if let Some(reported) = reported {
+        payload.insert(
+            "reported".to_string(),
+            serde_json::to_value(reported).map_err(|source| Error::Json { source })?,
+        );
+    }
+    Ok(Some(serde_json::Value::Object(payload)))
+}
+
 /// Pure mapping from config plus optional provider metadata to a dependency.
 pub fn dependency(
     config: &ModelConfig,
@@ -165,13 +194,6 @@ pub fn dependency(
                 }
             }
 
-            if let Some(parameters) = &metadata.parameters {
-                let parsed = parse_ollama_parameters(parameters);
-                let value =
-                    serde_json::to_value(&parsed).map_err(|source| Error::Json { source })?;
-                facets.insert("params".to_string(), facet(&value)?);
-            }
-
             if let Some(template) = &metadata.template {
                 facets.insert(
                     "template".to_string(),
@@ -201,6 +223,19 @@ pub fn dependency(
                 provider: other.to_string(),
             });
         }
+    }
+
+    // Configured parameters are half of the effective inference behavior: they are
+    // what the probe runner sends. Provider-reported parameters are the other half:
+    // they are the defaults the model uses when the config says nothing.
+    let reported = match config.provider.as_str() {
+        "ollama" => metadata
+            .and_then(|meta| meta.parameters.as_deref())
+            .map(parse_ollama_parameters),
+        _ => None,
+    };
+    if let Some(payload) = params_payload(&config.params, reported.as_ref())? {
+        facets.insert("params".to_string(), recorded_facet(&payload)?);
     }
 
     let identity = serde_json::Value::Object(identity);
@@ -444,6 +479,62 @@ mod tests {
     }
 
     #[test]
+    fn configured_inference_parameters_are_hashed() {
+        let baseline = build(&ollama_config(), Some(&metadata()));
+        let mut retuned = ollama_config();
+        retuned
+            .params
+            .insert("temperature".to_string(), serde_json::json!(0.9));
+        let after = build(&retuned, Some(&metadata()));
+        assert_ne!(
+            baseline.facets["params"].digest,
+            after.facets["params"].digest
+        );
+    }
+
+    #[test]
+    fn configured_parameters_are_recorded_alongside_reported_ones() {
+        let mut config = ollama_config();
+        config
+            .params
+            .insert("seed".to_string(), serde_json::json!(42));
+        let dependency = build(&config, Some(&metadata()));
+        let payload = dependency.facets["params"].normalized.clone().unwrap();
+        assert_eq!(payload["configured"]["seed"], serde_json::json!(42));
+        assert!(payload["reported"]["temperature"].is_array());
+    }
+
+    #[test]
+    fn configured_parameters_are_hashed_for_a_provider_that_reports_none() {
+        let mut config = ModelConfig {
+            provider: "openai-compatible".to_string(),
+            id: "gpt-4o".to_string(),
+            endpoint: Some("http://localhost:8000".to_string()),
+            params: BTreeMap::new(),
+        };
+        config
+            .params
+            .insert("temperature".to_string(), serde_json::json!(0.7));
+        let baseline = dependency(&config, None).unwrap().0;
+        config
+            .params
+            .insert("temperature".to_string(), serde_json::json!(0.9));
+        let after = dependency(&config, None).unwrap().0;
+        assert_ne!(
+            baseline.facets["params"].digest,
+            after.facets["params"].digest
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_parameters_at_all_has_no_params_facet() {
+        let mut without = metadata();
+        without.parameters = None;
+        let dependency = build(&ollama_config(), Some(&without));
+        assert!(!dependency.facets.contains_key("params"));
+    }
+
+    #[test]
     fn a_chat_template_change_changes_the_template_digest() {
         let baseline = build(&ollama_config(), Some(&metadata()));
         let mut retemplated = metadata();
@@ -529,18 +620,21 @@ mod tests {
         assert!(matches!(err, Error::ModelEndpointMissing { .. }), "{err:?}");
     }
 
-    async fn metadata_for(server: &wiremock::MockServer, model_digest: &str) -> OllamaMetadata {
+    async fn metadata_for_with(
+        server: &wiremock::MockServer,
+        model_digest: &str,
+        modified_at: &str,
+        size: u64,
+        license: &str,
+    ) -> OllamaMetadata {
         // Built as a map so the optional `digest` is inserted rather than
         // mutated in place: `serde_json::Value` implements `Index` but not
         // `IndexMut`.
         let mut model = serde_json::Map::new();
         model.insert("name".to_string(), serde_json::json!("qwen3:8b"));
         model.insert("model".to_string(), serde_json::json!("qwen3:8b"));
-        model.insert(
-            "modified_at".to_string(),
-            serde_json::json!("2025-10-03T23:34:03Z"),
-        );
-        model.insert("size".to_string(), serde_json::json!(9608350245u64));
+        model.insert("modified_at".to_string(), serde_json::json!(modified_at));
+        model.insert("size".to_string(), serde_json::json!(size));
         if !model_digest.is_empty() {
             model.insert(
                 "digest".to_string(),
@@ -571,7 +665,7 @@ mod tests {
                     "parameters": "temperature 0.7\n",
                     "template": "{{ .Prompt }}",
                     "capabilities": ["completion", "tools"],
-                    "license": "Apache-2.0",
+                    "license": license,
                     "modified_at": "2025-08-14T15:49:43Z"
                 })),
             )
@@ -589,6 +683,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// The single-call form: every test but the metadata-exclusion one wants the
+    /// same non-behavioral values on both sides.
+    async fn metadata_for(server: &wiremock::MockServer, model_digest: &str) -> OllamaMetadata {
+        metadata_for_with(
+            server,
+            model_digest,
+            "2025-10-03T23:34:03Z",
+            9608350245,
+            "Apache-2.0",
+        )
+        .await
     }
 
     #[tokio::test]
@@ -610,8 +717,22 @@ mod tests {
         // Same model, but the second response carries a different modification
         // time, size, and license. None of those are behavior-relevant, so the
         // dependency must be identical byte for byte.
-        let a = metadata_for(&first, &"dd".repeat(32)).await;
-        let b = metadata_for(&second, &"dd".repeat(32)).await;
+        let a = metadata_for_with(
+            &first,
+            &"dd".repeat(32),
+            "2025-10-03T23:34:03Z",
+            9608350245,
+            "Apache-2.0",
+        )
+        .await;
+        let b = metadata_for_with(
+            &second,
+            &"dd".repeat(32),
+            "2026-01-01T00:00:00Z",
+            111111,
+            "MIT",
+        )
+        .await;
 
         let config_a = ModelConfig {
             provider: "ollama".to_string(),
