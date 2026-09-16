@@ -274,6 +274,112 @@ def cmd_checksums(args: argparse.Namespace) -> None:
     sys.stdout.write("".join(f"{line}\n" for line in lines))
 
 
+# The release assets a Homebrew formula installs from. macOS only, because that is the
+# platform Homebrew's formula in this tap is for; the Linux and Windows archives are
+# reachable through the other channels.
+HOMEBREW_TARGETS = {"arm": "aarch64-apple-darwin", "intel": "x86_64-apple-darwin"}
+
+HOMEBREW_BASE = "https://github.com/f0rknturkoglu/agentchecksum/releases"
+
+
+def fetch(url: str) -> str:
+    """Read a release asset over HTTPS, failing loudly rather than silently."""
+    result = subprocess.run(["curl", "-fsSL", url], capture_output=True, text=True)
+    if result.returncode != 0:
+        fail(f"cannot read {url}: {result.stderr.strip() or 'curl failed'}")
+    return result.stdout
+
+
+def cmd_homebrew(args: argparse.Namespace) -> None:
+    name, version = crate()
+    tag = args.tag or f"v{version}"
+
+    # The formula pins a version and digests that must belong to one release. A tag that
+    # disagrees with the manifest is exactly how a formula ends up pointing at 0.1.0's
+    # hashes while claiming to be 0.1.1.
+    if tag != f"v{version}":
+        fail(f"tag {tag} does not match {name} {version} in Cargo.toml (expected v{version})")
+
+    base = args.release_base.rstrip("/")
+    sums_url = f"{base}/download/{tag}/SHA256SUMS"
+    try:
+        manifest = fetch(sums_url)
+    except SystemExit:
+        raise
+    digests = {}
+    for line in manifest.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            digests[parts[1]] = parts[0]
+
+    # Both macOS assets are required. A formula that silently loses one of them installs a
+    # broken product on half the machines that ask for it.
+    assets = {}
+    for flavour, target in HOMEBREW_TARGETS.items():
+        asset = archive_of(name, version, target)
+        digest = digests.get(asset)
+        if digest is None:
+            fail(f"{asset} is not listed in {sums_url}")
+        if len(digest) != 64 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            fail(f"{asset} has an unusable sha256 in {sums_url}: {digest!r}")
+        assets[flavour] = (target, asset, digest)
+
+    formula = render_homebrew_formula(name, version, tag, base, assets)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(formula)
+        ok(f"wrote {args.output} for {name} {version} from {tag}")
+    else:
+        sys.stdout.write(formula)
+
+
+def render_homebrew_formula(name, version, tag, base, assets) -> str:
+    arm_target, arm_asset, arm_digest = assets["arm"]
+    intel_target, intel_asset, intel_digest = assets["intel"]
+
+    return f"""# This file is generated. Edit the generator, not the formula:
+#
+#   python3 scripts/release_artifacts.py homebrew --output Formula/{name}.rb
+#
+# which reads the version from Cargo.toml and the digests from the release's own
+# SHA256SUMS, and refuses to run if either macOS archive is missing.
+class Agentchecksum < Formula
+  desc "Dependency fingerprint and behavioral regression gate for AI agents"
+  homepage "https://github.com/f0rknturkoglu/agentchecksum"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  # No `version`: both URLs carry `v{version}`, and Homebrew reads it from them —
+  # `brew audit` reports it as redundant when it is written out. The generator already
+  # refuses a tag that disagrees with Cargo.toml, so the version cannot drift.
+
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "{base}/download/{tag}/{arm_asset}"
+      sha256 "{arm_digest}"
+    else
+      url "{base}/download/{tag}/{intel_asset}"
+      sha256 "{intel_digest}"
+    end
+  end
+
+  def install
+    # Each archive holds one directory named after the asset, with the binary and the
+    # two license files in it.
+    bin.install "{name}"
+  end
+
+  test do
+    assert_match "agentchecksum #{{version}}", shell_output("#{{bin}}/{name} --version")
+  end
+end
+"""
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dist", type=Path, default=ROOT / "dist", help="directory holding the archives (default: dist/)")
@@ -294,6 +400,11 @@ def main(argv: list[str]) -> int:
 
     subparsers.add_parser("checksums", help="write SHA256SUMS over the archives")
 
+    homebrew = subparsers.add_parser("homebrew", help="render the Homebrew formula from a published release")
+    homebrew.add_argument("--tag", help="the release tag to read (default: v<version>)")
+    homebrew.add_argument("--release-base", default=HOMEBREW_BASE, help="where the release assets live")
+    homebrew.add_argument("--output", type=Path, help="write the formula here instead of stdout")
+
     args = parser.parse_args(argv)
     commands = {
         "version": cmd_version,
@@ -301,6 +412,7 @@ def main(argv: list[str]) -> int:
         "package": cmd_package,
         "smoke": cmd_smoke,
         "checksums": cmd_checksums,
+        "homebrew": cmd_homebrew,
     }
     commands[args.subcommand](args)
     return 0
