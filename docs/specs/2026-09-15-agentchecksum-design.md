@@ -960,7 +960,8 @@ process received is the connection material it never repeats.
 
 **A server that declares a configured value is refused, not redacted.** A child process is handed its
 environment and can print any of it back into its own declarations — an implementation version, the server
-instructions, a tool name, a tool description, or any key or string inside a schema. Those declarations are
+instructions, a tool name, a tool description, a protocol revision it reports, or any key or string inside
+a schema. Those declarations are
 what becomes the fingerprint, so a credential arriving through one of them would be committed: hashed into
 a facet digest, baked into a dependency id, written into the lockfile.
 

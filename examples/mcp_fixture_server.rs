@@ -47,6 +47,16 @@ use serde_json::{Map, Value, json};
 /// The newest session-protocol revision, used when the fixture is pinned to legacy.
 const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
+/// One reported revision, built the way the wire builds it.
+///
+/// `ProtocolVersion`'s field is private, so this serde path is the only way to hold a
+/// value the protocol does not define — which is precisely what a server may report,
+/// and why the reported set is spec data rather than a list of known revisions.
+fn protocol_version(reported: &str) -> ProtocolVersion {
+    serde_json::from_value(Value::String(reported.to_string()))
+        .expect("a protocol version is any string")
+}
+
 // ---------------------------------------------------------------------------
 // The spec file
 // ---------------------------------------------------------------------------
@@ -59,6 +69,14 @@ struct Spec {
     /// down to the session protocol.
     #[serde(default)]
     legacy_only: bool,
+    /// The protocol revisions this server reports, verbatim.
+    ///
+    /// Absent, the server reports the revisions it is built with, narrowed by
+    /// `legacy_only`. Present, these strings *are* the reported set — including a
+    /// string no revision of the protocol ever used, which the wire allows because
+    /// `ProtocolVersion` is an open newtype.
+    #[serde(default)]
+    supported_versions: Option<Vec<String>>,
     /// Tools per `tools/list` page. `0` serves the whole catalog in one page.
     #[serde(default)]
     page_size: usize,
@@ -179,6 +197,12 @@ impl Spec {
 
     /// The protocol revisions this server implements.
     fn versions(&self) -> Vec<ProtocolVersion> {
+        if let Some(reported) = &self.supported_versions {
+            return reported
+                .iter()
+                .map(|version| protocol_version(version.as_str()))
+                .collect();
+        }
         if self.legacy_only {
             vec![LEGACY]
         } else {

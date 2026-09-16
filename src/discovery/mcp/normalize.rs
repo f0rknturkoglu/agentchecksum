@@ -166,16 +166,28 @@ pub(crate) fn identity(
         None => None,
     };
 
-    let supported_versions = supported_versions.map(|versions| {
-        let mut reported: Vec<String> = versions
-            .iter()
-            .map(|version| version.as_str().to_string())
-            .collect();
-        // A set, not a sequence: order and repetition carry no meaning here.
-        reported.sort();
-        reported.dedup();
-        reported
-    });
+    // Reported revisions are strings the *server* chose: `ProtocolVersion` is an open
+    // newtype, so an arbitrary value can arrive here even though we only ever ask for
+    // known dates. They are written into the identity payload, which makes this a
+    // declaration like any other and therefore guarded like any other — before the
+    // strings are converted, sorted, and recorded.
+    let supported_versions = match supported_versions {
+        Some(versions) => {
+            for version in versions {
+                check_text(secrets, version.as_str(), "a supported protocol version")?;
+            }
+
+            let mut reported: Vec<String> = versions
+                .iter()
+                .map(|version| version.as_str().to_string())
+                .collect();
+            // A set, not a sequence: order and repetition carry no meaning here.
+            reported.sort();
+            reported.dedup();
+            Some(reported)
+        }
+        None => None,
+    };
 
     let (capabilities, capability_warnings) = capability_payload(capabilities);
     warnings.extend(capability_warnings);
@@ -591,6 +603,22 @@ mod tests {
         ));
         assert!(tool(&with_output, &secrets).unwrap_err().reflection);
 
+        // A reported protocol revision. `ProtocolVersion` is an open newtype, so the
+        // server can put any string in the list, and the list is recorded.
+        let arbitrary: ProtocolVersion =
+            serde_json::from_value(Value::String("x7p".to_string())).expect("a protocol version");
+        assert!(
+            identity(
+                &ProtocolVersion::V_2026_07_28,
+                &default_caps,
+                None,
+                Some(&[ProtocolVersion::V_2026_07_28, arbitrary]),
+                &secrets,
+            )
+            .unwrap_err()
+            .reflection
+        );
+
         // A capability identifier that AgentChecksum retains.
         let mut capabilities = ServerCapabilities::default();
         capabilities.extensions = Some(std::collections::BTreeMap::from([(
@@ -615,10 +643,21 @@ mod tests {
     fn a_reflection_is_reported_without_repeating_anything_it_carried() {
         let secrets = configured_secrets(&[("TOKEN", "x7p")]);
 
+        let arbitrary: ProtocolVersion =
+            serde_json::from_value(Value::String("x7p".to_string())).expect("a protocol version");
+
         for rejected in [
             tool(&tool_with("x7p", None), &secrets).unwrap_err(),
             tool(
                 &schema_of(serde_json::json!({ "x7p": { "type": "string" } })),
+                &secrets,
+            )
+            .unwrap_err(),
+            identity(
+                &ProtocolVersion::V_2026_07_28,
+                &ServerCapabilities::default(),
+                None,
+                Some(&[arbitrary]),
                 &secrets,
             )
             .unwrap_err(),

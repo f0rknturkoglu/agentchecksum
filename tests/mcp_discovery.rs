@@ -1922,6 +1922,52 @@ fn a_server_implementation_version_that_reflects_a_configured_value_is_refused()
     );
 }
 
+/// The reported revisions are strings the server chose, and they are recorded in the
+/// identity payload — so they are a declaration like any other.
+///
+/// `ProtocolVersion` is an open newtype: `x7p` is as reportable as `2026-07-28`, even
+/// though AgentChecksum only ever asks for known dates. The guard sits before those
+/// strings are converted, sorted, and recorded, which is the ordering half of the
+/// property — the failure is attributed to the identity, never to the catalog, and
+/// nothing derived from the identity was ever built.
+#[test]
+fn a_reported_protocol_version_that_reflects_a_configured_value_is_refused() {
+    let project = Project::stdio(
+        json!({
+            "supported_versions": ["2026-07-28", SHORT_SENTINEL],
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("reading the server identity"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("in a supported protocol version"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("tool catalog"),
+        "the reported revisions were not refused before the catalog was read: {diagnostic}"
+    );
+    // Neither the offending string nor the set it arrived in is repeated: the subject
+    // names the position, not what was found there.
+    assert!(
+        !diagnostic.contains(SHORT_SENTINEL),
+        "the diagnostic repeated the reported revision: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("2026-07-28"),
+        "the diagnostic repeated the reported revisions: {diagnostic}"
+    );
+}
+
 /// A tool name becomes half of a dependency id, so a name that *is* the configured
 /// value would put a credential inside an id. The subject is deliberately generic —
 /// "a tool name" — because one that quoted the name would print the very thing the
@@ -2081,9 +2127,10 @@ fn instructions_that_reflect_a_configured_value_are_refused_before_the_digest() 
 /// A refusal is not a reason to touch a baseline.
 ///
 /// The lockfile here was written by a successful run against a clean spec, and the
-/// only thing that changes is that the server now hands the configured value back.
-/// Both commands that discover the server meet the same refusal, and the bytes on disk
-/// are the ones the successful run wrote.
+/// only thing that changes is that the server now hands the configured value back —
+/// once from a field it describes itself with, once from the set of revisions it
+/// reports. Both commands that discover the server meet the same refusal, and the
+/// bytes on disk are the ones the successful run wrote.
 #[test]
 fn a_reflection_leaves_an_existing_lockfile_byte_identical() {
     let project = Project::stdio(
@@ -2122,6 +2169,28 @@ fn a_reflection_leaves_an_existing_lockfile_byte_identical() {
         "a refused diff rewrote the lockfile"
     );
     assert_secret_absent(&project, &report, Some(&stdout(&report)), SHORT_SENTINEL);
+
+    // The same property on the surface the server chooses most freely: a reported
+    // revision is a string, not one of the dates the protocol defines.
+    let reported = Project::stdio(
+        json!({ "tools": [tool("search")] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    reported.committed_baseline();
+    let before = reported.lock_bytes();
+    reported.redeclare(json!({
+        "supported_versions": ["2026-07-28", SHORT_SENTINEL],
+        "tools": [tool("search")]
+    }));
+
+    let output = reported.snapshot();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(
+        reported.lock_bytes(),
+        before,
+        "a refused snapshot rewrote the lockfile"
+    );
+    assert_secret_absent(&reported, &output, Some(&stdout(&output)), SHORT_SENTINEL);
 }
 
 /// A configured value is not itself a failure: the guard is about a server
