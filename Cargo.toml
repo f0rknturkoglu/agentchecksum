@@ -67,6 +67,19 @@ rmcp = { version = "3.4", default-features = false, features = [
     "reqwest",
 ] }
 
+# `cargo binstall agentchecksum` reads this to download the release archive instead of
+# compiling. `pkg-url` and `bin-dir` are written against the layout `scripts/release_artifacts.py`
+# produces: one archive per target named `agentchecksum-v<version>-<target>.<ext>`, holding a
+# directory of the same name with the binary inside it.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+# Only Windows differs: it is packaged as a zip.
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dev-dependencies]
 assert_cmd = "2.2"
 insta = { version = "1.48", features = ["json"] }
