@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Release
+
+# One release is one tag push, and the version in `Cargo.toml` and the tag must agree:
+# the first job refuses the run otherwise, before anything is built, because a
+# mistagged release would publish binaries whose `--version` contradicts the tag they
+# are filed under.
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: the same builds, archives, smoke tests and uploaded artifacts, with the
+  # release job skipped, so nothing is published.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tag:
+    name: Check the tag against the crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Both values come from `Cargo.toml` and the ref; no version number is written
+      # into this workflow, so the archive names, the `--version` assertion and the
+      # release tag cannot drift apart.
+      - name: Refuse a tag that does not match the crate version
+        run: python3 scripts/release_artifacts.py check-tag --tag "$GITHUB_REF_NAME" --event "$GITHUB_EVENT_NAME"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify-tag
+    strategy:
+      # One target failing must not cancel the others: the failures are read together,
+      # and a partial release cannot happen because the release job needs all of them.
+      fail-fast: false
+      matrix:
+        include:
+          # One binary per target, each built on a runner of that architecture: these
+          # are native builds, not cross builds. `--target` names the triple the binary
+          # must be, so a build that would produce the wrong architecture fails instead
+          # of shipping under the wrong name.
+          #
+          # These four labels are the ones this project intends to support. A label that
+          # does not exist fails the job ("no runner matching the specified labels")
+          # rather than quietly producing no artifact, so a typo here is loud. (macOS 14
+          # is the arm64 image GitHub has announced will be retired; replacing it is a
+          # deliberate change to this matrix, never a silent one.)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            python: python3
+            project: true
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            python: python3
+            project: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            python: python3
+            project: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            python: python
+            project: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rust-toolchain.toml` is the single source of truth for the compiler, exactly as
+      # in CI: the binary a release ships must be the one the pinned toolchain produced.
+      # `rustc --version` is what installs it through the rustup shim.
+      - name: Verify the pinned compiler is the one running
+        shell: bash
+        run: |
+          case "$(rustc --version)" in
+            "rustc 1.98.1 "*) echo "pinned toolchain active" ;;
+            *)
+              echo "::error::expected rustc 1.98.1, got $(rustc --version)"
+              exit 1
+              ;;
+          esac
+
+      # `--locked`: a release is built from the dependency set that is committed.
+      - name: Build the release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package the archive
+        run: ${{ matrix.python }} scripts/release_artifacts.py package --target ${{ matrix.target }}
+
+      # The archive is what a user downloads, so the archive is what gets tested: it is
+      # extracted, and the binary inside it must start and answer `--version` with the
+      # crate version and `--help`. On the runners that build a Unix binary the check
+      # goes further and runs a project end to end (`init`, `snapshot`, `diff`), which
+      # is what proves the packaged binary finds its configuration and can discover
+      # dependencies.
+      - name: Smoke-test the archive
+        run: ${{ matrix.python }} scripts/release_artifacts.py smoke --target ${{ matrix.target }} ${{ matrix.project && '--project' || '' }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [verify-tag, build]
+    # The one thing a dry run must not do. Every step before this job is identical in
+    # both cases, so a dry run exercises the whole pipeline.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # `gh` creates the release and uploads its assets with this token.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # All four archives in one directory: `SHA256SUMS` has to cover all of them.
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        run: python3 scripts/release_artifacts.py checksums
+
+      # Checked before it is published; a checksum file that does not check out is worth
+      # less than no checksum file at all.
+      - name: Verify the checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      # First-party `gh`, preinstalled on the runner, rather than a release action: one
+      # fewer third party in the path that can publish a binary.
+      - name: Attach the archives and SHA256SUMS to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-running a tag replaces its assets instead of failing.
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --verify-tag \
+              --title "AgentChecksum $tag" \
+              --generate-notes
+          fi

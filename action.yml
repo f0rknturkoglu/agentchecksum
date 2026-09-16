@@ -1,0 +1,72 @@
+name: AgentChecksum
+description: >-
+  Run AgentChecksum in a workflow: fingerprint the agent's dependencies and gate on
+  what the behavior probes measured. The CLI's exit code is the step's outcome — 1 for
+  a gate failure, 2 for a usage error, 3 for a check that could not be evaluated.
+author: AgentChecksum
+
+branding:
+  icon: check-circle
+  color: purple
+
+inputs:
+  command:
+    description: >-
+      The AgentChecksum subcommand to run: `snapshot`, `diff` or `check`. `check` is the
+      gate; `diff` reports and never fails a build.
+    required: false
+    default: check
+  args:
+    description: >-
+      Extra arguments appended to the command, for example
+      `--fail-on-drift --format json`.
+    required: false
+    default: ""
+  version:
+    description: >-
+      Which AgentChecksum to run: `latest` for the newest published release, or a tag
+      such as `v0.1.0`. When no release asset is available for this platform the action
+      builds the CLI from the source it ships (announced on stderr), so it keeps working
+      before the first release and on a mirror without release assets.
+    required: false
+    default: latest
+  working-directory:
+    description: The project directory to run in.
+    required: false
+    default: "."
+  config:
+    description: Path to the configuration file, relative to the working directory.
+    required: false
+    default: agentchecksum.toml
+  lock:
+    description: Path to the lockfile, relative to the working directory.
+    required: false
+    default: agentchecksum.lock
+
+outputs:
+  exit-code:
+    description: >-
+      The AgentChecksum exit code: 0 completed, 1 gate failure, 2 usage error,
+      3 runtime failure. The step fails for any non-zero code.
+    value: ${{ steps.run.outputs.exit-code }}
+  status:
+    description: >-
+      The verdict from a JSON report (`pass`, `drift`, `regression` or `error`), when the
+      command was run with `--format json`. Empty otherwise.
+    value: ${{ steps.run.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_LOCK: ${{ inputs.lock }}
+      run: |
+        "${{ github.action_path }}/scripts/github-action.sh" \
+          "${{ inputs.working-directory }}" \
+          "${{ github.action_path }}"
