@@ -230,7 +230,22 @@ pub fn tool(tool: &McpTool) -> std::result::Result<DiscoveredTool, Rejected> {
         input_schema,
         output_schema,
         capabilities: tool_capabilities(tool.annotations.as_ref()),
+        // Presence only. The value is opaque, server-controlled, and may be large,
+        // short-lived, or sensitive, so it is never read, compared, or stored.
+        opaque_metadata: tool.meta.is_some(),
     })
+}
+
+/// The server's instructions, validated against the same bound as any other text.
+///
+/// Returned as text because the caller turns them into a facet: hashes are what
+/// reach the lockfile, and the prose does not.
+pub fn instructions(instructions: Option<&str>) -> std::result::Result<Option<String>, Rejected> {
+    let Some(instructions) = instructions else {
+        return Ok(None);
+    };
+    check_bytes("server instructions", instructions, limits::MAX_TEXT_BYTES)?;
+    Ok(Some(instructions.to_string()))
 }
 
 /// The effective behavior hints, as a sorted set of tokens.
@@ -474,13 +489,58 @@ mod tests {
         // tools that differ only there are the same dependency contract.
         let plain = tool(&tool_with("t", None)).unwrap();
 
-        let mut decorated = tool_with("t", None);
-        decorated.title = Some("A prettier name".to_string());
-        decorated.icons = Some(vec![]);
-        decorated.meta = Some(rmcp::model::MetaObject::default());
-        let decorated = tool(&decorated).unwrap();
+        let mut wire = tool_with("t", None);
+        wire.title = Some("A prettier name".to_string());
+        wire.icons = Some(vec![]);
+        wire.meta = Some(rmcp::model::MetaObject::default());
+        let decorated = tool(&wire).unwrap();
 
-        assert_eq!(plain, decorated);
+        assert_eq!(plain.name, decorated.name);
+        assert_eq!(plain.description, decorated.description);
+        assert_eq!(plain.input_schema, decorated.input_schema);
+        assert_eq!(plain.output_schema, decorated.output_schema);
+        assert_eq!(plain.capabilities, decorated.capabilities);
+
+        // Presence alone is tracked, so discovery can say once per server that part
+        // of the declaration is deliberately outside the fingerprint.
+        assert!(!plain.opaque_metadata);
+        assert!(decorated.opaque_metadata);
+    }
+
+    #[test]
+    fn an_opaque_metadata_value_is_never_kept() {
+        // The value is server-controlled: it can be large, short-lived, or
+        // sensitive. Only its presence survives, so a declaration cannot smuggle
+        // arbitrary data into a lockfile through `_meta`.
+        let mut wire = tool_with("t", None);
+        let mut meta = rmcp::model::MetaObject::default();
+        meta.insert(
+            "io.example/secret".to_string(),
+            Value::String("SUPER_SECRET_OPAQUE_VALUE".to_string()),
+        );
+        wire.meta = Some(meta);
+
+        let normalized = tool(&wire).unwrap();
+        assert!(normalized.opaque_metadata);
+        let debugged = format!("{normalized:?}");
+        assert!(
+            !debugged.contains("SUPER_SECRET_OPAQUE_VALUE"),
+            "{debugged}"
+        );
+        assert!(!debugged.contains("io.example/secret"), "{debugged}");
+    }
+
+    #[test]
+    fn server_instructions_are_bounded_and_kept_as_text() {
+        assert_eq!(instructions(None).unwrap(), None);
+        assert_eq!(
+            instructions(Some("Prefer read-only tools.")).unwrap(),
+            Some("Prefer read-only tools.".to_string())
+        );
+
+        let oversized = "x".repeat(limits::MAX_TEXT_BYTES + 1);
+        let rejected = instructions(Some(&oversized)).unwrap_err();
+        assert_eq!(rejected.subject, "server instructions");
     }
 
     #[test]

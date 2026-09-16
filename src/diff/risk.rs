@@ -103,6 +103,14 @@ pub enum ToolFact {
     DescriptionFormattingOnly,
     CapabilityAdded,
     CapabilityRemoved,
+    /// A newly added tool whose own declarations name it write-capable and
+    /// destructive.
+    ///
+    /// Declared, not proven: MCP annotations are hints the server owns, and a
+    /// server that says `destructive` may behave any way it likes. What is
+    /// reported is that the declaration says so, which is the strongest statement
+    /// this layer is entitled to make.
+    DestructiveToolAdded,
 }
 
 pub fn tool(fact: ToolFact) -> RiskLevel {
@@ -113,9 +121,14 @@ pub fn tool(fact: ToolFact) -> RiskLevel {
         ToolFact::DescriptionChanged => RiskLevel::Medium,
         ToolFact::DescriptionFormattingOnly => RiskLevel::Low,
         ToolFact::CapabilityAdded => RiskLevel::Medium,
-        // Permission semantics are not modelled yet, so a dangerous addition is
-        // not CRITICAL here — but losing a capability stays HIGH.
+        // Losing a capability is HIGH rather than CRITICAL: it withdraws surface
+        // rather than adding any.
         ToolFact::CapabilityRemoved => RiskLevel::High,
+        // A new invocation surface is HIGH; one the server itself declares
+        // destructive is the worst thing a diff can discover on its own, so it is
+        // CRITICAL. The escalation is deliberately narrow: it needs *both* the
+        // write and destructive tokens, and anything it cannot decode stays HIGH.
+        ToolFact::DestructiveToolAdded => RiskLevel::Critical,
     }
 }
 
@@ -189,7 +202,7 @@ pub fn schema(side: SchemaSide, fact: SchemaFact) -> RiskLevel {
     }
 }
 
-/// MCP server facts (design spec §8.3). Discovery itself is a later phase.
+/// MCP server facts (design spec §8.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpFact {
     Added,
@@ -200,6 +213,10 @@ pub enum McpFact {
     ServerInfoChanged,
     /// Identity changed but the payload does not say which part.
     IdentityOtherChanged,
+    /// The server's instructions changed wording.
+    InstructionsChanged,
+    /// Instructions content differs, shape does not: a reflow.
+    InstructionsFormattingOnly,
 }
 
 pub fn mcp(fact: McpFact) -> RiskLevel {
@@ -209,6 +226,11 @@ pub fn mcp(fact: McpFact) -> RiskLevel {
         McpFact::ProtocolChanged => RiskLevel::High,
         McpFact::ServerInfoChanged => RiskLevel::Medium,
         McpFact::IdentityOtherChanged => RiskLevel::High,
+        // Instructions are guidance the model reads about how to use the server,
+        // so they carry exactly the weight a prompt or a tool description does:
+        // a rewrite is MEDIUM, a reflow is LOW.
+        McpFact::InstructionsChanged => RiskLevel::Medium,
+        McpFact::InstructionsFormattingOnly => RiskLevel::Low,
     }
 }
 
@@ -333,6 +355,11 @@ mod tests {
 
         assert_eq!(tool(ToolFact::CapabilityAdded), RiskLevel::Medium);
         assert_eq!(tool(ToolFact::CapabilityRemoved), RiskLevel::High);
+
+        // The one added-dependency row that is stricter than "new surface": the
+        // server declares the new tool destructive.
+        assert_eq!(tool(ToolFact::DestructiveToolAdded), RiskLevel::Critical);
+        assert!(tool(ToolFact::DestructiveToolAdded) > tool(ToolFact::Added));
     }
 
     #[test]
@@ -451,6 +478,10 @@ mod tests {
         assert_eq!(mcp(McpFact::ProtocolChanged), RiskLevel::High);
         assert_eq!(mcp(McpFact::ServerInfoChanged), RiskLevel::Medium);
         assert_eq!(mcp(McpFact::IdentityOtherChanged), RiskLevel::High);
+
+        // Instructions carry what a prompt or a tool description carries.
+        assert_eq!(mcp(McpFact::InstructionsChanged), RiskLevel::Medium);
+        assert_eq!(mcp(McpFact::InstructionsFormattingOnly), RiskLevel::Low);
     }
 
     #[test]

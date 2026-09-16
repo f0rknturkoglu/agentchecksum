@@ -333,11 +333,20 @@ fn a_stdio_server_and_its_tool_become_the_dependencies_and_the_aggregate_verifie
 // ---------------------------------------------------------------------------
 
 /// Snapshot `baseline`, re-declare the server as `changed`, and compare.
-fn baseline_then(project: &Project, baseline: Value, changed: Value) -> Value {
-    project.redeclare(json!({ "tools": baseline }));
+fn snapshot_then(project: &Project, baseline: Value, changed: Value) -> Value {
+    project.redeclare(baseline);
     project.committed_baseline();
-    project.redeclare(json!({ "tools": changed }));
+    project.redeclare(changed);
     project.diff_report()
+}
+
+/// The same two steps for a project whose declared catalog is what changes.
+fn baseline_then(project: &Project, baseline: Value, changed: Value) -> Value {
+    snapshot_then(
+        project,
+        json!({ "tools": baseline }),
+        json!({ "tools": changed }),
+    )
 }
 
 #[test]
@@ -817,6 +826,10 @@ impl Drop for FixtureProcess {
 /// Start the fixture in HTTP mode and wait for the port it bound.
 fn start_http(project: &Project) -> (FixtureProcess, u16) {
     let port_file = project.path().join("port");
+    // A fixture reads its spec once, at startup, so a test that changes the
+    // declarations restarts one — and a port file left by the previous process must
+    // not be read as this one's.
+    let _ = std::fs::remove_file(&port_file);
     let child = StdCommand::new(fixture())
         .arg("--http")
         .env("AC_FIXTURE_SPEC", &project.spec)
@@ -918,5 +931,609 @@ fn a_server_whose_newest_revision_is_legacy_is_recorded_as_the_legacy_era() {
     // not a discovery failure.
     assert!(
         project.lock()["dependencies"]["tool:local.search"]["facets"]["input_schema"].is_object()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. The lifecycle policy: only the peer decides the era
+// ---------------------------------------------------------------------------
+
+/// Just past the ten-second cap the SDK's own `Auto` policy puts on a
+/// `server/discover` probe, and far inside `limits::CONNECT_TIMEOUT`.
+const JUST_OVER_THE_SDK_DISCOVER_CAP_MS: u64 = 12_000;
+
+/// Past `limits::CONNECT_TIMEOUT`, so the client gives up before the server answers.
+const BEYOND_THE_CONNECT_TIMEOUT_MS: u64 = 61_000;
+
+/// Re-point the one configured stdio server at its spec with the fixture's start log
+/// enabled, and return that log's path.
+fn start_log(project: &Project) -> PathBuf {
+    let path = project.path().join("fixture-attempts");
+    write_config(
+        project.path(),
+        &config(&stdio_server(
+            "local",
+            &project.spec,
+            &[("AC_FIXTURE_ATTEMPT_FILE", &path.display().to_string())],
+        )),
+    );
+    path
+}
+
+/// How many times the fixture was started. A log that was never created is zero
+/// starts, which is what a client that started nothing leaves behind.
+fn attempts(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+/// No output stream, and no file, mentions the session era or its revision.
+///
+/// Checked as a whole surface rather than on the diagnostic alone: a legacy retry
+/// that is *logged* rather than reported is still a retry, and a lockfile naming the
+/// wrong era is the failure this policy exists to prevent.
+///
+/// `legacy` is looked for as the label it is — the `legacy lifecycle` stage in a
+/// diagnostic, or `"legacy"` as a recorded value — never as a bare word. A transport
+/// error can name an unrelated crate's `legacy` client, and a test that failed on
+/// that would be reporting a false positive about a real connection failure.
+fn assert_no_legacy_surface(project: &Project, output: &std::process::Output) {
+    for (surface, text) in [("stdout", stdout(output)), ("stderr", stderr(output))] {
+        for needle in ["2025-11-25", "legacy lifecycle"] {
+            assert!(
+                !text.contains(needle),
+                "`{needle}` reached {surface}: {text}"
+            );
+        }
+    }
+
+    for entry in std::fs::read_dir(project.path()).expect("the project directory is readable") {
+        let path = entry.expect("the directory entry is readable").path();
+        let bytes = std::fs::read(&path).expect("the artifact is readable");
+        let text = String::from_utf8_lossy(&bytes);
+        for needle in ["2025-11-25", "\"legacy\""] {
+            assert!(
+                !text.contains(needle),
+                "`{needle}` reached {}: {text}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A port nothing is listening on: bound to learn a free number, then released.
+fn unused_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a port is bindable");
+    let port = listener
+        .local_addr()
+        .expect("a bound socket has an address")
+        .port();
+    drop(listener);
+    port
+}
+
+/// A slow `server/discover` is latency, and latency must not choose the protocol era.
+///
+/// The SDK's `Auto` policy abandons the probe after ten seconds and initializes a
+/// session instead, which would record this server as a legacy one — the same
+/// declarations, a different dependency identity, decided by how busy the machine
+/// was. The delay here is deliberately just over that cap.
+#[test]
+fn a_slow_stateless_handshake_still_negotiates_the_stateless_era() {
+    let project = Project::stdio(
+        json!({
+            "discover": "delayed",
+            "discover_delay_ms": JUST_OVER_THE_SDK_DISCOVER_CAP_MS,
+            "tools": [tool("search")]
+        }),
+        &[],
+    );
+    let log = start_log(&project);
+
+    let output = project.snapshot();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let identity =
+        project.lock()["dependencies"]["mcp:local"]["facets"]["identity"]["normalized"].clone();
+    assert_eq!(identity["era"], "stateless");
+    assert_eq!(identity["protocol_version"], "2026-07-28");
+    assert!(
+        project.lock()["dependencies"]["tool:local.search"]["facets"]["input_schema"].is_object()
+    );
+    assert_eq!(
+        attempts(&log),
+        1,
+        "the handshake was retried by starting the server a second time"
+    );
+}
+
+/// A server that never answers is a timeout, not evidence about its age.
+///
+/// This is the expensive one: it waits out `limits::CONNECT_TIMEOUT` on purpose, so
+/// it costs about a minute. What it buys is the rule that a slow server cannot be
+/// discovered *as a legacy server*, which is what a timeout-triggered fallback
+/// would do — against this fixture the session handshake would answer immediately
+/// and the snapshot would succeed.
+#[test]
+fn a_handshake_that_never_answers_is_a_timeout_and_never_a_second_attempt() {
+    let project = Project::stdio(
+        json!({
+            "discover": "delayed",
+            "discover_delay_ms": BEYOND_THE_CONNECT_TIMEOUT_MS,
+            "tools": [tool("search")]
+        }),
+        &[],
+    );
+    let log = start_log(&project);
+
+    let output = project.snapshot();
+
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(diagnostic.contains("`local` (stdio)"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("did not complete connecting and negotiating within 60s"),
+        "{diagnostic}"
+    );
+    assert!(
+        !project.lock_exists(),
+        "a timed-out handshake left a lockfile behind"
+    );
+    assert_eq!(attempts(&log), 1, "the server was started a second time");
+    assert_no_legacy_surface(&project, &output);
+}
+
+/// The fallback a legacy peer can trigger, over the transport whose `discover`
+/// refusal is a JSON-RPC error rather than a sessionless 4xx.
+///
+/// The existing `legacy_only` test covers the version-downgrade path inside the
+/// stateless lifecycle; this covers the other one, where the peer says it does not
+/// implement `server/discover` at all and the client opens a session instead.
+#[test]
+fn a_server_that_refuses_discover_is_discovered_through_the_session_lifecycle() {
+    let project = Project::stdio(
+        json!({
+            "legacy_only": true,
+            "discover": "refused",
+            "server_info": { "name": "fixture", "version": "1.0.0" },
+            "tools": [tool("search")]
+        }),
+        &[],
+    );
+    let (fixture, port) = start_http(&project);
+    write_config(project.path(), &config(&http_server("local", port)));
+
+    let output = project.snapshot();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    drop(fixture);
+
+    let identity =
+        project.lock()["dependencies"]["mcp:local"]["facets"]["identity"]["normalized"].clone();
+    assert_eq!(identity["era"], "legacy");
+    assert_eq!(identity["protocol_version"], "2025-11-25");
+    assert_eq!(
+        identity["server_info"],
+        json!({ "name": "fixture", "version": "1.0.0" })
+    );
+    assert!(
+        project.lock()["dependencies"]["tool:local.search"]["facets"]["input_schema"].is_object(),
+        "the session lifecycle discovered no tool contract"
+    );
+}
+
+/// An unreachable server is unreachable, not old.
+///
+/// The second attempt is what a transport-triggered fallback would open; the stage
+/// in the diagnostic is what tells the two apart, because the legacy attempt reports
+/// a different one.
+#[test]
+fn a_transport_failure_is_not_retried_as_a_legacy_connection() {
+    let project = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    let port = unused_port();
+    write_config(project.path(), &config(&http_server("local", port)));
+    let log = project.path().join("fixture-attempts");
+
+    let output = project.snapshot();
+
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("`local` (streamable-http)"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("connecting and negotiating"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("legacy lifecycle"),
+        "the failure was retried as a legacy connection: {diagnostic}"
+    );
+    assert!(
+        !project.lock_exists(),
+        "an unreachable server left a lockfile behind"
+    );
+    assert_eq!(
+        attempts(&log),
+        0,
+        "a server was started for a dead endpoint"
+    );
+    assert_no_legacy_surface(&project, &output);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Server instructions: a digest, a shape, and no prose
+// ---------------------------------------------------------------------------
+
+/// Two sentences, so a reflow has somewhere to happen.
+const INSTRUCTIONS: &str = "Prefer the read-only tools.\nSearch the index before answering.";
+
+#[test]
+fn instructions_are_a_digest_and_a_shape_and_carry_no_text() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+    project.committed_baseline();
+
+    let facet = project.lock()["dependencies"]["mcp:local"]["facets"]["instructions"].clone();
+    assert!(
+        facet["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the instructions facet has no content digest: {facet}"
+    );
+    assert!(
+        facet["shape"]
+            .as_str()
+            .is_some_and(|shape| shape.starts_with("sha256:")),
+        "the instructions facet has no shape digest: {facet}"
+    );
+    assert!(
+        facet.get("normalized").is_none(),
+        "the instructions were recorded as a payload: {facet}"
+    );
+
+    // A server that declares none has no instructions facet: missing is a different
+    // statement from empty, and Phase 2 needs to see the difference.
+    let silent = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    silent.committed_baseline();
+    assert!(
+        silent.lock()["dependencies"]["mcp:local"]["facets"]
+            .get("instructions")
+            .is_none(),
+        "a server without instructions grew an instructions facet"
+    );
+}
+
+#[test]
+fn a_reflowed_instruction_is_low_and_classified_as_formatting_only() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+
+    // The same words, on one line.
+    let reflowed = INSTRUCTIONS.replace('\n', " ");
+    let report = snapshot_then(
+        &project,
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        json!({ "instructions": reflowed, "tools": [tool("search")] }),
+    );
+
+    assert_eq!(report["overall_risk"], "low");
+    let change = one_change(&report, "mcp:local");
+    assert_eq!(change["change"], "modified");
+    let instructions = facet(&change, "instructions");
+    assert_eq!(instructions["risk"], "low");
+    assert_eq!(instructions["details"][0]["path"], "classification");
+    assert_eq!(instructions["details"][0]["after"], "formatting-only");
+    assert!(
+        one_change_opt(&report, "tool:local.search").is_none(),
+        "the tool contract moved with the instructions"
+    );
+}
+
+#[test]
+fn a_rewritten_instruction_is_medium_and_classified_as_a_text_change() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+
+    let report = snapshot_then(
+        &project,
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        json!({
+            "instructions": "Always answer from the index cache.",
+            "tools": [tool("search")]
+        }),
+    );
+
+    assert_eq!(report["overall_risk"], "medium");
+    let instructions = facet(&one_change(&report, "mcp:local"), "instructions");
+    assert_eq!(instructions["risk"], "medium");
+    assert_eq!(instructions["details"][0]["path"], "classification");
+    assert_eq!(instructions["details"][0]["after"], "text-changed");
+    assert!(one_change_opt(&report, "tool:local.search").is_none());
+}
+
+/// Instructions appearing and disappearing are the facet rules the engine already
+/// has for a payload it has nothing to compare against: added MEDIUM, removed HIGH.
+#[test]
+fn instructions_added_are_medium_and_instructions_removed_are_high() {
+    let added = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    let report = snapshot_then(
+        &added,
+        json!({ "tools": [tool("search")] }),
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+    );
+    assert_eq!(report["overall_risk"], "medium");
+    let instructions = facet(&one_change(&report, "mcp:local"), "instructions");
+    assert_eq!(instructions["change"], "added");
+    assert_eq!(instructions["risk"], "medium");
+
+    let removed = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+    let report = snapshot_then(
+        &removed,
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        json!({ "tools": [tool("search")] }),
+    );
+    assert_eq!(report["overall_risk"], "high");
+    let instructions = facet(&one_change(&report, "mcp:local"), "instructions");
+    assert_eq!(instructions["change"], "removed");
+    assert_eq!(instructions["risk"], "high");
+}
+
+#[test]
+fn changing_only_the_instructions_moves_the_aggregate_checksum() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+    project.committed_baseline();
+    let before = project.lock();
+
+    project.redeclare(json!({
+        "instructions": "Search the index before answering, and prefer the read-only tools.",
+        "tools": [tool("search")]
+    }));
+    project.committed_baseline();
+    let after = project.lock();
+
+    assert_ne!(
+        before["agent_checksum"], after["agent_checksum"],
+        "the instructions are not part of the aggregate"
+    );
+    assert_eq!(
+        before["dependencies"]["tool:local.search"], after["dependencies"]["tool:local.search"],
+        "the tool contract moved with the instructions"
+    );
+    assert_ne!(
+        before["dependencies"]["mcp:local"]["facets"]["instructions"],
+        after["dependencies"]["mcp:local"]["facets"]["instructions"]
+    );
+}
+
+#[test]
+fn the_instructions_text_never_reaches_the_lockfile() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+    project.committed_baseline();
+
+    let text = String::from_utf8_lossy(&project.lock_bytes()).to_string();
+    for fragment in [
+        INSTRUCTIONS,
+        "Prefer the read-only tools.",
+        "Search the index before answering.",
+    ] {
+        assert!(
+            !text.contains(fragment),
+            "the instructions reached the lockfile as `{fragment}`: {text}"
+        );
+    }
+}
+
+/// The other transport, end to end: the fixture's `server/discover` and its session
+/// `initialize` both carry the same instructions, and the diff sees the change.
+///
+/// The fixture reads its spec once, at startup, so the declarations change under a
+/// new process: this is the path a test would otherwise get wrong and read as "the
+/// instructions never moved".
+#[test]
+fn an_instruction_change_is_observed_end_to_end_over_streamable_http() {
+    let project = Project::stdio(
+        json!({ "instructions": INSTRUCTIONS, "tools": [tool("search")] }),
+        &[],
+    );
+    let (fixture, port) = start_http(&project);
+    write_config(project.path(), &config(&http_server("local", port)));
+    project.committed_baseline();
+    drop(fixture);
+
+    project.redeclare(json!({
+        "instructions": "Always answer from the index cache.",
+        "tools": [tool("search")]
+    }));
+    let (fixture, port) = start_http(&project);
+    write_config(project.path(), &config(&http_server("local", port)));
+    let report = project.diff_report();
+    drop(fixture);
+
+    assert_eq!(report["overall_risk"], "medium");
+    let instructions = facet(&one_change(&report, "mcp:local"), "instructions");
+    assert_eq!(instructions["risk"], "medium");
+    assert_eq!(instructions["details"][0]["after"], "text-changed");
+}
+
+// ---------------------------------------------------------------------------
+// 15. A tool the server itself declares destructive
+// ---------------------------------------------------------------------------
+
+/// A tool whose own declaration says it writes and destroys.
+fn destructive_tool(name: &str) -> Value {
+    let mut declared = tool(name);
+    declared["annotations"] = json!({ "readOnlyHint": false, "destructiveHint": true });
+    declared
+}
+
+/// A tool whose own declaration says it writes, and says nothing about destroying.
+fn writing_tool(name: &str) -> Value {
+    let mut declared = tool(name);
+    declared["annotations"] = json!({ "readOnlyHint": false, "destructiveHint": false });
+    declared
+}
+
+/// A new tool is HIGH. A new tool the server declares write-capable *and*
+/// destructive is CRITICAL, and the escalation needs both tokens: this pins the
+/// three declarations side by side so the escalation cannot quietly widen.
+#[test]
+fn an_added_destructive_tool_is_critical_and_a_writing_or_read_only_one_is_high() {
+    let project = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    let report = baseline_then(
+        &project,
+        json!([tool("search")]),
+        json!([tool("search"), destructive_tool("purge")]),
+    );
+
+    assert_eq!(report["overall_risk"], "critical");
+    let change = one_change(&report, "tool:local.purge");
+    assert_eq!(change["change"], "added");
+    assert_eq!(change["risk"], "critical");
+    // The escalation reads the recorded tokens, and they are the ones the
+    // declaration implies. The report holds no facets for an added dependency, so
+    // this is read from a snapshot of the changed declaration.
+    project.committed_baseline();
+    assert_eq!(
+        project.lock()["dependencies"]["tool:local.purge"]["facets"]["capabilities"]["normalized"],
+        json!(["destructive", "non-idempotent", "open-world", "write"])
+    );
+
+    // Writing but not destructive is an ordinary new surface.
+    let project = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    let report = baseline_then(
+        &project,
+        json!([tool("search")]),
+        json!([tool("search"), writing_tool("purge")]),
+    );
+    assert_eq!(one_change(&report, "tool:local.purge")["risk"], "high");
+    assert_eq!(report["overall_risk"], "high");
+
+    // And so is read-only, which is the same diff the existing added-tool test runs.
+    let project = Project::stdio(json!({ "tools": [tool("search")] }), &[]);
+    let report = baseline_then(
+        &project,
+        json!([tool("search")]),
+        json!([tool("search"), tool("purge")]),
+    );
+    assert_eq!(one_change(&report, "tool:local.purge")["risk"], "high");
+    assert_eq!(report["overall_risk"], "high");
+}
+
+// ---------------------------------------------------------------------------
+// 16. Opaque `_meta`: presence is a warning, the value is not a fingerprint
+// ---------------------------------------------------------------------------
+
+/// The extension key and value a server attaches to a tool. Neither may be read.
+const OPAQUE_KEY: &str = "com.example/private-note";
+const OPAQUE_VALUE: &str = "SUPER_SECRET_OPAQUE_METADATA_VALUE";
+
+fn with_meta(name: &str, value: &str) -> Value {
+    let mut declared = tool(name);
+    declared["meta"] = json!({ OPAQUE_KEY: value });
+    declared
+}
+
+/// A project with two stdio servers, each with its own spec.
+fn two_stdio_servers(first: Value, second: Value) -> Project {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let first_spec = write_spec(dir.path(), "first.json", first);
+    let second_spec = write_spec(dir.path(), "second.json", second);
+    write_config(
+        dir.path(),
+        &config(&format!(
+            "{}\n{}",
+            stdio_server("local", &first_spec, &[]),
+            stdio_server("remote", &second_spec, &[])
+        )),
+    );
+    Project {
+        dir,
+        spec: first_spec,
+    }
+}
+
+/// `_meta` is a presence, aggregated per server, and never a value.
+///
+/// The fixture declares it on two tools of one server and one tool of another, so
+/// this pins all four properties at once: one warning line per server however many
+/// tools carry metadata, no key or value in that line, a lockfile identical to the
+/// same declarations without `_meta`, and — because a server that rotates a metadata
+/// value is not a server that changed its contract — no move in the checksum when
+/// only the value does.
+#[test]
+fn opaque_tool_metadata_is_one_warning_per_server_and_never_a_fingerprint() {
+    let decorated = two_stdio_servers(
+        json!({ "tools": [with_meta("search", OPAQUE_VALUE), with_meta("fetch", OPAQUE_VALUE)] }),
+        json!({ "tools": [with_meta("search", OPAQUE_VALUE)] }),
+    );
+
+    let output = decorated.snapshot();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let report = stdout(&output);
+    let warnings: Vec<&str> = report
+        .lines()
+        .filter(|line| line.contains("declared opaque MCP metadata"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{report}");
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("2 tools declared") && line.contains("`mcp:local`")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|line| line.contains("1 tool declared") && line.contains("`mcp:remote`")),
+        "{warnings:?}"
+    );
+    assert!(!report.contains(OPAQUE_KEY), "{report}");
+    assert!(!report.contains("private-note"), "{report}");
+    assert!(!report.contains(OPAQUE_VALUE), "{report}");
+
+    // The same two servers, declaring the same tools without `_meta`.
+    let plain = two_stdio_servers(
+        json!({ "tools": [tool("search"), tool("fetch")] }),
+        json!({ "tools": [tool("search")] }),
+    );
+    plain.committed_baseline();
+    assert_eq!(
+        plain.lock_bytes(),
+        decorated.lock_bytes(),
+        "`_meta` reached the lockfile"
+    );
+    assert_eq!(
+        plain.lock()["agent_checksum"],
+        decorated.lock()["agent_checksum"]
+    );
+
+    // A different value for the same key is the same contract.
+    let rotated = two_stdio_servers(
+        json!({ "tools": [with_meta("search", "rotated-value"), with_meta("fetch", "rotated-value")] }),
+        json!({ "tools": [with_meta("search", "rotated-value")] }),
+    );
+    rotated.committed_baseline();
+    assert_eq!(
+        rotated.lock_bytes(),
+        decorated.lock_bytes(),
+        "a `_meta` value was fingerprinted"
     );
 }

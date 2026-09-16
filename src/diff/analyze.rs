@@ -419,26 +419,49 @@ fn schema_facet(
 fn mcp_server(baseline: &LockedDependency, current: &LockedDependency) -> Vec<FacetChange> {
     let mut changes = Vec::new();
 
-    let Some(before) = baseline.facets.get("identity") else {
-        return changes;
-    };
-    let Some(after) = current.facets.get("identity") else {
-        return changes;
-    };
+    // The server's instructions are prose the model reads about how to use the
+    // server, so they carry the same weight a prompt or a tool description does, and
+    // they follow the same contract: content keeps the text, shape collapses
+    // whitespace so a reflow can be told from a rewrite.
+    //
+    // They are claimed here rather than left to the engine's sweep, which would
+    // report a reflow as an unclassified facet change and call it MEDIUM. An
+    // instructions facet that appears or disappears is still handled generically —
+    // added is MEDIUM, removed is HIGH — because there is no text pair to compare.
+    if let Some(change) = text_facet(
+        "instructions",
+        baseline.facets.get("instructions"),
+        current.facets.get("instructions"),
+        || risk::mcp(McpFact::InstructionsFormattingOnly),
+        || risk::mcp(McpFact::InstructionsChanged),
+    ) {
+        changes.push(change);
+    }
+
+    if let Some(change) = identity_change(baseline, current) {
+        changes.push(change);
+    }
+
+    changes
+}
+
+/// The server identity facet, key by key.
+fn identity_change(baseline: &LockedDependency, current: &LockedDependency) -> Option<FacetChange> {
+    let before = baseline.facets.get("identity")?;
+    let after = current.facets.get("identity")?;
     if before.digest == after.digest {
-        return changes;
+        return None;
     }
 
     let (Some(before_payload), Some(after_payload)) = (
         before.normalized.as_ref().and_then(Value::as_object),
         after.normalized.as_ref().and_then(Value::as_object),
     ) else {
-        changes.push(FacetChange::new(
+        return Some(FacetChange::new(
             "identity",
             ChangeKind::Modified,
             risk::mcp(McpFact::IdentityOtherChanged),
         ));
-        return changes;
     };
 
     let mut details = Vec::new();
@@ -470,18 +493,47 @@ fn mcp_server(baseline: &LockedDependency, current: &LockedDependency) -> Vec<Fa
     }
 
     if details.is_empty() {
-        changes.push(FacetChange::new(
+        return Some(FacetChange::new(
             "identity",
             ChangeKind::Modified,
             risk::mcp(McpFact::IdentityOtherChanged),
         ));
-        return changes;
     }
 
-    changes.push(
-        FacetChange::new("identity", ChangeKind::Modified, max_risk(risks)).with_details(details),
-    );
-    changes
+    Some(FacetChange::new("identity", ChangeKind::Modified, max_risk(risks)).with_details(details))
+}
+
+/// Whether a dependency declares itself a write-capable, destructive tool.
+///
+/// Reads the effective capability tokens MCP discovery recorded. Both are required:
+/// a read-only tool never carries `destructive`, and a write-capable tool that does
+/// not declare destructive behaviour is an ordinary new surface.
+///
+/// Fails safe in the direction that matters. A missing facet, a payload that is not
+/// an array of strings, or tokens this build does not recognize all answer `false`,
+/// which leaves the ordinary added-tool risk in place rather than inventing an
+/// escalation. Nothing here reads a tool name or a description: danger is never
+/// inferred from prose.
+pub fn declares_destructive_capabilities(dependency: &LockedDependency) -> bool {
+    let Some(tokens) = dependency
+        .facets
+        .get("capabilities")
+        .and_then(|facet| facet.normalized.as_ref())
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+
+    let mut write = false;
+    let mut destructive = false;
+    for token in tokens {
+        match token.as_str() {
+            Some("write") => write = true,
+            Some("destructive") => destructive = true,
+            _ => {}
+        }
+    }
+    write && destructive
 }
 
 // ------------------------------------------------------------------ helpers
@@ -1519,6 +1571,52 @@ mod tests {
         let changes = tool(&malformed, &empty);
         assert_eq!(changes[0].risk, RiskLevel::High);
         assert!(changes[0].is_change());
+    }
+
+    fn tool_with_capabilities(tokens: Value) -> LockedDependency {
+        tool_with(vec![("capabilities", facet("cap", None, Some(tokens)))])
+    }
+
+    #[test]
+    fn only_a_declared_write_destructive_tool_escalates() {
+        // Both tokens are required — a read-only tool never carries `destructive`,
+        // and a write-capable tool that does not declare destructive behaviour is an
+        // ordinary new surface. Everything undecodable answers `false`, which leaves
+        // the added-tool risk alone instead of inventing an escalation.
+        let expected = [
+            (serde_json::json!(["open-world", "read-only"]), false),
+            (
+                serde_json::json!(["non-destructive", "non-idempotent", "open-world", "write"]),
+                false,
+            ),
+            (
+                serde_json::json!(["destructive", "non-idempotent", "open-world", "write"]),
+                true,
+            ),
+            (
+                serde_json::json!(["closed-world", "destructive", "write"]),
+                true,
+            ),
+            (serde_json::json!(["write"]), false),
+            (serde_json::json!(["destructive"]), false),
+            (serde_json::json!([1, 2, 3]), false),
+            (
+                serde_json::json!({ "write": true, "destructive": true }),
+                false,
+            ),
+            (serde_json::json!("write destructive"), false),
+        ];
+
+        for (tokens, escalates) in expected {
+            assert_eq!(
+                declares_destructive_capabilities(&tool_with_capabilities(tokens.clone())),
+                escalates,
+                "{tokens}"
+            );
+        }
+
+        // No capabilities facet is not a claim in either direction.
+        assert!(!declares_destructive_capabilities(&tool_with(vec![])));
     }
 
     #[test]

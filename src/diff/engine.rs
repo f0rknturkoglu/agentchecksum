@@ -34,12 +34,23 @@ pub fn diff(baseline: &Lockfile, current: &Lockfile) -> DiffReport {
 
     for id in ids {
         match (baseline.dependencies.get(id), current.dependencies.get(id)) {
-            (None, Some(added)) => changes.push(whole_change(
-                id,
-                added.kind,
-                ChangeKind::Added,
-                risk::added(added.kind),
-            )),
+            (None, Some(added)) => {
+                // A new dependency is HIGH because it is new surface. One class is
+                // worse than new surface: a tool whose own declaration names it
+                // write-capable *and* destructive. This is the one place a
+                // whole-dependency rule reads the dependency's own facets, and it
+                // earns the special case — a diff can discover nothing more alarming
+                // on its own. Anything it cannot decode stays at the ordinary
+                // added-tool risk.
+                let risk = if added.kind == DependencyKind::Tool
+                    && analyze::declares_destructive_capabilities(added)
+                {
+                    risk::tool(risk::ToolFact::DestructiveToolAdded)
+                } else {
+                    risk::added(added.kind)
+                };
+                changes.push(whole_change(id, added.kind, ChangeKind::Added, risk));
+            }
             (Some(removed), None) => changes.push(whole_change(
                 id,
                 removed.kind,
@@ -609,6 +620,99 @@ mod tests {
         // The aggregates still differ: the fingerprint layer is not being told
         // anything untrue, only that its movement meant nothing semantic.
         assert_ne!(report.baseline_checksum, report.current_checksum);
+    }
+
+    fn tool_dependency_with_capabilities(id: &str, tokens: serde_json::Value) -> Dependency {
+        Dependency {
+            id: id.to_string(),
+            kind: DependencyKind::Tool,
+            facets: recorded_facets(vec![("capabilities", tokens)]),
+            source: Some("s".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_newly_added_tool_is_high_until_its_own_declaration_says_otherwise() {
+        let baseline = lockfile(vec![dependency(
+            DependencyKind::Prompt,
+            "prompt:a.md",
+            &[("content", "a")],
+        )]);
+
+        // An ordinary new tool: new surface, HIGH.
+        let read_only = lockfile(vec![
+            dependency(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]),
+            tool_dependency_with_capabilities(
+                "tool:s.read",
+                serde_json::json!(["open-world", "read-only"]),
+            ),
+        ]);
+        let report = diff(&baseline, &read_only);
+        assert_eq!(report.changes[0].risk, RiskLevel::High);
+        assert_eq!(report.changes[0].change, ChangeKind::Added);
+
+        // A write-capable tool that does not declare destructive behaviour is still
+        // only new surface.
+        let additive = lockfile(vec![
+            dependency(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]),
+            tool_dependency_with_capabilities(
+                "tool:s.write",
+                serde_json::json!(["non-destructive", "non-idempotent", "open-world", "write"]),
+            ),
+        ]);
+        assert_eq!(diff(&baseline, &additive).changes[0].risk, RiskLevel::High);
+
+        // The strict case: the declaration itself says write and destructive.
+        let destructive = lockfile(vec![
+            dependency(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]),
+            tool_dependency_with_capabilities(
+                "tool:s.destroy",
+                serde_json::json!(["destructive", "non-idempotent", "open-world", "write"]),
+            ),
+        ]);
+        let report = diff(&baseline, &destructive);
+        assert_eq!(report.changes[0].risk, RiskLevel::Critical);
+        assert_eq!(report.overall_risk, RiskLevel::Critical);
+        // Declared, not proven: the report says what the server said, nothing more.
+        assert_eq!(report.changes[0].change, ChangeKind::Added);
+    }
+
+    #[test]
+    fn an_added_tool_without_decodable_capabilities_stays_high() {
+        // Fail safe: a malformed payload must never downgrade, and it must never
+        // escalate either.
+        let baseline = lockfile(vec![dependency(
+            DependencyKind::Prompt,
+            "prompt:a.md",
+            &[("content", "a")],
+        )]);
+
+        for tokens in [
+            serde_json::json!("write destructive"),
+            serde_json::json!({ "write": true }),
+            serde_json::json!([]),
+        ] {
+            let current = lockfile(vec![
+                dependency(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]),
+                tool_dependency_with_capabilities("tool:s.x", tokens.clone()),
+            ]);
+            assert_eq!(
+                diff(&baseline, &current).changes[0].risk,
+                RiskLevel::High,
+                "{tokens}"
+            );
+        }
+
+        // And a tool with no capabilities facet at all.
+        let bare = lockfile(vec![
+            dependency(DependencyKind::Prompt, "prompt:a.md", &[("content", "a")]),
+            dependency(
+                DependencyKind::Tool,
+                "tool:s.plain",
+                &[("description", "d")],
+            ),
+        ]);
+        assert_eq!(diff(&baseline, &bare).changes[0].risk, RiskLevel::High);
     }
 
     #[test]

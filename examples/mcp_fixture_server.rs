@@ -11,15 +11,18 @@
 //! AC_FIXTURE_SPEC=/path/spec.json target/debug/examples/mcp_fixture_server [--stdio|--http]
 //! AC_FIXTURE_PORT_FILE=/path/port   # --http: the ephemeral port, written once listening
 //! AC_FIXTURE_PID_FILE=/path/pid     # this process's pid, written once running
+//! AC_FIXTURE_ATTEMPT_FILE=/path/log # one line appended per start, so a test can
+//!                                   # count how many times the client started this server
 //! ```
 //!
 //! `--stdio` (the default) serves MCP on stdin/stdout through the SDK's server
 //! implementation. `--http` serves the stateless Streamable HTTP protocol on
 //! `127.0.0.1` with an ephemeral port; that path is written on raw sockets rather
 //! than through a web framework so the fixture has no dependency the binary does
-//! not already have.
+//! not already have. Both transports honor the spec's `discover` mode, so a test can
+//! state a slow or a refusing `server/discover` either way.
 //!
-//! Nothing here reads the environment it is started with beyond the three variables
+//! Nothing here reads the environment it is started with beyond the four variables
 //! above: a configured credential is handed to this process by the client and is
 //! never looked at, echoed, or logged.
 
@@ -30,10 +33,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::model::{
-    DiscoverResult, Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    DiscoverResult, ErrorCode, Implementation, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData, ServerHandler};
 use serde::Deserialize;
@@ -64,9 +67,29 @@ struct Spec {
     /// diagnostics.
     #[serde(default)]
     stderr_secret: String,
+    /// The guidance the server gives the client.
+    #[serde(default)]
+    instructions: Option<String>,
+    /// How `server/discover` is answered. `ok` is a modern server; `refused` is the
+    /// explicit legacy signal (a correlated JSON-RPC error for a method this server
+    /// does not implement); `delayed` answers correctly, late.
+    #[serde(default)]
+    discover: DiscoverMode,
+    /// Delay before answering `server/discover`, to exercise a client-side timeout.
+    #[serde(default)]
+    discover_delay_ms: u64,
     /// The declared catalog. Duplicate names are expressible on purpose.
     #[serde(default)]
     tools: Vec<ToolSpec>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DiscoverMode {
+    #[default]
+    Ok,
+    Refused,
+    Delayed,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +128,10 @@ struct ToolSpec {
     output_schema: Option<Map<String, Value>>,
     #[serde(default)]
     annotations: Option<ToolAnnotations>,
+    /// Opaque extension metadata, quoted as-is onto the wire. The client must never
+    /// keep its value.
+    #[serde(default)]
+    meta: Option<Value>,
 }
 
 fn empty_schema() -> Map<String, Value> {
@@ -158,13 +185,20 @@ impl Spec {
 
     /// What the session protocol's `initialize` answers with.
     fn server_config(&self) -> ServerConfig {
-        ServerConfig::new(Self::capabilities()).with_server_info(self.implementation())
+        let config =
+            ServerConfig::new(Self::capabilities()).with_server_info(self.implementation());
+        match &self.instructions {
+            Some(instructions) => config.with_instructions(instructions.clone()),
+            None => config,
+        }
     }
 
     /// What the stateless protocol's `server/discover` answers with.
     fn discover_result(&self) -> DiscoverResult {
-        DiscoverResult::new(self.versions(), Self::capabilities())
-            .with_server_info(self.implementation())
+        let mut result = DiscoverResult::new(self.versions(), Self::capabilities())
+            .with_server_info(self.implementation());
+        result.instructions = self.instructions.clone();
+        result
     }
 
     /// The declared delay, applied where the catalog is read.
@@ -212,6 +246,9 @@ impl Spec {
         if let Some(annotations) = &tool.annotations {
             declared = declared.with_annotations(annotations.clone());
         }
+        if let Some(meta) = &tool.meta {
+            declared.meta = meta.as_object().cloned().map(rmcp::model::MetaObject);
+        }
         declared
     }
 }
@@ -231,6 +268,36 @@ impl ServerHandler for Fixture {
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Owned(self.spec.versions())
+    }
+
+    /// `server/discover`, with the spec's mode applied.
+    ///
+    /// The SDK's own server answers this from `supported_protocol_versions` and
+    /// `get_info`, so overriding it is the only way a stdio fixture can be slow, and
+    /// a slow `server/discover` is the case the client's lifecycle policy exists for.
+    /// The delay is asynchronous rather than a blocked runtime thread: the point of
+    /// the mode is a server that is slow to *answer*, not one that is wedged.
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<DiscoverResult, ErrorData>> + MaybeSendFuture + '_ {
+        let spec = Arc::clone(&self.spec);
+        async move {
+            // A server that does not implement `server/discover` answers a correlated
+            // JSON-RPC error, exactly as the raw-socket path does. Nothing else about
+            // this server is legacy.
+            if spec.discover == DiscoverMode::Refused {
+                return Err(ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    "Method not found",
+                    None,
+                ));
+            }
+            if spec.discover == DiscoverMode::Delayed && spec.discover_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(spec.discover_delay_ms)).await;
+            }
+            Ok(spec.discover_result())
+        }
     }
 
     async fn list_tools(
@@ -417,6 +484,24 @@ fn dispatch(spec: &Spec, message: &Value) -> Option<Value> {
 /// server does not implement is refused by name, listed against the ones it does.
 fn discover_reply(spec: &Spec, message: &Value, id: Option<Value>) -> Option<Value> {
     let id = id?;
+
+    // A server that does not implement `server/discover` answers a correlated
+    // JSON-RPC error, which is the one thing that legitimately means "I am a legacy
+    // server": the client is entitled to fall back on it and on nothing else.
+    if spec.discover == DiscoverMode::Refused {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": "Method not found" }
+        }));
+    }
+
+    // The same server, answering correctly but late. A client that treats a timeout
+    // as evidence of legacy protocol would negotiate a session here.
+    if spec.discover == DiscoverMode::Delayed && spec.discover_delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(spec.discover_delay_ms));
+    }
+
     let requested = message
         .get("params")
         .and_then(|params| params.get("_meta"))
@@ -473,6 +558,27 @@ fn http_response(status: u16, body: Vec<u8>) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 
+/// One line per start, in the file `AC_FIXTURE_ATTEMPT_FILE` names.
+///
+/// Appended rather than overwritten, because the point is to count: a client that
+/// answers a failed handshake by launching this server a second time leaves two
+/// lines, and that is the only evidence of it a test can see from the outside.
+fn record_attempt() {
+    let Ok(path) = std::env::var("AC_FIXTURE_ATTEMPT_FILE") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        // A test that asked for the log and cannot have it fails on the count it
+        // reads back, which is better than a fixture that exits for a log file.
+        return;
+    };
+    let _ = writeln!(file, "start");
+}
+
 fn main() {
     let spec = Arc::new(Spec::load());
 
@@ -482,6 +588,9 @@ fn main() {
     if let Ok(path) = std::env::var("AC_FIXTURE_PID_FILE") {
         let _ = std::fs::write(path, std::process::id().to_string());
     }
+    // Before anything is served, and before the port file: a test that sees the port
+    // is looking at a process whose start has already been recorded.
+    record_attempt();
 
     let http = std::env::args().nth(1).as_deref() == Some("--http");
     if http {

@@ -15,11 +15,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use rmcp::model::{
-    ClientCapabilities, ClientConfig, Implementation, MetaObject, PaginatedRequestParams,
-    ProtocolVersion, RequestMetaObject,
+    ClientCapabilities, ClientConfig, ErrorCode, Implementation, MetaObject,
+    PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
 };
 use rmcp::service::{
-    ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, RoleClient, RunningService,
+    ClientCacheConfig, ClientInitializeError, ClientLifecycleMode, ClientServiceExt, RoleClient,
+    RunningService,
 };
 use rmcp::transport::{
     ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
@@ -43,19 +44,53 @@ fn preferred_versions() -> Vec<ProtocolVersion> {
     vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25]
 }
 
-/// How the session is established.
+/// The stateless handshake, and nothing else.
 ///
-/// `Auto` is the SDK's compatibility path: it probes with the stateless handshake
-/// and falls back to the session protocol only when the server answers with a
-/// correlated JSON-RPC error — a legacy server saying "I do not know that method".
-/// A transport failure, a TLS problem, an authorization rejection, or a malformed
-/// response is *not* a fallback: it propagates, because retrying those as legacy
-/// would turn an outage into a fingerprint of something else.
-fn lifecycle() -> ClientLifecycleMode {
-    ClientLifecycleMode::Auto {
+/// `Discover` is deliberately used instead of the SDK's `Auto`, which also falls
+/// back to the session lifecycle when the modern probe does not answer *in time*.
+/// That would let transient latency decide the protocol era — and therefore the
+/// fingerprint: a server under load would be recorded as a legacy server, and the
+/// same declarations would produce a different dependency identity run to run. In
+/// this mode the SDK never falls back on its own, so the fallback below happens only
+/// where the peer explicitly said it is legacy.
+fn discover_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Discover {
         preferred_versions: preferred_versions(),
-        legacy_version: Some(ProtocolVersion::V_2025_11_25),
     }
+}
+
+/// The session handshake, for a peer that told us it is legacy.
+fn legacy_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Initialize
+}
+
+/// Whether a failed modern probe is evidence that the peer is a legacy server.
+///
+/// The one signal that means this is a *correlated JSON-RPC error that is not a
+/// modern-era rejection*: the server understood the request and answered that it
+/// does not implement the method. That classification lives in the SDK's private
+/// `DiscoverOutcome`, so the same two-line test is repeated here against the public
+/// error-code constants.
+///
+/// Everything else is a failure, and none of it is evidence about the peer's age:
+/// a timeout (the server was slow), a transport or TLS error (it was unreachable), a
+/// TLS or authorization rejection, an uncorrelated or malformed response, and the
+/// modern rejections `-32021` (a capability the client must have) and `-32020`
+/// (header mismatch) — in fact the last two explicitly say the peer *is* modern.
+///
+/// One transport fact rather than a policy choice: over Streamable HTTP the SDK's own
+/// client transport synthesises a correlated error of this shape when a sessionless
+/// `server/discover` is answered with a 4xx other than 401/403, which is its way of
+/// saying the endpoint serves the session protocol. The fallback therefore fires
+/// there too — and it still has to succeed to fingerprint anything.
+fn is_legacy_signal(error: &ClientInitializeError) -> bool {
+    let ClientInitializeError::JsonRpcError(data) = error else {
+        return false;
+    };
+    !matches!(
+        data.code,
+        ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY | ErrorCode::HEADER_MISMATCH
+    )
 }
 
 /// The client identity we declare.
@@ -64,14 +99,14 @@ fn lifecycle() -> ClientLifecycleMode {
 /// directory, no random value. A server that groups or rate-limits clients by
 /// identity must see the same client on every run, and a fingerprint must not
 /// depend on which machine produced it.
-fn client_config() -> ClientConfig {
+fn client_config(protocol_version: ProtocolVersion) -> ClientConfig {
     let mut config = ClientConfig::default();
     config.client_info = Implementation::new("agentchecksum", env!("CARGO_PKG_VERSION"));
     // The smallest set that is true. Discovery reads; it does not sample, does not
     // offer roots, and does not render UI, so it must not claim it can — a server is
     // entitled to change what it exposes based on what a client says it supports.
     config.capabilities = ClientCapabilities::default();
-    config.protocol_version = ProtocolVersion::V_2026_07_28;
+    config.protocol_version = protocol_version;
     config
 }
 
@@ -81,13 +116,92 @@ pub async fn discover(server: &McpServerConfig) -> Result<DiscoveredServer> {
 
     match server.transport {
         Transport::Stdio => {
-            let transport = stdio_transport(server, &secrets)?;
-            discover_over(server, "stdio", transport, &secrets).await
+            discover_over(
+                server,
+                "stdio",
+                || stdio_transport(server, &secrets),
+                &secrets,
+            )
+            .await
         }
         Transport::StreamableHttp => {
-            let transport = http_transport(server, &secrets)?;
-            discover_over(server, "streamable-http", transport, &secrets).await
+            discover_over(
+                server,
+                "streamable-http",
+                || http_transport(server, &secrets),
+                &secrets,
+            )
+            .await
         }
+    }
+}
+
+/// Establish a session, with a fallback that only the peer can trigger.
+///
+/// The transport is built per attempt because the first attempt consumes it: a
+/// legacy fallback therefore opens a second connection or spawns a second child.
+/// That cost is paid only on the path a server explicitly asked for, and it buys the
+/// rule this function exists to enforce — nothing about timing, reachability, or
+/// authorization can move a dependency from one protocol era to another.
+async fn connect<T, E, A>(
+    server: &McpServerConfig,
+    transport: &'static str,
+    open: impl Fn() -> Result<T>,
+    secrets: &Secrets,
+) -> Result<RunningService<RoleClient, ClientConfig>>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: StdError + Send + Sync + 'static,
+{
+    let alias = server.name.as_str();
+
+    let modern = client_config(ProtocolVersion::V_2026_07_28)
+        .serve_with_lifecycle(open()?, discover_lifecycle());
+    match tokio::time::timeout(limits::CONNECT_TIMEOUT, modern).await {
+        Ok(Ok(client)) => return Ok(client),
+        Ok(Err(error)) if is_legacy_signal(&error) => {
+            tracing::debug!(
+                server = alias,
+                "the peer answered the stateless handshake as a legacy server; retrying \
+                 with the session lifecycle"
+            );
+        }
+        Ok(Err(error)) => {
+            return Err(secrets.failed(
+                alias,
+                transport,
+                "connecting and negotiating",
+                &describe(&error),
+            ));
+        }
+        Err(_) => {
+            return Err(secrets.timeout(
+                alias,
+                transport,
+                "connecting and negotiating",
+                limits::CONNECT_TIMEOUT,
+            ));
+        }
+    }
+
+    // Only reachable from the branch above: the peer gave the correlated error that
+    // means "I do not implement that method".
+    let legacy = client_config(ProtocolVersion::V_2025_11_25)
+        .serve_with_lifecycle(open()?, legacy_lifecycle());
+    match tokio::time::timeout(limits::CONNECT_TIMEOUT, legacy).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(error)) => Err(secrets.failed(
+            alias,
+            transport,
+            "connecting with the legacy lifecycle",
+            &describe(&error),
+        )),
+        Err(_) => Err(secrets.timeout(
+            alias,
+            transport,
+            "connecting with the legacy lifecycle",
+            limits::CONNECT_TIMEOUT,
+        )),
     }
 }
 
@@ -95,7 +209,7 @@ pub async fn discover(server: &McpServerConfig) -> Result<DiscoveredServer> {
 async fn discover_over<T, E, A>(
     server: &McpServerConfig,
     transport: &'static str,
-    transport_impl: T,
+    open: impl Fn() -> Result<T>,
     secrets: &Secrets,
 ) -> Result<DiscoveredServer>
 where
@@ -104,25 +218,7 @@ where
 {
     let alias = server.name.as_str();
 
-    let connecting = client_config().serve_with_lifecycle(transport_impl, lifecycle());
-    let mut client = tokio::time::timeout(limits::CONNECT_TIMEOUT, connecting)
-        .await
-        .map_err(|_| {
-            secrets.timeout(
-                alias,
-                transport,
-                "connecting and negotiating",
-                limits::CONNECT_TIMEOUT,
-            )
-        })?
-        .map_err(|error| {
-            secrets.failed(
-                alias,
-                transport,
-                "connecting and negotiating",
-                &describe(&error),
-            )
-        })?;
+    let mut client = connect(server, transport, open, secrets).await?;
 
     let introspected = match tokio::time::timeout(
         limits::SERVER_BUDGET,
@@ -162,14 +258,6 @@ async fn introspect(
     transport: &'static str,
     secrets: &Secrets,
 ) -> Result<DiscoveredServer> {
-    // A snapshot must describe *now*. The SDK caches `tools/list` per session and,
-    // by default, serves a stale entry when a refresh fails — which would let an
-    // outage produce a confident fingerprint of the previous contract. One-shot
-    // discovery has nothing to gain from a cache and the wrong answer to lose.
-    client
-        .set_response_cache_config(ClientCacheConfig::disabled())
-        .await;
-
     let peer = client.peer_info().ok_or_else(|| {
         secrets.failed(
             alias,
@@ -179,11 +267,38 @@ async fn introspect(
         )
     })?;
 
-    // Optional in the protocol, so its absence is recorded rather than fatal: a
-    // valid server that does not expose discovery metadata still has a tool
-    // contract worth fingerprinting.
+    // Optional in the protocol, so its absence is recorded rather than fatal: a valid
+    // server that does not expose discovery metadata still has a tool contract worth
+    // fingerprinting.
+    //
+    // This costs one extra request per server, deliberately. The startup probe keeps
+    // its result to itself — `peer_info()` exposes the negotiated version,
+    // capabilities, and server info, but not `supported_versions` — and it does not
+    // seed the response cache either, so asking is the only way to learn what the
+    // server says it supports. That answer is part of the contract this layer records
+    // and it is inside the same bounded budget.
     let (supported_versions, mut warnings) =
         supported_versions(client, alias, transport, secrets).await;
+
+    // A snapshot must describe *now*, so response caching is off for everything that
+    // follows. The SDK's default is to serve a stale list entry when a refresh fails,
+    // which would let an outage produce a confident fingerprint of the previous
+    // contract; one-shot discovery has nothing to gain from a cache and the wrong
+    // answer to lose.
+    client
+        .set_response_cache_config(ClientCacheConfig::disabled())
+        .await;
+
+    let instructions =
+        normalize::instructions(peer.instructions.as_deref()).map_err(|rejected| {
+            as_diagnostic(
+                alias,
+                transport,
+                "reading the server identity",
+                &rejected,
+                secrets,
+            )
+        })?;
 
     let (identity, identity_warnings) = normalize::identity(
         &peer.protocol_version,
@@ -219,9 +334,22 @@ async fn introspect(
         ));
     }
 
+    // One line for the category, like the encoded-name warning: a server with fifty
+    // tools carrying `_meta` must not produce fifty lines, and the values themselves
+    // are never read, so there is nothing per-tool to say.
+    let opaque = tools.iter().filter(|tool| tool.opaque_metadata).count();
+    if opaque > 0 {
+        warnings.push(format!(
+            "{opaque} tool{} declared opaque MCP metadata; metadata values are intentionally not \
+             fingerprinted",
+            if opaque == 1 { "" } else { "s" }
+        ));
+    }
+
     Ok(DiscoveredServer {
         alias: alias.to_string(),
         identity,
+        instructions,
         tools,
         warnings,
     })
@@ -516,4 +644,76 @@ fn as_diagnostic(
         stage,
         &format!("{}: {}", rejected.subject, rejected.reason),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::ErrorData;
+
+    fn json_rpc(code: i32) -> ClientInitializeError {
+        ClientInitializeError::JsonRpcError(ErrorData::new(
+            ErrorCode(code),
+            "fixture".to_string(),
+            None,
+        ))
+    }
+
+    /// The decision that keeps timing out of the fingerprint.
+    ///
+    /// Only a *correlated JSON-RPC error that is not a modern-era rejection* means
+    /// the peer is legacy. Everything else is a failure, and treating any of it as
+    /// legacy would let latency, an outage, or an authorization problem move a
+    /// dependency from one protocol era to another.
+    #[test]
+    fn only_an_explicit_legacy_answer_may_trigger_the_fallback() {
+        // "I do not implement that method" — the signal, and the only one.
+        assert!(is_legacy_signal(&json_rpc(-32601)));
+        assert!(is_legacy_signal(&json_rpc(-32600)));
+
+        // The two codes the protocol reserves for a *modern* peer refusing a request.
+        assert!(!is_legacy_signal(&json_rpc(
+            ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY.0
+        )));
+        assert!(!is_legacy_signal(&json_rpc(ErrorCode::HEADER_MISMATCH.0)));
+
+        // Everything that is not the peer answering a method question at all.
+        assert!(!is_legacy_signal(&ClientInitializeError::ConnectionClosed(
+            "closed".to_string()
+        )));
+        assert!(!is_legacy_signal(
+            &ClientInitializeError::ExpectedInitResult(None)
+        ));
+        assert!(!is_legacy_signal(
+            &ClientInitializeError::UncorrelatedErrorResponse {
+                expected: rmcp::model::RequestId::Number(1),
+                received: rmcp::model::NumberOrString::Number(2),
+            }
+        ));
+    }
+
+    /// The two preferred revisions are named, never taken from the SDK's `LATEST`.
+    #[test]
+    fn the_stateless_revision_is_asked_for_by_name() {
+        let preferred = preferred_versions();
+        assert_eq!(
+            preferred.first().map(ProtocolVersion::as_str),
+            Some("2026-07-28")
+        );
+        assert_ne!(
+            preferred.first().map(ProtocolVersion::as_str),
+            Some(ProtocolVersion::LATEST.as_str()),
+            "the SDK's LATEST is still the previous revision, which would negotiate a session"
+        );
+
+        // And the two steps are distinct: the first never falls back on its own.
+        assert!(matches!(
+            discover_lifecycle(),
+            ClientLifecycleMode::Discover { .. }
+        ));
+        assert!(matches!(
+            legacy_lifecycle(),
+            ClientLifecycleMode::Initialize
+        ));
+    }
 }

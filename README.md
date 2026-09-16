@@ -147,7 +147,18 @@ configured argument vector — never through a shell) and **`streamable-http`** 
 credentials, query strings, and fragments in the URL are rejected rather than stripped, and redirects
 are not followed).
 
-Each server becomes a dependency `mcp:<alias>` carrying its identity, and each declared tool becomes
+Session establishment is a two-step policy, and only the server can trigger the second step: AgentChecksum
+asks for the stateless protocol first, and falls back to the session handshake only when the server answers
+that it does not implement it. A slow server is a **failure**, never a legacy one — timing is not evidence
+about a protocol era, and letting it decide one would mean identical declarations fingerprinted differently
+from one run to the next.
+
+Each server becomes a dependency `mcp:<alias>` carrying its identity and, when the server declares them,
+its **instructions** — the prose it gives the model about how to use it. Instructions are fingerprinted the
+way a prompt or a tool description is, as a content digest plus a whitespace-collapsed shape digest, so a
+reflow reads as LOW and a rewrite as MEDIUM, and the lockfile keeps hashes rather than server prose.
+Changing only the instructions, with every tool untouched, is therefore still a dependency change. Each
+declared tool becomes
 `tool:<alias>.<name>` — the name is percent-encoded, so two distinct names can never produce one id —
 carrying its description, its input schema, its output schema when it declares one, and its annotation
 capabilities. The alias is a namespace, not a display name: renaming it is an identity change, and it is
@@ -160,8 +171,9 @@ ever invoked on your behalf, so a snapshot cannot exercise the side effects a to
 
 What is deliberately left out of the fingerprint is as settled as what goes in: transport and session
 plumbing (PIDs, ports, session ids, cache hints, timings), configured commands and environment variables,
-server stderr, cosmetic metadata (`title`, `icons`), opaque `_meta` and extension settings (only
-extension identifiers are recorded), and the server's prose `instructions`. The bounds on discovery —
+server stderr, cosmetic metadata (`title`, `icons`), and opaque `_meta` and extension *settings* (their
+presence and identifiers are reported — one aggregated warning per server — but never their values). The
+bounds on discovery —
 timeouts, page count, tool count, schema size and nesting depth — live in a single file, and exceeding one
 fails the run rather than truncating the inventory: a lockfile that describes a partial server is worse
 than no lockfile. Discovery is fail-closed. One server that cannot be fully discovered fails the command,
@@ -171,6 +183,12 @@ Tool annotations are recorded as declared: AgentChecksum folds in the protocol d
 effective tokens (`read-only`/`write`, `destructive`/`non-destructive`, `idempotent`/`non-idempotent`,
 `open-world`/`closed-world`). They are hints a server declares about itself, not guarantees — a server
 that says `read-only` may still write, and nothing in the output claims otherwise.
+
+Those tokens are also what makes one diff case stricter than the rest. A newly added tool is HIGH because
+it is new invocation surface; a newly added tool whose own declaration names it **write-capable and
+destructive** is CRITICAL — the worst thing a diff can discover on its own, and still only a *declared*
+one. The escalation needs both tokens, and a capability payload this build cannot decode leaves the
+ordinary added-tool risk in place rather than inflating or deflating it.
 
 Because no credential-derived value is fingerprinted, rotating a token that does not change what the
 server declares produces the same checksum. When credentials do change the declared contract — a

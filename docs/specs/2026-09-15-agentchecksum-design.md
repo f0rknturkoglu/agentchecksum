@@ -286,7 +286,7 @@ and neither is load-bearing beyond being deterministic.
       }
     },
     "mcp:github": {
-      "kind": "mcp_server",
+      "kind": "mcp",
       "facets": {
         "identity": {
           "digest": "sha256:…",
@@ -551,9 +551,12 @@ This is the table the code asserts, row by row, in `src/diff/risk.rs`.
 | Inference parameters changed · a model or server capability added · server implementation info changed | MEDIUM |
 | A facet whose digest changed and no analyzer could explain it | MEDIUM, or HIGH for a schema facet |
 | A model, tool, or server dependency added | HIGH |
+| A newly added tool whose own declaration names it write-capable **and** destructive | CRITICAL (declared, not proven — §9.5) |
 | Tool removed · a prompt dependency removed | HIGH |
 | Quantization changed · chat template changed · endpoint identity changed (openai-compatible) · a model gained or lost any other capability · an identity subfield changed that we cannot name | HIGH |
 | MCP protocol era or version changed · a server dependency removed | HIGH |
+| Server `instructions` rewritten | MEDIUM |
+| Server `instructions` reflowed (equal `shape` digest) | LOW |
 | Gaining a facet | MEDIUM, or HIGH for a schema facet |
 | Losing a facet | HIGH |
 | Model removed · provider, family, or parameter size changed · content digest changed (same id) | CRITICAL |
@@ -650,9 +653,11 @@ consumer reads structure, not sentences.
 }
 ```
 
-- `kind` uses the lockfile's vocabulary (`model`, `prompt`, `tool`, `mcp_server`). Note the id
-  prefix is **not** the same token: it follows `as_str()`, so an MCP server is `"kind": "mcp_server"`
-  with an id of `mcp:github`. Both are stable; neither is derived from the other at runtime.
+- `kind` uses the lockfile's vocabulary (`model`, `prompt`, `tool`, `mcp`), which is the same token
+  `as_str()` returns and the same one every id prefix uses: a server is `"kind": "mcp"` with an id of
+  `mcp:github`. One vocabulary across the lockfile, the JSON report, and human output.
+  `mcp_server` is still *accepted* when reading, because that is the spelling this enum produced
+  before the contract was pinned; nothing writes it.
 - `before`/`after` inside `details` appear only where the baseline recorded a normalized payload to
   read a value from. `before_digest`/`after_digest` are absent when the facet does not exist on that
   side.
@@ -687,16 +692,35 @@ accepts or rejects each request independently. Servers **MUST** implement `serve
 | **Stateless** | `2026-07-28` and later | Per-request `_meta`; no session; `server/discover` available | `stateless` |
 | **Legacy** | `2025-11-25` and earlier | `initialize` / `notifications/initialized` handshake | `legacy` |
 
-**How the session is established.** `serve_with_lifecycle(transport, ClientLifecycleMode::Auto { … })`,
-with `2026-07-28` preferred and `2025-11-25` as the legacy version. `Auto` is the SDK's compatibility
-path: it probes with `server/discover`, and falls back to the legacy handshake when the probe returns a
-*correlated* JSON-RPC error whose code is not a modern-era rejection — a legacy server saying it does
-not know the method — or when the server does not answer the probe at all. Version negotiation inside
-that probe is the SDK's own retry loop: an `UnsupportedProtocolVersionError` (code `-32022`, `data`
-carrying `supported` and `requested`) makes it re-ask with a mutually supported version, and a server
-whose list intersects ours in nothing fails the discovery. Everything else propagates — a transport
-failure, a TLS or authorization rejection, an uncorrelated or malformed response. Retrying those as
-legacy would turn an outage into a fingerprint of something else.
+**How the session is established.** Two explicit steps, and only the peer can trigger the second one.
+
+1. The stateless handshake: `ClientLifecycleMode::Discover` with `2026-07-28` preferred and `2025-11-25`
+   as the fallback preference. Version negotiation inside the probe is the SDK's own retry loop: an
+   `UnsupportedProtocolVersionError` (code `-32022`, `data` carrying `supported` and `requested`) makes it
+   re-ask with a mutually supported version, and a server whose list intersects ours in nothing fails the
+   discovery.
+2. The session handshake, `ClientLifecycleMode::Initialize`, at `2025-11-25` — reached **only** when step 1
+   failed with a *correlated* JSON-RPC error whose code is not a modern-era rejection. That is the one
+   signal that means "this peer does not implement that method", and it is the same classification the SDK
+   makes internally (its `DiscoverOutcome` and its version-sending `legacy_version` are not public, so the
+   test is re-derived from the public error codes). Because the transport is consumed by the first attempt
+   and is not returned on failure, the fallback opens a second connection or spawns a second child — a cost
+   paid only on the path a server explicitly asked for.
+
+The SDK's `ClientLifecycleMode::Auto` is deliberately **not** used. It also falls back when the probe
+simply does not answer within its internal ten-second cap, which would let transient latency choose the
+protocol era — and therefore the fingerprint: the same server, under load, would be recorded as legacy,
+and identical declarations would produce a different dependency identity from one run to the next.
+
+A **timeout is a failure**, never evidence of age. So are a transport or TLS error, an authorization
+rejection, an uncorrelated or malformed response, and the modern rejection codes `-32021` (a client
+capability the server requires) and `-32020` (header mismatch) — the last two say the peer *is* modern.
+Each is reported as `McpFailed` or `McpTimeout` with the stage that failed, and none of them can produce a
+legacy fingerprint. One consequence worth stating because it is a transport fact rather than a policy
+choice: on Streamable HTTP the SDK's own transport synthesises that correlated error when a sessionless
+`server/discover` is answered with a 4xx other than 401/403 — its way of saying the endpoint serves the
+session protocol. The fallback therefore fires there too, and it still has to *succeed* to fingerprint
+anything.
 
 The stateless revision is named explicitly rather than taken from the SDK's `LATEST`, which still points
 at `2025-11-25`: asking for `LATEST` would negotiate a session protocol against a server that supports
@@ -771,7 +795,7 @@ in the lockfile.
 
 | Dependency | Facets |
 |---|---|
-| `mcp:<alias>` | `identity` |
+| `mcp:<alias>` | `identity`, `instructions` (only when declared) |
 | `tool:<alias>.<name>` | `description`, `input_schema`, `output_schema` (only when declared), `capabilities` |
 
 **`identity`** (server) is a small object: `era`, the negotiated `protocol_version`, `supported_versions`
@@ -782,10 +806,17 @@ name with their declared flags (`list_changed`, `subscribe`), defaulting an abse
 undeclared flag and a declared `false` read the same; `logging` and `completions` are recorded as presence
 only.
 
-**`description`** records a digest over the normalized description text plus a `shape` digest over the
-whitespace-collapsed text, and no `normalized` payload. This is the contract a prompt's `content`/`shape`
-pair already uses, and for the same reason: a tool description is model input, so a reflow and a rewrite
-must be distinguishable and Phase 2 makes that call.
+**`instructions`** (server) is the guidance the server gives the model about how to use it, and it is a
+facet of its own rather than a field inside `identity`, because identity describes the implementation while
+instructions describe what the server asks of the agent. Folding them together would make a wording edit
+look like a change of identity. It exists only when the server declares it; a facet that appears or
+disappears is classified generically (added MEDIUM, removed HIGH), because there is no text pair to compare.
+
+**`description`** and **`instructions`** record a digest over the normalized text plus a `shape` digest over
+the whitespace-collapsed text, and no `normalized` payload. This is the contract a prompt's
+`content`/`shape` pair already uses, and for the same reason: both are model input, so a reflow and a
+rewrite must be distinguishable and Phase 2 makes that call. The lockfile therefore contains hashes, not
+server prose.
 
 **`input_schema`** and **`output_schema`** record the normalized schema as their payload, with the digest
 taken over exactly that value, so a stored payload can be re-hashed from the lockfile alone. `output_schema`
@@ -824,7 +855,8 @@ AgentChecksum reports that the hint says so and claims nothing further.
 |---|---|
 | Tool `title`, `icons` | Presentation. They cannot change how a tool behaves, so fingerprinting them would turn a cosmetic edit into a dependency change |
 | Tool `_meta`, and the *settings* of extension and experimental capabilities | Opaque, server-controlled data; copying it into a committed lockfile turns a capture of arbitrary values into a dependency fingerprint. Extension and experimental capabilities are reduced to their sorted identifiers, with one aggregated warning |
-| Server `instructions`, and implementation `title`, `description`, `websiteUrl` | Prose and presentation rather than declarations about the tool contract; only an implementation's `name` and `version` are recorded |
+| Implementation `title`, `description`, `websiteUrl` | Presentation. Only an implementation's `name` and `version` describe anything that can behave differently |
+| Tool `_meta` *values* | Opaque, server-controlled data; only their presence is reported, in one aggregated warning per server (§9.6) |
 | Configured `command`, `args`, `env` | Connection material, not contract. `env` is where a credential lives |
 | Transport and session plumbing | PIDs, ports, session ids, cache hints (`ttlMs`, `cacheScope`), and timings are machine- or run-specific; §6.2 excludes them already |
 | Server stderr | The server's own log, discarded and never read (§9.2) |

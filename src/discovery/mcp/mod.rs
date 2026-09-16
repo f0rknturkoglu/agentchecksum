@@ -101,6 +101,10 @@ pub struct DiscoveredTool {
     pub output_schema: Option<Value>,
     /// Effective annotation tokens, sorted; see `normalize::tool_capabilities`.
     pub capabilities: Vec<String>,
+    /// Whether the declaration carried opaque `_meta`. The value is never kept:
+    /// this exists only so discovery can say, once per server, that part of what the
+    /// server sent is deliberately outside the fingerprint.
+    pub opaque_metadata: bool,
 }
 
 /// A complete discovery result for one configured server.
@@ -108,6 +112,8 @@ pub struct DiscoveredTool {
 pub struct DiscoveredServer {
     pub alias: String,
     pub identity: Identity,
+    /// The server's own guidance for using it, when it gave any.
+    pub instructions: Option<String>,
     /// Sorted by name, so a server's response order cannot influence anything.
     pub tools: Vec<DiscoveredTool>,
     /// Deterministic, non-secret diagnostics gathered while discovering.
@@ -166,6 +172,15 @@ pub fn dependencies(server: &DiscoveredServer) -> Result<Vec<Dependency>> {
 fn server_dependency(server: &DiscoveredServer) -> Result<Dependency> {
     let mut facets = BTreeMap::new();
     facets.insert("identity".to_string(), identity_facet(&server.identity)?);
+
+    // Instructions are prose the model reads about how to use this server, so they
+    // are a dependency in their own right — a facet rather than a field inside
+    // identity, because the identity describes the server's implementation and this
+    // describes what it asks of the agent.
+    if let Some(instructions) = &server.instructions {
+        facets.insert("instructions".to_string(), text_facet(instructions));
+    }
+
     Ok(Dependency {
         id: server_id(&server.alias),
         kind: DependencyKind::McpServer,
@@ -176,21 +191,26 @@ fn server_dependency(server: &DiscoveredServer) -> Result<Dependency> {
     })
 }
 
+/// The text facet contract, shared by prompts, tool descriptions, and server
+/// instructions.
+///
+/// Content keeps the text a model would read, shape collapses whitespace so Phase 2
+/// can tell a reflow from a rewrite, and nothing is recorded as a payload: the
+/// lockfile carries hashes, not server prose.
+fn text_facet(raw: &str) -> Facet {
+    Facet {
+        digest: Digest::sha256(text::normalize_text(raw).as_bytes()),
+        shape: Some(Digest::sha256(text::shape_text(raw).as_bytes())),
+        normalized: None,
+    }
+}
+
 fn tool_dependency(alias: &str, tool: &DiscoveredTool) -> Result<Dependency> {
     let mut facets = BTreeMap::new();
 
-    // A description is model input, so it uses the same contract a prompt does:
-    // content keeps the text a model would read, shape collapses whitespace so
-    // Phase 2 can tell a reflow from a rewrite.
+    // A description is model input, so it uses the same contract a prompt does.
     if let Some(description) = &tool.description {
-        facets.insert(
-            "description".to_string(),
-            Facet {
-                digest: Digest::sha256(text::normalize_text(description).as_bytes()),
-                shape: Some(Digest::sha256(text::shape_text(description).as_bytes())),
-                normalized: None,
-            },
-        );
+        facets.insert("description".to_string(), text_facet(description));
     }
 
     facets.insert(
@@ -308,6 +328,7 @@ mod tests {
             }),
             output_schema: None,
             capabilities: vec![],
+            opaque_metadata: false,
         }
     }
 
@@ -324,6 +345,7 @@ mod tests {
                 }),
                 capabilities: Some(serde_json::json!({ "tools": { "list_changed": true } })),
             },
+            instructions: None,
             tools,
             warnings: vec![],
         }
@@ -361,6 +383,25 @@ mod tests {
         // does not store, exactly as a prompt's does.
         assert!(description.normalized.is_none());
         assert!(description.shape.is_some());
+    }
+
+    #[test]
+    fn a_reflowed_instruction_set_moves_content_but_not_shape() {
+        // The same contract a prompt and a tool description use, so Phase 2 can call
+        // a reflow LOW without asking a model.
+        let reflowed = |text: &str| {
+            let mut candidate = server("s", vec![]);
+            candidate.instructions = Some(text.to_string());
+            dependencies(&candidate).unwrap()[0].facets["instructions"].clone()
+        };
+
+        let original = reflowed("Prefer read-only tools.\nNever delete without asking.");
+        let rewrapped = reflowed("Prefer read-only tools.\n\n   Never delete without asking.");
+        let rewritten = reflowed("Prefer read-only tools.\nYou may delete when useful.");
+
+        assert_ne!(original.digest, rewrapped.digest);
+        assert_eq!(original.shape, rewrapped.shape);
+        assert_ne!(original.shape, rewritten.shape);
     }
 
     #[test]
@@ -513,6 +554,42 @@ mod tests {
             capabilities,
             serde_json::json!(["open-world", "write", "destructive"])
         );
+    }
+
+    #[test]
+    fn instructions_become_a_text_facet_and_absent_ones_produce_none() {
+        let mut with_instructions = server("s", vec![]);
+        with_instructions.instructions = Some("Prefer read-only tools.".to_string());
+
+        let built = dependencies(&with_instructions).unwrap();
+        let facet = &built[0].facets["instructions"];
+        assert!(
+            facet.normalized.is_none(),
+            "the lockfile carries hashes, not server prose"
+        );
+        assert!(facet.shape.is_some());
+
+        let without = dependencies(&server("s", vec![])).unwrap();
+        assert!(!without[0].facets.contains_key("instructions"));
+    }
+
+    #[test]
+    fn instructions_are_a_facet_of_their_own_not_part_of_the_identity() {
+        // Identity describes the implementation; instructions describe what the
+        // server asks of the agent. Folding them together would make a wording edit
+        // look like the server changed identity.
+        let mut with_instructions = server("s", vec![]);
+        with_instructions.instructions = Some("Prefer read-only tools.".to_string());
+        let with = dependencies(&with_instructions).unwrap();
+        let without = dependencies(&server("s", vec![])).unwrap();
+
+        assert_eq!(
+            with[0].facets["identity"], without[0].facets["identity"],
+            "the identity does not see instructions"
+        );
+        assert!(with[0].facets.contains_key("instructions"));
+        // And the checksum does see them.
+        assert_ne!(with[0].facets, without[0].facets, "but the dependency does");
     }
 
     #[test]
