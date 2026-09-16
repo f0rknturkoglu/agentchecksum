@@ -9,13 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet. The next entry lands when work starts on the version after `0.1.0`.
 
-## [0.1.0] — not yet released
+## [0.1.0] — 2026-09-16
 
-Version `0.1.0` is the version in `Cargo.toml`, but it has **not been released**: the repository is
-not tagged, no GitHub Release exists, and the crate is not published on crates.io. There is no date
-here on purpose — a date would claim a release that has not happened. Until the first tag, the
-supported ways to install it are a build from a clone or `cargo install --git`; see
-[getting-started.md](docs/getting-started.md#install).
+Released 2026-09-16, tagged [`v0.1.0`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0).
+Prebuilt archives for four targets are attached to that release, with a `SHA256SUMS` manifest beside
+them; [getting-started.md](docs/getting-started.md#install) lists the installation methods and what
+each one requires.
 
 This is the first version of the design described in
 [the design specification](docs/specs/2026-09-15-agentchecksum-design.md), implemented as one Rust
@@ -86,6 +85,13 @@ reported parameters, read from the native API) and `openai-compatible` (any Open
 `/v1/chat/completions` endpoint). The second exposes no content digest, so the endpoint becomes part
 of the model identity and the CLI warns about it rather than implying a guarantee it cannot make.
 
+**Distribution** — a composite GitHub Action that runs one AgentChecksum command and lets the CLI's
+exit code decide the step, and a release workflow that builds one binary per target on a native
+runner, smoke-tests the archive it produced, and attaches reproducibly-built archives and a
+`SHA256SUMS` manifest to the GitHub Release. The action verifies a downloaded release against that
+manifest before running it: an archive that cannot be authenticated is refused with exit `3` rather
+than executed, and the source build it falls back to is only for platforms with no release asset.
+
 **Diagnosability** — `inspect probes` prints the parsed probe suite: what is configured, which tools
 each probe references, and the metrics each probe feeds. `--format json` writes one JSON document to
 stdout and nothing else for every command, and diagnostics go to stderr through `tracing`.
@@ -113,5 +119,4 @@ describes belong to a later phase. Prebuilt release binaries, a published crate 
 action's download path all begin at the first tagged release.
 
 [Unreleased]: https://github.com/f0rknturkoglu/agentchecksum/commits/main
-
-There is no `v0.1.0` tag to link to: that is the point of "not yet released" above.
+[0.1.0]: https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0
