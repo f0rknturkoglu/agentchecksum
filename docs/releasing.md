@@ -198,3 +198,23 @@ fixed owner, no gzip timestamp — so rebuilding the same binary produces the sa
 `SHA256SUMS` means something across a rebuild. A rebuild that produces different bytes is
 therefore a real difference (a different compiler, a different binary, a different input),
 not noise.
+## After v0.1.0 is out
+
+Deliberately not done before the first release, and worth doing only once there is
+something to point at:
+
+- **The moving Action tag.** `uses: f0rknturkoglu/agentchecksum@v0.1` should track the
+  `v0.1.x` line, so a consumer gets fixes without editing their workflow. Move it on every
+  `v0.1.*` tag, never on a major one. Until then `@main` works, and the action falls back to
+  a source build when the tag it was asked for has no release yet.
+- **A crates.io publication.** The crate packages and installs cleanly today
+  (`cargo install --path` from the packaged directory was verified against a temporary
+  root), so publishing is a `cargo publish --locked` and a documented install line away. It
+  is a separate, deliberate step from the release workflow, which never publishes.
+- **Package-manager distribution — Homebrew, Scoop, WinGet, Nix.** Each needs a repository
+  or a submission to an index that does not exist yet, so none of them is claimed. The
+  archives are shaped for them already: a stable name, one directory holding the binary and
+  the licenses, and a checksum manifest that lists every asset.
+
+Adding one of these is a new decision, not a pending task: nothing in the repository is
+waiting on them, and the release workflow does not change to accommodate them.
