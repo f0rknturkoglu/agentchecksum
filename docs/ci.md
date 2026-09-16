@@ -24,7 +24,7 @@ crates.io — so a job must not assume a download exists. Two options work today
 The repository ships a composite action at its root, so a consumer repository can use it directly:
 
 ```yaml
-- uses: f0rknturkoglu/agentchecksum@main
+- uses: f0rknturkoglu/agentchecksum@v0.1
   with:
     command: check
 ```
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Fingerprint the agent
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: snapshot
 
@@ -107,7 +107,7 @@ jobs:
         run: git diff --exit-code -- agentchecksum.lock
 
       - name: Gate on drift
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: check
           args: --no-probes --fail-on-drift
@@ -164,14 +164,14 @@ jobs:
 
       - name: Report what changed
         if: steps.base.outputs.lock != ''
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: diff
           args: --from ${{ steps.base.outputs.lock }}
 
       - name: Gate on it
         if: steps.base.outputs.lock != ''
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: check
           args: --from ${{ steps.base.outputs.lock }} --no-probes --fail-on-drift
@@ -215,7 +215,7 @@ jobs:
       # refuses to record anything while the dependency state has moved, and a dirty
       # tree would attribute the numbers to a revision nobody can check out.
       - name: Refresh the lockfile
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: snapshot
 
@@ -227,7 +227,7 @@ jobs:
           # Only matters if your endpoint reads a credential from the environment;
           # AgentChecksum itself sends none (see docs/security.md).
           MODEL_ENDPOINT_TOKEN: ${{ secrets.MODEL_ENDPOINT_TOKEN }}
-        uses: f0rknturkoglu/agentchecksum@main
+        uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: check
           args: --accept --repeat 3

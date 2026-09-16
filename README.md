@@ -80,11 +80,11 @@ Rust 1.98 or newer. The repository pins its compiler in `rust-toolchain.toml`, s
 exactly the toolchain the test suite was verified against; CI installs that pin rather than choosing
 its own.
 
-### Prebuilt binaries (after the first tagged release)
+### Prebuilt binaries
 
-`v0.1.0` has not been tagged yet, so no release assets exist. Once it is, the release workflow builds
-these archives on native runners and attaches them to the GitHub Release, with a `SHA256SUMS` manifest
-beside them:
+Every release is built on a native runner per target and attached to
+[the GitHub Release](https://github.com/f0rknturkoglu/agentchecksum/releases/latest), with a
+`SHA256SUMS` manifest beside the archives:
 
 ```text
 agentchecksum-v0.1.0-aarch64-apple-darwin.tar.gz      macOS, Apple Silicon
@@ -102,16 +102,16 @@ tar -xzf agentchecksum-v0.1.0-aarch64-apple-darwin.tar.gz
 ./agentchecksum-v0.1.0-aarch64-apple-darwin/agentchecksum --version
 ```
 
-### Cargo (after publication)
-
-Once the crate is published to crates.io:
+### Cargo (not yet available)
 
 ```bash
 cargo install agentchecksum --locked
 ```
 
-That path does not work yet — the crate has not been published. It is listed here so the plan is not a
-surprise, not to suggest it is available.
+This is the intended package installation path and it **does not work yet**: the crate is not
+published on crates.io, because the account still needs a verified email address before it can publish
+anything. Until that is done, use a prebuilt archive or a source build. The command will start working
+the day `agentchecksum 0.1.0` appears on crates.io, without any change to this section.
 
 ## Five-minute quickstart
 
@@ -264,8 +264,8 @@ jobs:
           ollama pull qwen3:8b-q4
 
       # The composite action runs one AgentChecksum command and lets its exit code
-      # decide the step. `@main` works today; pin a tag once v0.1.0 is released.
-      - uses: f0rknturkoglu/agentchecksum@main
+      # decide the step. `@v0.1` tracks the 0.1.x line; pin `@v0.1.0` for the exact release.
+      - uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: check
 ```

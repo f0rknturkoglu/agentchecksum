@@ -28,9 +28,9 @@ for the commands below, so it is stated plainly rather than implied by a badge:
 |---|---|
 | Build from a clone: `cargo build --release` | **Yes** |
 | `cargo install --git https://github.com/f0rknturkoglu/agentchecksum` | **Yes** — it builds from the repository |
-| The composite action in this repository (`uses: f0rknturkoglu/agentchecksum@main`) | **Yes** — when no release asset exists for the runner it builds the CLI from the source it ships, announced on stderr. See [ci.md](ci.md#the-composite-action-recommended) |
-| `cargo install agentchecksum` (crates.io) | **No** — nothing is published |
-| Downloading a prebuilt release binary | **No** — it starts working at the first tagged release |
+| The composite action in this repository (`uses: f0rknturkoglu/agentchecksum@v0.1`) | **Yes** — it uses the release asset for the runner and verifies it against `SHA256SUMS`. See [ci.md](ci.md#the-composite-action-recommended) |
+| Downloading a prebuilt release binary | **Yes** — from [the `v0.1.0` release](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0) |
+| `cargo install agentchecksum` (crates.io) | **No** — the crate is not published yet; the account needs a verified email address before it can publish |
 
 Both working methods need a Rust toolchain: the crate declares `rust-version = "1.98"`, and the
 repository pins `1.98.1` in `rust-toolchain.toml`. The build produces one binary and needs no

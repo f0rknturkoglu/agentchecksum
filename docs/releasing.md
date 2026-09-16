@@ -131,8 +131,20 @@ crates.io version cannot be replaced, so it should be pushed by a human who has 
 the dry run.
 
 ```bash
+cargo publish --dry-run --locked   # must pass first
 cargo publish --locked
 ```
+
+Two prerequisites that the dry run cannot check, because they are properties of the account
+rather than of the crate:
+
+- **Authentication.** `cargo login` writes a token to `~/.cargo/credentials.toml`. Without
+  one, `cargo publish` stops before uploading anything.
+- **A verified email address.** crates.io refuses a publish with
+  `A verified email address is required to publish crates to crates.io`, pointing at
+  <https://crates.io/settings/profile>. The token is fine and the package is fine; the
+  account simply is not allowed to publish yet. A rejected upload publishes nothing, so the
+  version is still free once the address is verified.
 
 The version on crates.io is the version in `Cargo.toml` at the tagged commit. If the crate
 was already published and you later decide the release is wrong, you cannot reuse that
@@ -220,10 +232,10 @@ workflow *publishes*, not the first time it runs.
 Deliberately not done before the first release, and worth doing only once there is
 something to point at:
 
-- **The moving Action tag.** `uses: f0rknturkoglu/agentchecksum@v0.1` should track the
-  `v0.1.x` line, so a consumer gets fixes without editing their workflow. Move it on every
-  `v0.1.*` tag, never on a major one. Until then `@main` works, and the action falls back to
-  a source build when the tag it was asked for has no release yet.
+- **The moving Action tag.** `uses: f0rknturkoglu/agentchecksum@v0.1` tracks the `v0.1.x`
+  line, so a consumer gets fixes without editing their workflow. Move it on every `v0.1.*`
+  tag — never on a major one, and never `v0.1.0`, which is immutable. `v0.1` was created at
+  the first release and points at the same commit.
 - **A crates.io publication.** The crate packages and installs cleanly today
   (`cargo install --path` from the packaged directory was verified against a temporary
   root), so publishing is a `cargo publish --locked` and a documented install line away. It

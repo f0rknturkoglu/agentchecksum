@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Action smoke
+
+# Exercises the composite action the way a consumer uses it: through the public
+# `@v0.1` tag, which makes it resolve the release asset for the runner, download it and
+# verify it against the release's own `SHA256SUMS` before running it.
+#
+# Manual only. Downloading a release on every push would prove nothing new about the
+# commit being pushed; this is a check to run after a release, or after the moving `v0.1`
+# tag moves. The `version` input is pinned to the exact release so the check does not
+# depend on which release is newest.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  action:
+    name: The published action, against the published release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The action runs one command in *your* project, so this job needs a project.
+      # `[model]` is declared because the agent checksum is computed from the dependency
+      # state, and the endpoint is never contacted by `snapshot`.
+      - name: A project for the action to run in
+        run: |
+          mkdir -p project/prompts
+          printf 'You are a smoke-test agent.\n' > project/prompts/system.md
+          printf '%s\n' \
+            'version = 1' \
+            '[agent]' \
+            'name = "action-smoke"' \
+            '[model]' \
+            'provider = "openai-compatible"' \
+            'id = "m"' \
+            'endpoint = "http://127.0.0.1:9"' \
+            '[[prompts]]' \
+            'path = "prompts/system.md"' \
+            > project/agentchecksum.toml
+
+      - uses: f0rknturkoglu/agentchecksum@v0.1
+        with:
+          command: snapshot
+          version: v0.1.0
+          working-directory: project
+
+      - name: The action ran the released binary and wrote a lockfile
+        run: |
+          test -f project/agentchecksum.lock
+          grep -q 'ac1:' project/agentchecksum.lock
+          echo "the released action produced a lockfile from a downloaded, verified binary"
