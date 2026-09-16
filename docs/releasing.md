@@ -238,6 +238,9 @@ something to point at:
   which consumers pinning `@v0.1` need just as much as a fix in `scripts/`. Never move a
   major tag backwards, and never touch `v0.1.0`, which is immutable.
 
+  Moving it does not start a release: the workflow triggers on `v*.*.*`, so only a
+  release tag reaches it.
+
   It has moved once so far: from the `v0.1.0` commit to the commit that brought the action
   description inside GitHub Marketplace's 125-character limit. Publish the Marketplace
   listing from a release on `v0.1`, not on `v0.1.0`: the Marketplace reads `action.yml` at

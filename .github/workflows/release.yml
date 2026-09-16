@@ -7,7 +7,14 @@ name: Release
 # are filed under.
 on:
   push:
-    tags: ["v*"]
+    # Release tags only: `v0.1.0`, `v1.2.3`. The pattern is deliberately not `v*`, which
+    # also matches the moving compatibility tags (`v0.1`, `v1`): those are aliases for
+    # consumers to pin, they carry no version of their own, and moving one must not start
+    # a release. It did, twice, and `verify-tag` refused both — correctly, but as a failed
+    # run on the repository for something that was not a release attempt. Two dots keep
+    # the pattern honest while `verify-tag` stays as the guard against a mistyped release
+    # tag such as `v0.1.1` when the crate says `0.1.0`.
+    tags: ["v*.*.*"]
   # Dry run: the same builds, archives, smoke tests and uploaded artifacts, with the
   # release job skipped, so nothing is published.
   workflow_dispatch:
