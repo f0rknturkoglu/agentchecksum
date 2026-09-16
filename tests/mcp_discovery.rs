@@ -715,24 +715,46 @@ fn process_is_alive(pid: i32) -> bool {
 
 /// Every surface a credential could reach: the artifacts, the two output streams,
 /// and the machine-readable report.
-fn assert_no_sentinel(project: &Project, output: &std::process::Output, json_report: Option<&str>) {
-    for (surface, text) in [
+fn credential_surfaces(
+    project: &Project,
+    output: &std::process::Output,
+    json_report: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut surfaces = vec![
         ("stdout", stdout(output)),
         ("stderr", stderr(output)),
         ("--format json", json_report.unwrap_or_default().to_string()),
-    ] {
+    ];
+    if project.lock_exists() {
+        surfaces.push((
+            "the lockfile",
+            String::from_utf8_lossy(&project.lock_bytes()).to_string(),
+        ));
+    }
+    surfaces
+}
+
+/// Nothing a user can see repeats this value.
+fn assert_secret_absent(
+    project: &Project,
+    output: &std::process::Output,
+    json_report: Option<&str>,
+    secret: &str,
+) {
+    for (surface, text) in credential_surfaces(project, output, json_report) {
         assert!(
-            !text.contains(SENTINEL),
-            "the sentinel reached {surface}: {text}"
+            !text.contains(secret),
+            "`{secret}` reached {surface}: {text}"
         );
     }
+}
+
+fn assert_no_sentinel(project: &Project, output: &std::process::Output, json_report: Option<&str>) {
+    assert_secret_absent(project, output, json_report, SENTINEL);
+    // The key is not part of the contract either: a lockfile naming the variable a
+    // credential traveled in describes configuration the contract must not carry.
     if project.lock_exists() {
-        let bytes = project.lock_bytes();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(
-            !text.contains(SENTINEL),
-            "the sentinel reached the lockfile: {text}"
-        );
+        let text = String::from_utf8_lossy(&project.lock_bytes()).to_string();
         assert!(
             !text.contains("TOKEN"),
             "the environment key reached the lockfile: {text}"
@@ -775,6 +797,138 @@ fn the_configured_token_never_reaches_a_timeout() {
     let output = run(project.path(), &["snapshot", "--format", "json"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert_no_sentinel(&project, &output, Some(&stdout(&output)));
+}
+
+/// Shorter than the six-character threshold a length-based filter would have kept in
+/// place. A credential is not less of a credential for being three characters long.
+const SHORT_SENTINEL: &str = "x7p";
+
+/// One short configured value, on the ways a run can end: a success, a discovery the
+/// server's own declarations fail, a failure whose reason is the server's own text,
+/// and a server that stops answering. The surfaces are checked whole — both streams,
+/// the lockfile, and the JSON report — because redaction is a property of the run and
+/// not of one message.
+///
+/// The third run is the one that can fail: it is the only one of the four where the
+/// configured value is in the text the client is holding, so a filter that treated a
+/// three-character value as too short to be a credential would publish it there. The
+/// other three are sweeps of the surfaces that run produces.
+#[test]
+fn a_short_configured_token_never_reaches_any_surface() {
+    let succeeded = Project::stdio(
+        json!({ "tools": [tool("search")] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    let output = run(succeeded.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_secret_absent(&succeeded, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+
+    let refused = Project::stdio(
+        json!({ "tools": [tool("search"), tool("search")] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    let output = run(refused.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_secret_absent(&refused, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+
+    let echoed = Project::stdio(
+        json!({
+            "discover": "refused",
+            "discover_error_code": -32600,
+            "discover_error_message": format!("failure for {SHORT_SENTINEL}"),
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    let output = run(echoed.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("[redacted]"),
+        "the value was never treated as a secret at all: {}",
+        stderr(&output)
+    );
+    assert_secret_absent(&echoed, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+
+    let stalled = Project::stdio(
+        json!({ "hang_ms": BEYOND_THE_PAGE_TIMEOUT_MS, "tools": [tool("search")] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    let output = run(stalled.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_secret_absent(&stalled, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+}
+
+/// A failure reason built out of the server's own text is sanitized where it is
+/// produced.
+///
+/// `-32600` fails closed, so the reason in the diagnostic is the peer's message
+/// verbatim — the fixture is handed the configured value and echoes it back. The
+/// `[redacted]` marker is half the assertion: it proves the text was carried and
+/// sanitized rather than dropped, so a future change that stopped quoting the peer
+/// would not pass this test by accident.
+#[test]
+fn a_server_echoed_value_never_reaches_a_failure_diagnostic() {
+    let project = Project::stdio(
+        json!({
+            "discover": "refused",
+            "discover_error_code": -32600,
+            "discover_error_message": format!("failure for {SHORT_SENTINEL}"),
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("connecting and negotiating"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("[redacted]"),
+        "the peer's text was dropped rather than sanitized: {diagnostic}"
+    );
+    assert_secret_absent(&project, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+}
+
+/// The same echoed value on the legacy fallback path, where the session does start
+/// and the client writes its note about the optional discovery metadata from a
+/// failure the server was on the other end of.
+///
+/// The note is a warning rather than a failure, which is the reason this is a test of
+/// its own: a warning is the surface a sanitizing bug reaches a user through without
+/// anything failing. The value the server was handed appears nowhere, and the note
+/// still names the server it is about.
+#[test]
+fn a_server_echoed_value_never_reaches_the_supported_versions_warning() {
+    let project = Project::stdio(
+        json!({
+            "discover": "refused",
+            "discover_error_message": format!("failure for {SHORT_SENTINEL}"),
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // The refusal is what moved the session to the legacy lifecycle, and the warning
+    // below is the one the fallback path produces.
+    assert_eq!(
+        project.lock()["dependencies"]["mcp:local"]["facets"]["identity"]["normalized"]["era"],
+        "legacy"
+    );
+
+    let report = stdout(&output);
+    let warning = report
+        .lines()
+        .find(|line| line.contains("did not report its supported protocol versions"))
+        .unwrap_or_else(|| panic!("the supported-versions warning never fired: {report}"));
+    assert!(warning.contains("`mcp:local`"), "unattributed: {warning}");
+    assert_secret_absent(&project, &output, Some(&report), SHORT_SENTINEL);
 }
 
 // ---------------------------------------------------------------------------
@@ -898,11 +1052,22 @@ fn a_streamable_http_server_is_discovered_the_same_as_a_stdio_one() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. A server pinned to the session protocol
+// 12. A server whose newest revision is the session one
 // ---------------------------------------------------------------------------
 
+/// Answering `server/discover` with only the session revision is a failure, not a
+/// downgrade — and this is the test that keeps `2025-11-25` out of the stateless
+/// candidate list.
+///
+/// The fixture advertises only the session revision, so the stateless handshake has
+/// nothing to negotiate: the peer answered the modern opener by naming a revision the
+/// modern lifecycle does not speak, which is a rejected handshake rather than an
+/// invitation to run the session one. Recording it as a legacy server would describe
+/// an era that never happened — and, because a snapshot's whole purpose is to notice
+/// when a dependency moves, it would re-fingerprint every such server the day someone
+/// added `2025-11-25` to `preferred_versions()` as a compatibility improvement.
 #[test]
-fn a_server_whose_newest_revision_is_legacy_is_recorded_as_the_legacy_era() {
+fn a_discover_response_advertising_only_the_session_revision_fails_closed() {
     let project = Project::stdio(
         json!({
             "legacy_only": true,
@@ -911,27 +1076,57 @@ fn a_server_whose_newest_revision_is_legacy_is_recorded_as_the_legacy_era() {
         }),
         &[],
     );
+    let log = start_log(&project);
 
     let output = project.snapshot();
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 
-    let identity =
-        project.lock()["dependencies"]["mcp:local"]["facets"]["identity"]["normalized"].clone();
-    assert_eq!(identity["era"], "legacy");
-    let negotiated = identity["protocol_version"]
-        .as_str()
-        .expect("the negotiated version is a string")
-        .to_string();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    // The diagnosis names both sides of the disagreement. `2025-11-25` is in it
+    // because that is what the peer offered, and a rejection that did not say what it
+    // rejected would be a code rather than a diagnostic.
     assert!(
-        negotiated.as_str() < "2026-07-28",
-        "the negotiated version `{negotiated}` is not a pre-stateless revision"
+        diagnostic.contains("no compatible protocol version"),
+        "{diagnostic}"
     );
-    assert_eq!(identity["supported_versions"], json!(["2025-11-25"]));
-    // The tool contract is still discovered: falling back is a protocol decision,
-    // not a discovery failure.
+    assert!(diagnostic.contains("2026-07-28"), "{diagnostic}");
+    assert!(diagnostic.contains("2025-11-25"), "{diagnostic}");
     assert!(
-        project.lock()["dependencies"]["tool:local.search"]["facets"]["input_schema"].is_object()
+        diagnostic.contains("connecting and negotiating"),
+        "{diagnostic}"
     );
+
+    // Nothing was negotiated, so nothing is recorded: no lockfile, no era, and none of
+    // the lifecycle a fallback would have run.
+    assert!(
+        !project.lock_exists(),
+        "a failed negotiation wrote a lockfile: {:?}",
+        project.lock_bytes()
+    );
+    assert!(
+        !diagnostic.contains("legacy lifecycle"),
+        "a rejected revision was retried as a legacy connection: {diagnostic}"
+    );
+    assert_eq!(
+        attempts(&log),
+        1,
+        "the server was asked a second time for a revision it had refused"
+    );
+
+    // The revision is a candidate the client refused, never an era a server was given:
+    // it appears in the reason, in the line that says what was rejected, and nowhere
+    // else — not on stdout, and not in any file the run produced.
+    for line in diagnostic
+        .lines()
+        .filter(|line| line.contains("2025-11-25"))
+    {
+        assert!(
+            line.contains("no compatible protocol version"),
+            "the refused revision reached a line that is not the rejection: {line}"
+        );
+    }
+    assert_no_legacy_text("stdout", &stdout(&output));
+    assert_no_legacy_files(&project);
 }
 
 // ---------------------------------------------------------------------------
@@ -973,21 +1168,29 @@ fn attempts(log: &Path) -> usize {
 /// Checked as a whole surface rather than on the diagnostic alone: a legacy retry
 /// that is *logged* rather than reported is still a retry, and a lockfile naming the
 /// wrong era is the failure this policy exists to prevent.
+fn assert_no_legacy_surface(project: &Project, output: &std::process::Output) {
+    assert_no_legacy_text("stdout", &stdout(output));
+    assert_no_legacy_text("stderr", &stderr(output));
+    assert_no_legacy_files(project);
+}
+
+/// A stream that names no era this run did not negotiate.
 ///
 /// `legacy` is looked for as the label it is — the `legacy lifecycle` stage in a
 /// diagnostic, or `"legacy"` as a recorded value — never as a bare word. A transport
 /// error can name an unrelated crate's `legacy` client, and a test that failed on
 /// that would be reporting a false positive about a real connection failure.
-fn assert_no_legacy_surface(project: &Project, output: &std::process::Output) {
-    for (surface, text) in [("stdout", stdout(output)), ("stderr", stderr(output))] {
-        for needle in ["2025-11-25", "legacy lifecycle"] {
-            assert!(
-                !text.contains(needle),
-                "`{needle}` reached {surface}: {text}"
-            );
-        }
+fn assert_no_legacy_text(surface: &str, text: &str) {
+    for needle in ["2025-11-25", "legacy lifecycle"] {
+        assert!(
+            !text.contains(needle),
+            "`{needle}` reached {surface}: {text}"
+        );
     }
+}
 
+/// And no artifact on disk that does.
+fn assert_no_legacy_files(project: &Project) {
     for entry in std::fs::read_dir(project.path()).expect("the project directory is readable") {
         let path = entry.expect("the directory entry is readable").path();
         let bytes = std::fs::read(&path).expect("the artifact is readable");
@@ -1084,29 +1287,32 @@ fn a_handshake_that_never_answers_is_a_timeout_and_never_a_second_attempt() {
     assert_no_legacy_surface(&project, &output);
 }
 
-/// The fallback a legacy peer can trigger, over the transport whose `discover`
-/// refusal is a JSON-RPC error rather than a sessionless 4xx.
+/// The fallback a peer's refusal can trigger: the one signal that is evidence of a
+/// server that predates `server/discover`.
 ///
-/// The existing `legacy_only` test covers the version-downgrade path inside the
-/// stateless lifecycle; this covers the other one, where the peer says it does not
-/// implement `server/discover` at all and the client opens a session instead.
+/// The fixture answers `server/discover` with the JSON-RPC error that means "I do not
+/// implement that method", and then accepts the session handshake at `2025-11-25`.
+///
+/// The spec deliberately does not pin the fixture to the session revision
+/// (`legacy_only`). The SDK's server refuses a stateless `server/discover` that
+/// declares a revision it does not implement *before* the fixture's own `discover`
+/// runs, so a pinned server would fail the handshake with `-32022` instead of
+/// refusing the method — and the client would be right not to fall back. That is the
+/// fail-closed test above; this is the other path.
 #[test]
 fn a_server_that_refuses_discover_is_discovered_through_the_session_lifecycle() {
     let project = Project::stdio(
         json!({
-            "legacy_only": true,
             "discover": "refused",
             "server_info": { "name": "fixture", "version": "1.0.0" },
             "tools": [tool("search")]
         }),
         &[],
     );
-    let (fixture, port) = start_http(&project);
-    write_config(project.path(), &config(&http_server("local", port)));
+    let log = start_log(&project);
 
     let output = project.snapshot();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    drop(fixture);
 
     let identity =
         project.lock()["dependencies"]["mcp:local"]["facets"]["identity"]["normalized"].clone();
@@ -1120,6 +1326,93 @@ fn a_server_that_refuses_discover_is_discovered_through_the_session_lifecycle() 
         project.lock()["dependencies"]["tool:local.search"]["facets"]["input_schema"].is_object(),
         "the session lifecycle discovered no tool contract"
     );
+
+    // The fallback is the one path that costs a second process: the transport the
+    // first attempt consumed cannot be reused, so the peer is started twice and the
+    // second session is the one that was introspected.
+    assert_eq!(
+        attempts(&log),
+        2,
+        "the legacy fallback opened its session without starting the server again"
+    );
+}
+
+/// A failure that is not `METHOD_NOT_FOUND` is not evidence about a peer's age.
+///
+/// `-32600` is a peer saying the request was wrong, and `-32603` is a peer saying it
+/// is unwell. Both are transient or local statements: a client that read either as a
+/// handshake answer would open a session against a server that never claimed to
+/// predate `server/discover`, and would then record an era chosen by an error the peer
+/// did not mean that way.
+#[test]
+fn an_invalid_request_is_not_evidence_of_a_legacy_peer() {
+    let project = Project::stdio(
+        json!({
+            "discover": "refused",
+            "discover_error_code": -32600,
+            "tools": [tool("search")]
+        }),
+        &[],
+    );
+    let log = start_log(&project);
+
+    let output = project.snapshot();
+
+    assert_discover_failure_fails_closed(&project, &output, &log, "-32600");
+}
+
+#[test]
+fn an_internal_error_is_not_evidence_of_a_legacy_peer() {
+    let project = Project::stdio(
+        json!({
+            "discover": "refused",
+            "discover_error_code": -32603,
+            "tools": [tool("search")]
+        }),
+        &[],
+    );
+    let log = start_log(&project);
+
+    let output = project.snapshot();
+
+    assert_discover_failure_fails_closed(&project, &output, &log, "-32603");
+}
+
+/// A `server/discover` failure that is not `METHOD_NOT_FOUND`: refused, attributed,
+/// with no session, no artifact, no second process, and no mention of the lifecycle a
+/// fallback would have run.
+fn assert_discover_failure_fails_closed(
+    project: &Project,
+    output: &std::process::Output,
+    log: &Path,
+    code: &str,
+) {
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(output));
+    let diagnostic = stderr(output);
+    assert!(diagnostic.contains("`local` (stdio)"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("connecting and negotiating"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(code),
+        "the code the peer answered with is not in the diagnostic: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("legacy lifecycle"),
+        "the failure was retried as a legacy connection: {diagnostic}"
+    );
+    assert!(
+        !project.lock_exists(),
+        "a failed handshake left a lockfile behind: {:?}",
+        project.lock_bytes()
+    );
+    assert_eq!(
+        attempts(log),
+        1,
+        "a failure that is not method-not-found was retried against a second process"
+    );
+    assert_no_legacy_surface(project, output);
 }
 
 /// An unreachable server is unreachable, not old.

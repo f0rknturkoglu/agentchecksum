@@ -190,8 +190,18 @@ destructive** is CRITICAL — the worst thing a diff can discover on its own, an
 one. The escalation needs both tokens, and a capability payload this build cannot decode leaves the
 ordinary added-tool risk in place rather than inflating or deflating it.
 
+Session establishment is deliberately strict about one thing: AgentChecksum falls back to the session
+protocol only when the server answers, in so many words, that it does not implement `server/discover`
+(`-32601`). Every other answer — a generic error, an internal failure, a timeout, a transport or
+authorization problem — is a **failure**, not evidence that the server is old. Nothing about timing or
+reachability is allowed to change which protocol era a dependency is fingerprinted under.
+
 Because no credential-derived value is fingerprinted, rotating a token that does not change what the
-server declares produces the same checksum. When credentials do change the declared contract — a
+server declares produces the same checksum. And because configured environment values are connection
+material, every non-empty one is redacted out of everything you can see — stdout, stderr, warnings,
+errors, tracing, the lockfile — including text a server echoes back. There is no length threshold: a
+three-character token is treated like any other. This is a guarantee about values you configured, not a
+claim to recognize secrets AgentChecksum was never given. When credentials do change the declared contract — a
 narrower set of authorized tools, for example — that is a real dependency change, and it is reported as
 one.
 

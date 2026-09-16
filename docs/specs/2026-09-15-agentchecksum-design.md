@@ -694,33 +694,45 @@ accepts or rejects each request independently. Servers **MUST** implement `serve
 
 **How the session is established.** Two explicit steps, and only the peer can trigger the second one.
 
-1. The stateless handshake: `ClientLifecycleMode::Discover` with `2026-07-28` preferred and `2025-11-25`
-   as the fallback preference. Version negotiation inside the probe is the SDK's own retry loop: an
-   `UnsupportedProtocolVersionError` (code `-32022`, `data` carrying `supported` and `requested`) makes it
-   re-ask with a mutually supported version, and a server whose list intersects ours in nothing fails the
-   discovery.
-2. The session handshake, `ClientLifecycleMode::Initialize`, at `2025-11-25` — reached **only** when step 1
-   failed with a *correlated* JSON-RPC error whose code is not a modern-era rejection. That is the one
-   signal that means "this peer does not implement that method", and it is the same classification the SDK
-   makes internally (its `DiscoverOutcome` and its version-sending `legacy_version` are not public, so the
-   test is re-derived from the public error codes). Because the transport is consumed by the first attempt
-   and is not returned on failure, the fallback opens a second connection or spawns a second child — a cost
-   paid only on the path a server explicitly asked for.
+1. **The stateless handshake**: `ClientLifecycleMode::Discover` with `2026-07-28` as its *only* candidate.
+   One era means one revision; anything newer is a further revision of the same era. Version negotiation
+   inside the probe is the SDK's own retry loop: an `UnsupportedProtocolVersionError` (code `-32022`,
+   `data` carrying `supported` and `requested`) makes it re-ask with a mutually supported version, and a
+   server whose list intersects ours in nothing fails the discovery. A server that answers
+   `server/discover` while advertising only the session revision therefore fails here — it cannot be
+   negotiated *into* a legacy state through the stateless lifecycle, because an era that disagrees with
+   the handshake that produced it is not a fact about the server.
+2. **The session handshake**: `ClientLifecycleMode::Initialize`, at `2025-11-25`. This is not a fallback
+   *version* but a separate concept, and it is reached **only** when step 1's probe was answered with the
+   explicit JSON-RPC signal `METHOD_NOT_FOUND` (`-32601`) — the protocol's own way of saying "I do not
+   implement that method". Because the transport is consumed by the first attempt and is not returned on
+   failure, the fallback opens a second connection or spawns a second child; that cost is paid only on the
+   path a server explicitly asked for.
 
-The SDK's `ClientLifecycleMode::Auto` is deliberately **not** used. It also falls back when the probe
-simply does not answer within its internal ten-second cap, which would let transient latency choose the
-protocol era — and therefore the fingerprint: the same server, under load, would be recorded as legacy,
-and identical declarations would produce a different dependency identity from one run to the next.
+Nothing else is evidence of age, and nothing else may move a dependency from one protocol era to another:
 
-A **timeout is a failure**, never evidence of age. So are a transport or TLS error, an authorization
-rejection, an uncorrelated or malformed response, and the modern rejection codes `-32021` (a client
-capability the server requires) and `-32020` (header mismatch) — the last two say the peer *is* modern.
-Each is reported as `McpFailed` or `McpTimeout` with the stage that failed, and none of them can produce a
-legacy fingerprint. One consequence worth stating because it is a transport fact rather than a policy
-choice: on Streamable HTTP the SDK's own transport synthesises that correlated error when a sessionless
-`server/discover` is answered with a 4xx other than 401/403 — its way of saying the endpoint serves the
-session protocol. The fallback therefore fires there too, and it still has to *succeed* to fingerprint
-anything.
+| Answer to the stateless probe | Result |
+|---|---|
+| `METHOD_NOT_FOUND` (`-32601`) | the one legacy signal — step 2 runs |
+| `Invalid Request` (`-32600`), `Invalid Params` (`-32602`), `Internal Error` (`-32603`) | failure; a transient server error must not re-fingerprint a server as another era |
+| `-32021` missing client capability, `-32020` header mismatch | failure; these explicitly say the peer *is* modern |
+| `-32022` with no mutually supported revision | failure; the SDK's retry loop consumes this code before an age question can arise |
+| timeout · latency | failure; a slow server is a slow server |
+| transport or TLS error · authorization rejection | failure; unreachable or forbidden is not old |
+| uncorrelated, malformed, or closed response | failure |
+
+Each is reported as `McpFailed` or `McpTimeout` naming the stage that failed. The SDK's
+`ClientLifecycleMode::Auto` is deliberately **not** used: it also falls back when the probe simply does not
+answer within its internal ten-second cap, which would let transient latency choose the protocol era — and
+therefore the fingerprint, since the same server under load would be recorded as legacy and identical
+declarations would produce different identities run to run.
+
+One consequence follows from a transport fact rather than a policy choice: the SDK's Streamable HTTP
+transport synthesises a correlated `-32600` when a sessionless `server/discover` is answered with a 4xx
+other than 401/403. That code is not `METHOD_NOT_FOUND`, so this build does not fall back over that
+transport — a legacy server reachable only over HTTP is reported as a discovery failure rather than
+fingerprinted through a lifecycle the transport guessed at. Reaching such a server needs a stdio
+configuration, or a transport-level decision this version has not made.
 
 The stateless revision is named explicitly rather than taken from the SDK's `LATEST`, which still points
 at `2025-11-25`: asking for `LATEST` would negotiate a session protocol against a server that supports
@@ -936,11 +948,23 @@ credential rotation that leaves the declared contract unchanged produces the sam
 agent checksum. When credentials do change what a server declares — a narrower authorized tool set, for
 instance — that is a real dependency change and is reported as one.
 
-**Redaction.** The values in `[mcp.servers.env]` are redacted out of every diagnostic, including text that
-came from the server, because a server may echo back whatever it was started with. A failed spawn reports
-the operating system's reason and never the environment the server would have been given; an endpoint
-diagnostic names the component that is wrong rather than repeating the URL. Values shorter than six bytes
-are not redacted: hiding `1` or `true` would mangle diagnostics without protecting anything.
+**Redaction is an invariant, not a filter.** Every non-empty value in `[mcp.servers.env]` is removed from
+every string a user can see — lockfile, stdout, stderr, warnings, failure reasons, tracing output — and
+length is not a property of a secret: a three-character token is redacted exactly like a long one. Values
+are deduplicated and replaced longest-first, so a value contained in another (`abc` inside `abc123`) leaves
+no fragment behind.
+
+The guarantee is deliberately a statement about **configured** values only. AgentChecksum cannot redact a
+secret it was never given, and it does not try to guess: the contract is that the connection material this
+process received is the connection material it never repeats.
+
+Every free-form string in the MCP module goes through one sanitizing function before it is exposed — a
+failure reason, a warning about the session, the note that optional discovery metadata was unavailable, a
+shutdown complaint. The text can originate from a server, a transport, or a child process, and any of them
+may echo back what they were started with, so the sanitizing happens at the point where the string is
+produced rather than at the point where someone remembers to. A failed spawn reports the operating system's
+reason and never the environment the server would have been given; an endpoint diagnostic names the
+component that is wrong rather than repeating the URL.
 
 ---
 

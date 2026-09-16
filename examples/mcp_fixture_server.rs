@@ -20,7 +20,9 @@
 //! `127.0.0.1` with an ephemeral port; that path is written on raw sockets rather
 //! than through a web framework so the fixture has no dependency the binary does
 //! not already have. Both transports honor the spec's `discover` mode, so a test can
-//! state a slow or a refusing `server/discover` either way.
+//! state a slow or a refusing `server/discover` either way, and `discover_error_code`
+//! with `discover_error_message` say which JSON-RPC error that refusal is and what
+//! text it carries.
 //!
 //! Nothing here reads the environment it is started with beyond the four variables
 //! above: a configured credential is handed to this process by the client and is
@@ -70,11 +72,23 @@ struct Spec {
     /// The guidance the server gives the client.
     #[serde(default)]
     instructions: Option<String>,
-    /// How `server/discover` is answered. `ok` is a modern server; `refused` is the
-    /// explicit legacy signal (a correlated JSON-RPC error for a method this server
-    /// does not implement); `delayed` answers correctly, late.
+    /// How `server/discover` is answered. `ok` is a modern server; `refused` is a
+    /// server answering that method with a correlated JSON-RPC error; `delayed`
+    /// answers correctly, late.
     #[serde(default)]
     discover: DiscoverMode,
+    /// The JSON-RPC error code `refused` answers with. The default is the one code
+    /// that the protocol uses to say "I do not implement that method"; any other code
+    /// is how a test states a peer that failed for a reason that says nothing about
+    /// its age. Ignored outside `refused`, which is the only mode that answers with
+    /// an error at all.
+    #[serde(default)]
+    discover_error_code: Option<i64>,
+    /// The `message` of that error, used verbatim. It is how a test hands the client
+    /// a server-controlled string — a value the server echoes back — to prove the
+    /// client sanitizes what it repeats. The default carries nothing.
+    #[serde(default)]
+    discover_error_message: Option<String>,
     /// Delay before answering `server/discover`, to exercise a client-side timeout.
     #[serde(default)]
     discover_delay_ms: u64,
@@ -208,6 +222,23 @@ impl Spec {
         }
     }
 
+    /// The JSON-RPC error this server answers `server/discover` with, when `refused`
+    /// is the declared mode: the code, and the message verbatim.
+    fn discover_error(&self) -> Option<(ErrorCode, String)> {
+        if self.discover != DiscoverMode::Refused {
+            return None;
+        }
+        let code = self
+            .discover_error_code
+            .map(|code| ErrorCode(i32::try_from(code).unwrap_or(ErrorCode::METHOD_NOT_FOUND.0)))
+            .unwrap_or(ErrorCode::METHOD_NOT_FOUND);
+        let message = self
+            .discover_error_message
+            .clone()
+            .unwrap_or_else(|| "Method not found".to_string());
+        Some((code, message))
+    }
+
     /// One page of the catalog, starting at the cursor's offset.
     fn page(&self, cursor: Option<&str>) -> ListToolsResult {
         let total = self.tools.len();
@@ -285,13 +316,9 @@ impl ServerHandler for Fixture {
         async move {
             // A server that does not implement `server/discover` answers a correlated
             // JSON-RPC error, exactly as the raw-socket path does. Nothing else about
-            // this server is legacy.
-            if spec.discover == DiscoverMode::Refused {
-                return Err(ErrorData::new(
-                    ErrorCode::METHOD_NOT_FOUND,
-                    "Method not found",
-                    None,
-                ));
+            // this server is legacy, and the code and message are the spec's.
+            if let Some((code, message)) = spec.discover_error() {
+                return Err(ErrorData::new(code, message, None));
             }
             if spec.discover == DiscoverMode::Delayed && spec.discover_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(spec.discover_delay_ms)).await;
@@ -487,12 +514,14 @@ fn discover_reply(spec: &Spec, message: &Value, id: Option<Value>) -> Option<Val
 
     // A server that does not implement `server/discover` answers a correlated
     // JSON-RPC error, which is the one thing that legitimately means "I am a legacy
-    // server": the client is entitled to fall back on it and on nothing else.
-    if spec.discover == DiscoverMode::Refused {
+    // server": the client is entitled to fall back on it and on nothing else. The
+    // code and message are the spec's, so a test can state a failure that is not a
+    // missing method.
+    if let Some((code, message)) = spec.discover_error() {
         return Some(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": { "code": -32601, "message": "Method not found" }
+            "error": { "code": code.0, "message": message }
         }));
     }
 

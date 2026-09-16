@@ -34,14 +34,30 @@ use super::limits;
 use super::normalize::{self, Rejected};
 use super::{DiscoveredServer, DiscoveredTool};
 
-/// The protocol revisions AgentChecksum asks for, most preferred first.
+/// The revision the stateless lifecycle speaks.
 ///
-/// The stateless revision is named explicitly because the SDK's own `LATEST`
-/// constant still points at the previous one: asking for `LATEST` here would
-/// negotiate a session protocol on a server that supports both, and the fingerprint
-/// would then describe an era the server does not have to be in.
+/// Named explicitly because the SDK's own `LATEST` constant still points at the
+/// previous, session-based one: asking for `LATEST` would negotiate a session
+/// protocol against a server that supports both, and the fingerprint would then
+/// describe an era the server does not have to be in.
+const STATELESS_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// The revision the session lifecycle speaks.
+///
+/// A separate concept from the candidate list below, deliberately: it is not a
+/// fallback *version*, it is the revision used only after a peer has said, in so many
+/// words, that it does not implement `server/discover`.
+const LEGACY_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+/// The revisions the stateless handshake may negotiate.
+///
+/// One entry, because the stateless era is one revision and anything newer is a
+/// revision of the same era. Listing the session revision here would let a server
+/// answer `server/discover`, negotiate a session revision, and be recorded as legacy
+/// through a lifecycle that was never the session one — an era that disagrees with
+/// the handshake that produced it.
 fn preferred_versions() -> Vec<ProtocolVersion> {
-    vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25]
+    vec![STATELESS_VERSION]
 }
 
 /// The stateless handshake, and nothing else.
@@ -66,31 +82,32 @@ fn legacy_lifecycle() -> ClientLifecycleMode {
 
 /// Whether a failed modern probe is evidence that the peer is a legacy server.
 ///
-/// The one signal that means this is a *correlated JSON-RPC error that is not a
-/// modern-era rejection*: the server understood the request and answered that it
-/// does not implement the method. That classification lives in the SDK's private
-/// `DiscoverOutcome`, so the same two-line test is repeated here against the public
-/// error-code constants.
+/// Exactly one signal qualifies: the peer answered `server/discover` with
+/// **`METHOD_NOT_FOUND`**, the protocol's own way of saying "I do not implement that
+/// method". Nothing else is evidence about the peer's age, and nothing else may move
+/// a dependency from one protocol era to another:
 ///
-/// Everything else is a failure, and none of it is evidence about the peer's age:
-/// a timeout (the server was slow), a transport or TLS error (it was unreachable), a
-/// TLS or authorization rejection, an uncorrelated or malformed response, and the
-/// modern rejections `-32021` (a capability the client must have) and `-32020`
-/// (header mismatch) — in fact the last two explicitly say the peer *is* modern.
+/// * `-32600`, `-32602`, and `-32603` are the peer saying the request was wrong or
+///   that it is unwell. A transient internal error acting as a legacy signal would
+///   re-fingerprint an entire server as something it may not be.
+/// * `-32021` and `-32020` are explicit *modern* rejections.
+/// * `-32022` is consumed by the SDK's own version-retry loop before this point.
+/// * A timeout says the peer was slow, a transport or TLS error says it was
+///   unreachable, an authorization rejection says we may not talk to it, and an
+///   uncorrelated or malformed response says it is broken. None of that is evidence
+///   of a protocol era.
 ///
-/// One transport fact rather than a policy choice: over Streamable HTTP the SDK's own
-/// client transport synthesises a correlated error of this shape when a sessionless
-/// `server/discover` is answered with a 4xx other than 401/403, which is its way of
-/// saying the endpoint serves the session protocol. The fallback therefore fires
-/// there too — and it still has to succeed to fingerprint anything.
+/// One consequence, stated because it is a transport fact rather than a policy
+/// choice: the SDK's Streamable HTTP transport synthesises a correlated `-32600` when
+/// a sessionless `server/discover` is answered with a 4xx other than 401/403. That is
+/// *not* method-not-found, so this build does not fall back over that transport — a
+/// legacy server reachable only over HTTP is reported as a discovery failure instead
+/// of being fingerprinted through a lifecycle the transport guessed at.
 fn is_legacy_signal(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::JsonRpcError(data) = error else {
         return false;
     };
-    !matches!(
-        data.code,
-        ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY | ErrorCode::HEADER_MISMATCH
-    )
+    data.code == ErrorCode::METHOD_NOT_FOUND
 }
 
 /// The client identity we declare.
@@ -155,8 +172,8 @@ where
 {
     let alias = server.name.as_str();
 
-    let modern = client_config(ProtocolVersion::V_2026_07_28)
-        .serve_with_lifecycle(open()?, discover_lifecycle());
+    let modern =
+        client_config(STATELESS_VERSION).serve_with_lifecycle(open()?, discover_lifecycle());
     match tokio::time::timeout(limits::CONNECT_TIMEOUT, modern).await {
         Ok(Ok(client)) => return Ok(client),
         Ok(Err(error)) if is_legacy_signal(&error) => {
@@ -171,7 +188,7 @@ where
                 alias,
                 transport,
                 "connecting and negotiating",
-                &describe(&error),
+                &secrets.diagnostic(&error),
             ));
         }
         Err(_) => {
@@ -186,15 +203,14 @@ where
 
     // Only reachable from the branch above: the peer gave the correlated error that
     // means "I do not implement that method".
-    let legacy = client_config(ProtocolVersion::V_2025_11_25)
-        .serve_with_lifecycle(open()?, legacy_lifecycle());
+    let legacy = client_config(LEGACY_VERSION).serve_with_lifecycle(open()?, legacy_lifecycle());
     match tokio::time::timeout(limits::CONNECT_TIMEOUT, legacy).await {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(error)) => Err(secrets.failed(
             alias,
             transport,
             "connecting with the legacy lifecycle",
-            &describe(&error),
+            &secrets.diagnostic(&error),
         )),
         Err(_) => Err(secrets.timeout(
             alias,
@@ -241,7 +257,7 @@ where
         Ok(Ok(_)) => {}
         Ok(Err(error)) => discovered.warnings.push(format!(
             "the session did not close cleanly: {}",
-            describe(&error)
+            secrets.diagnostic(&error)
         )),
         Err(_) => discovered.warnings.push(format!(
             "the session did not close within {}s",
@@ -277,8 +293,7 @@ async fn introspect(
     // seed the response cache either, so asking is the only way to learn what the
     // server says it supports. That answer is part of the contract this layer records
     // and it is inside the same bounded budget.
-    let (supported_versions, mut warnings) =
-        supported_versions(client, alias, transport, secrets).await;
+    let (supported_versions, mut warnings) = supported_versions(client, secrets).await;
 
     // A snapshot must describe *now*, so response caching is off for everything that
     // follows. The SDK's default is to serve a stale list entry when a refresh fails,
@@ -356,10 +371,11 @@ async fn introspect(
 }
 
 /// The versions the server says it implements, when it says so.
+///
+/// Takes no server identity: its only failure mode is a warning, and the warning
+/// text is sanitized before the caller attaches the alias to it.
 async fn supported_versions(
     client: &RunningService<RoleClient, ClientConfig>,
-    alias: &str,
-    transport: &'static str,
     secrets: &Secrets,
 ) -> (Option<Vec<ProtocolVersion>>, Vec<String>) {
     let asking = client.discover(RequestMetaObject(MetaObject::default()));
@@ -369,11 +385,10 @@ async fn supported_versions(
             None,
             vec![format!(
                 "the server did not report its supported protocol versions ({}); only the negotiated version is recorded",
-                describe(&error)
+                secrets.diagnostic(&error)
             )],
         ),
         Err(_) => {
-            let _ = (alias, transport, secrets);
             (
                 None,
                 vec!["the server did not report its supported protocol versions in time; only the negotiated version is recorded".to_string()],
@@ -433,7 +448,7 @@ async fn list_tools(
                     alias,
                     transport,
                     "reading the tool catalog",
-                    &describe(&error),
+                    &secrets.diagnostic(&error),
                 )
             })?;
 
@@ -543,7 +558,7 @@ fn stdio_transport(server: &McpServerConfig, secrets: &Secrets) -> Result<TokioC
                 &server.name,
                 "stdio",
                 "starting the server",
-                &describe(&error),
+                &secrets.diagnostic(&error),
             )
         })?;
     Ok(child)
@@ -581,18 +596,34 @@ struct Secrets(Vec<String>);
 
 impl Secrets {
     fn from_config(server: &McpServerConfig) -> Self {
-        // Short values are excluded: redacting `1` or `true` from every message
-        // would mangle diagnostics without protecting anything, since a value that
-        // short carries no secret worth hiding.
-        const MIN_REDACTED: usize = 6;
-        Self(
-            server
-                .env
-                .values()
-                .filter(|value| value.len() >= MIN_REDACTED)
-                .cloned()
-                .collect(),
-        )
+        // Every non-empty value, however short. A token is not less of a token for
+        // being three characters long, and a length threshold is precisely the kind
+        // of assumption that leaves the shortest credentials unprotected. Empty
+        // values are skipped because replacing an empty string matches everywhere and
+        // would destroy the diagnostic instead of sanitizing it.
+        let mut values: Vec<String> = server
+            .env
+            .values()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+
+        // Longest first, then lexicographically so the order is total and stable.
+        // Order matters: replacing `abc` before `abc123` would leave `[redacted]123`,
+        // a fragment of a secret that was configured in full.
+        values.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+        values.dedup();
+        Self(values)
+    }
+
+    /// Free-form text from an error, sanitized before anyone can see it.
+    ///
+    /// Every string that reaches a user — a warning, a failure reason, a shutdown
+    /// note — goes through here first. The text can originate from a server, a
+    /// transport, or a child process, and any of them may echo back something they
+    /// were given, including the environment this process handed them.
+    fn diagnostic(&self, error: &dyn StdError) -> String {
+        self.redact(&error.to_string())
     }
 
     fn redact(&self, text: &str) -> String {
@@ -622,11 +653,6 @@ impl Secrets {
             seconds: budget.as_secs(),
         }
     }
-}
-
-/// A failure's own text, for a diagnostic.
-fn describe(error: &dyn StdError) -> String {
-    error.to_string()
 }
 
 /// Turn a rejected declaration into a diagnostic that names the server and the unit
@@ -659,23 +685,31 @@ mod tests {
         ))
     }
 
-    /// The decision that keeps timing out of the fingerprint.
+    /// The decision that keeps everything except an explicit answer out of the
+    /// fingerprint.
     ///
-    /// Only a *correlated JSON-RPC error that is not a modern-era rejection* means
-    /// the peer is legacy. Everything else is a failure, and treating any of it as
-    /// legacy would let latency, an outage, or an authorization problem move a
-    /// dependency from one protocol era to another.
+    /// Only `METHOD_NOT_FOUND` means the peer is legacy: the protocol's own way of
+    /// saying "I do not implement that method". Every other failure is just a
+    /// failure, and treating one as legacy would let a transient error, an outage, or
+    /// an authorization problem re-fingerprint an entire server as another era.
     #[test]
-    fn only_an_explicit_legacy_answer_may_trigger_the_fallback() {
-        // "I do not implement that method" — the signal, and the only one.
+    fn only_method_not_found_is_evidence_of_a_legacy_peer() {
         assert!(is_legacy_signal(&json_rpc(-32601)));
-        assert!(is_legacy_signal(&json_rpc(-32600)));
 
-        // The two codes the protocol reserves for a *modern* peer refusing a request.
+        // The peer saying the request was wrong, or that it is unwell.
+        assert!(!is_legacy_signal(&json_rpc(-32600)));
+        assert!(!is_legacy_signal(&json_rpc(-32602)));
+        assert!(!is_legacy_signal(&json_rpc(-32603)));
+
+        // Explicit modern rejections, and the version error the SDK's retry loop
+        // consumes before classification can happen at all.
         assert!(!is_legacy_signal(&json_rpc(
             ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY.0
         )));
         assert!(!is_legacy_signal(&json_rpc(ErrorCode::HEADER_MISMATCH.0)));
+        assert!(!is_legacy_signal(&json_rpc(
+            ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0
+        )));
 
         // Everything that is not the peer answering a method question at all.
         assert!(!is_legacy_signal(&ClientInitializeError::ConnectionClosed(
@@ -690,6 +724,102 @@ mod tests {
                 received: rmcp::model::NumberOrString::Number(2),
             }
         ));
+        assert!(!is_legacy_signal(&ClientInitializeError::TransportError {
+            // `from_parts` exists precisely for fixtures; the transport error
+            // carries an I/O failure and must not be mistaken for an age signal.
+            error: rmcp::transport::DynamicTransportError::from_parts(
+                "fixture",
+                std::any::TypeId::of::<()>(),
+                Box::new(std::io::Error::other("connection refused")),
+            ),
+            context: "sending the probe".into(),
+        }));
+    }
+
+    /// The stateless candidate list cannot contain the session revision.
+    #[test]
+    fn the_modern_candidates_never_include_the_legacy_revision() {
+        let preferred = preferred_versions();
+
+        assert_eq!(preferred.len(), 1, "one era, one revision: {preferred:?}");
+        assert_eq!(preferred[0], STATELESS_VERSION);
+        assert_ne!(
+            preferred[0], LEGACY_VERSION,
+            "selecting the session revision inside the stateless handshake would record \
+             an era the handshake never used"
+        );
+        assert_eq!(STATELESS_VERSION.as_str(), "2026-07-28");
+        assert_eq!(LEGACY_VERSION.as_str(), "2025-11-25");
+    }
+
+    fn secrets(values: &[(&str, &str)]) -> Secrets {
+        Secrets::from_config(&McpServerConfig {
+            name: "s".to_string(),
+            transport: Transport::Stdio,
+            command: Some("server".to_string()),
+            args: Vec::new(),
+            env: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            url: None,
+        })
+    }
+
+    /// Length is not a property of a secret.
+    #[test]
+    fn a_configured_value_is_redacted_however_short_it_is() {
+        let configured = secrets(&[("TOKEN", "x7p"), ("OTHER", "abc"), ("EMPTY", "")]);
+
+        for text in [
+            "failure for x7p",
+            "handshake failed: abc is invalid",
+            "the server said: x7p",
+        ] {
+            let sanitized = configured.redact(text);
+            assert!(!sanitized.contains("x7p"), "{sanitized}");
+            assert!(!sanitized.contains("abc"), "{sanitized}");
+            assert!(sanitized.contains("[redacted]"), "{sanitized}");
+        }
+
+        // An empty value would match everywhere, so it is not part of the set.
+        assert_eq!(configured.0.len(), 2, "{:?}", configured.0);
+    }
+
+    /// A value that contains another must not leave a fragment behind.
+    #[test]
+    fn overlapping_values_are_replaced_longest_first() {
+        let configured = secrets(&[("SHORT", "abc"), ("LONG", "abc123")]);
+
+        let sanitized = configured.redact("token=abc123");
+        assert_eq!(sanitized, "token=[redacted]");
+        assert!(
+            !sanitized.contains("123"),
+            "a fragment survived: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("abc"),
+            "a fragment survived: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn duplicate_values_are_collapsed() {
+        let configured = secrets(&[("A", "same"), ("B", "same")]);
+        assert_eq!(configured.0.len(), 1, "{:?}", configured.0);
+    }
+
+    /// The single door every free-form string goes through.
+    #[test]
+    fn every_diagnostic_string_is_sanitized_at_the_source() {
+        let configured = secrets(&[("TOKEN", "x7p")]);
+
+        // The shape the previously unredacted warning paths used.
+        let error = std::io::Error::other("the server answered: failure for x7p");
+        let diagnostic = configured.diagnostic(&error);
+
+        assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
+        assert!(!diagnostic.contains("x7p"), "{diagnostic}");
     }
 
     /// The two preferred revisions are named, never taken from the SDK's `LATEST`.
