@@ -67,7 +67,7 @@ right one.
 
 ## Install
 
-### From source (works today)
+### From source
 
 ```bash
 git clone https://github.com/f0rknturkoglu/agentchecksum
@@ -102,16 +102,15 @@ tar -xzf agentchecksum-v0.1.0-aarch64-apple-darwin.tar.gz
 ./agentchecksum-v0.1.0-aarch64-apple-darwin/agentchecksum --version
 ```
 
-### Cargo (not yet available)
+### Cargo
 
 ```bash
 cargo install agentchecksum --locked
 ```
 
-This is the intended package installation path and it **does not work yet**: the crate is not
-published on crates.io, because the account still needs a verified email address before it can publish
-anything. Until that is done, use a prebuilt archive or a source build. The command will start working
-the day `agentchecksum 0.1.0` appears on crates.io, without any change to this section.
+The crate is published: [agentchecksum on crates.io](https://crates.io/crates/agentchecksum). This is
+the slowest of the three methods, because it compiles from source, and the one that needs no
+platform-specific asset.
 
 ## Five-minute quickstart
 

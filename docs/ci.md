@@ -16,8 +16,9 @@ Every command below is verified against the binary's `--help`; `--config`, `--lo
 
 ## Installing the CLI in a job
 
-**Nothing is released yet** — `0.1.0` is not tagged, no GitHub Release exists and the crate is not on
-crates.io — so a job must not assume a download exists. Two options work today.
+`0.1.0` is released, so a job can get the CLI three ways: the composite action below (which prefers a
+prebuilt asset and verifies it), a prebuilt archive downloaded directly, or a build from source when
+the job already has a Rust toolchain.
 
 ### The composite action (recommended)
 

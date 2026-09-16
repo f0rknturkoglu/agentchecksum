@@ -20,9 +20,9 @@ endpoint in `[model]`.
 
 ## Install
 
-**Nothing is released yet.** Version `0.1.0` is in the manifest, but the repository is not tagged, no
-GitHub Release exists, and the crate is not published on crates.io. That has a concrete consequence
-for the commands below, so it is stated plainly rather than implied by a badge:
+`0.1.0` is released: tagged [`v0.1.0`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0),
+with prebuilt archives attached to that release and the crate published to crates.io. Every method
+below works today:
 
 | Method | Available today? |
 |---|---|
@@ -30,11 +30,11 @@ for the commands below, so it is stated plainly rather than implied by a badge:
 | `cargo install --git https://github.com/f0rknturkoglu/agentchecksum` | **Yes** — it builds from the repository |
 | The composite action in this repository (`uses: f0rknturkoglu/agentchecksum@v0.1`) | **Yes** — it uses the release asset for the runner and verifies it against `SHA256SUMS`. See [ci.md](ci.md#the-composite-action-recommended) |
 | Downloading a prebuilt release binary | **Yes** — from [the `v0.1.0` release](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0) |
-| `cargo install agentchecksum` (crates.io) | **No** — the crate is not published yet; the account needs a verified email address before it can publish |
+| `cargo install agentchecksum` (crates.io) | **Yes** — [the crate is published](https://crates.io/crates/agentchecksum) |
 
-Both working methods need a Rust toolchain: the crate declares `rust-version = "1.98"`, and the
-repository pins `1.98.1` in `rust-toolchain.toml`. The build produces one binary and needs no
-runtime, database, or service.
+The two source-based methods need a Rust toolchain: the crate declares `rust-version = "1.98"`, and
+the repository pins `1.98.1` in `rust-toolchain.toml`. The build produces one binary and needs no
+runtime, database, or service. The prebuilt archives need neither — they are the reason they exist.
 
 ```bash
 git clone https://github.com/f0rknturkoglu/agentchecksum
