@@ -198,6 +198,23 @@ fixed owner, no gzip timestamp — so rebuilding the same binary produces the sa
 `SHA256SUMS` means something across a rebuild. A rebuild that produces different bytes is
 therefore a real difference (a different compiler, a different binary, a different input),
 not noise.
+## Exercising the pipeline without publishing
+
+`workflow_dispatch` runs the same builds, archives, smoke tests and artifact uploads, and skips only
+the job that creates the GitHub Release. It is the way to find a broken runner label or a packaging
+mistake before a tag exists:
+
+```bash
+gh workflow run release.yml
+gh run list --workflow release.yml --limit 1
+```
+
+Nothing is published by it: there is no tag to attach a release to, and the publishing job is gated on
+the push event. The `verify-tag` job prints the tag a release would need and exits 0.
+
+This path was exercised before `v0.1.0` was tagged, so the first release is the first time the
+workflow *publishes*, not the first time it runs.
+
 ## After v0.1.0 is out
 
 Deliberately not done before the first release, and worth doing only once there is

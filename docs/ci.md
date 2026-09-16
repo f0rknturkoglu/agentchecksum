@@ -50,9 +50,19 @@ lets the CLI's exit code decide the step's outcome.
 
 Three properties of the action matter when you are deciding whether to trust a step: it never
 reinterprets a verdict, it never swallows an exit code, and it never invents arguments — the CLI's
-exit code *is* the step's outcome, and the action adds no defaults beyond the inputs above. When it
-does use a published asset it verifies the download against the release's `SHA256SUMS`; if a release
-publishes no checksum manifest, it says so with a warning and continues.
+exit code *is* the step's outcome, and the action adds no defaults beyond the inputs above.
+
+A downloaded release binary is **always** checksum-verified before it runs. The release workflow
+publishes a `SHA256SUMS` manifest alongside the archives, so a manifest that cannot be read, one with
+no entry for the selected archive, or a digest that disagrees all mean the same thing: the archive
+cannot be authenticated, nothing is executed, and the step fails with exit `3`. That is a distribution
+failure, not a gate failure, and it is deliberately not a reason to build from source instead — an
+asset that was selected has to be usable, and silently replacing it would hide a broken release.
+
+The source build is the answer to one situation only: **no release asset exists** for the runner's
+platform, which is what makes the action usable before the first release. It installs with
+`cargo install --locked --path <action>`, and on Windows it runs the `agentchecksum.exe` Cargo
+installs there.
 
 ### Building it yourself
 

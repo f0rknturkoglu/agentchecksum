@@ -25,7 +25,9 @@ inputs:
   version:
     description: >-
       Which AgentChecksum to run: `latest` for the newest published release, or a tag
-      such as `v0.1.0`. When no release asset is available for this platform the action
+      such as `v0.1.0`. A downloaded release is verified against the release's
+      SHA256SUMS before it runs; an archive that cannot be authenticated is refused
+      rather than executed. When no release asset exists for this platform the action
       builds the CLI from the source it ships (announced on stderr), so it keeps working
       before the first release and on a mirror without release assets.
     required: false

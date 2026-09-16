@@ -36,9 +36,11 @@ log() { printf '%s\n' "$*" >&2; }
 # ---------------------------------------------------------------------------
 
 case "${RUNNER_OS:-$(uname -s)}" in
-    Linux) platform="unknown-linux-gnu"; archive="tar.gz" ;;
-    macOS) platform="apple-darwin"; archive="tar.gz" ;;
-    Windows) platform="pc-windows-msvc"; archive="zip" ;;
+    Linux) platform="unknown-linux-gnu"; archive="tar.gz"; executable="agentchecksum" ;;
+    macOS) platform="apple-darwin"; archive="tar.gz"; executable="agentchecksum" ;;
+    # Cargo names an installed binary after the host, so a Windows build — from a
+    # release archive or from source — is always `agentchecksum.exe`.
+    Windows) platform="pc-windows-msvc"; archive="zip"; executable="agentchecksum.exe" ;;
     *)
         log "::error::AgentChecksum has no release for this operating system"
         exit 3
@@ -85,26 +87,42 @@ if [ -n "$tag" ]; then
         base="$release_base/download/$tag"
     fi
 
+    # A missing archive means there is no release for this platform yet, which is the
+    # one case where building from source is the right answer. Everything after a
+    # successful download is fatal instead: the asset was chosen, so it has to be
+    # usable, and "usable" starts with "authenticated".
     if curl -fsSL -o "$work/$asset" "$base/$asset" 2>/dev/null; then
-        # The checksum manifest is the release's own statement about its assets, so a
-        # download that does not match it is refused rather than extracted.
-        if curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null; then
-            expected="$(grep " $asset\$" "$work/SHA256SUMS" | awk '{print $1}')"
-            actual="$(cd "$work" && { sha256sum "$asset" 2>/dev/null || shasum -a 256 "$asset"; } | awk '{print $1}')"
-            if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-                log "::error::$asset does not match the checksum the release publishes"
-                exit 3
-            fi
-        else
-            log "::warning::the release publishes no SHA256SUMS; the download was not verified"
+        if ! curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null; then
+            log "::error::$asset was downloaded but the release's SHA256SUMS could not be read, so the archive cannot be verified. AgentChecksum does not run an unverified binary."
+            exit 3
+        fi
+
+        # `awk` rather than `grep | awk`: grep exits 1 when nothing matches, and `set -e`
+        # would turn that into a silent exit 1 with no diagnostic — the one shape a
+        # distribution failure must never take.
+        expected="$(awk -v name="$asset" '$2 == name { print $1 }' "$work/SHA256SUMS")"
+        if [ -z "$expected" ]; then
+            log "::error::the release's SHA256SUMS has no entry for $asset, so the archive cannot be authenticated"
+            exit 3
+        fi
+
+        actual="$(cd "$work" && { sha256sum "$asset" 2>/dev/null || shasum -a 256 "$asset"; } | awk '{print $1}')"
+        if [ "$expected" != "$actual" ]; then
+            log "::error::$asset does not match the checksum the release publishes"
+            exit 3
         fi
 
         case "$archive" in
             tar.gz) tar -xzf "$work/$asset" -C "$work" ;;
             zip) unzip -oq "$work/$asset" -d "$work" ;;
         esac
-        found="$(find "$work" -type f \( -name agentchecksum -o -name agentchecksum.exe \) | head -1)"
-        [ -n "$found" ] && binary="$found"
+
+        found="$(find "$work" -type f -name "$executable" | head -1)"
+        if [ -z "$found" ]; then
+            log "::error::$asset was verified but holds no $executable; the release asset is malformed"
+            exit 3
+        fi
+        binary="$found"
     fi
 fi
 
@@ -115,7 +133,11 @@ if [ -z "$binary" ]; then
         exit 3
     fi
     cargo install --quiet --locked --path "$action_path" --root "$work/installed"
-    binary="$work/installed/bin/agentchecksum"
+    binary="$work/installed/bin/$executable"
+    if [ ! -f "$binary" ]; then
+        log "::error::cargo install finished without installing $binary"
+        exit 3
+    fi
 fi
 
 # ---------------------------------------------------------------------------

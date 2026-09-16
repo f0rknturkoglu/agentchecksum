@@ -273,9 +273,11 @@ jobs:
 If the model cannot be reached from the job, `--diff-only` still gates on the dependency half and
 needs no endpoint at all.
 
-The action is a thin wrapper: it finds a binary (a published release for the platform, or a source
-build when there is no release for it yet), runs your command in your project, prints stdout and
-stderr unchanged, and exits with the CLI's own code. It never reinterprets a verdict.
+The action is a thin wrapper: it finds a binary — a published release for the platform, verified
+against the release's `SHA256SUMS` before it runs, or a source build when there is no release for it
+yet — runs your command in your project, prints stdout and stderr unchanged, and exits with the CLI's
+own code. It never reinterprets a verdict, and an archive that cannot be authenticated is refused
+rather than run.
 
 Exit codes, the `--from` PR-gate variant, and capturing a baseline in a controlled job:
 [docs/ci.md](docs/ci.md).
