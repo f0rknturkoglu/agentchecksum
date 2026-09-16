@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", features = ["json"] }
 # Required by reqwest; the MCP client joins in a later phase.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# JSON Schema validation for probe expectations and tool arguments (spec §10.2).
+# `default-features = false` is load-bearing: the defaults enable `resolve-http` and
+# `resolve-file`, and a validator that can fetch a URL would turn a probe into
+# network access. Internal `#/…` references only.
+jsonschema = { version = "0.56", default-features = false }
 # The official MCP SDK (spec §9). Client only: `default-features = false` drops the
 # server, its macros, and the schema generator, none of which the binary uses.
 # `reqwest` selects the rustls backend — without a TLS feature the Streamable HTTP

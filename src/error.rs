@@ -43,6 +43,15 @@ pub enum Error {
     #[error("unsupported config version {found}; this build supports version {supported}")]
     ConfigVersion { found: u32, supported: u32 },
 
+    #[error("`[policy.metrics.{name}]` does not name a metric this build measures")]
+    PolicyMetricUnknown { name: String, known: String },
+
+    #[error("`[policy.metrics.{metric}]` is not a usable policy: {detail}")]
+    PolicyRange { metric: String, detail: String },
+
+    #[error("{reason}")]
+    InvalidUsage { reason: String },
+
     #[error("dependency identity collision: `{id}` is claimed more than once")]
     DependencyCollision { id: String },
 
@@ -158,6 +167,72 @@ pub enum Error {
         stage: String,
         seconds: u64,
     },
+    #[error("probe file `{path}` could not be read: {reason}")]
+    ProbeParse { path: PathBuf, reason: String },
+
+    #[error("probe `{name}` in `{path}` is not usable: {reason}")]
+    ProbeInvalid {
+        name: String,
+        path: PathBuf,
+        reason: String,
+    },
+
+    #[error("probe `{name}` is declared twice, in `{first}` and `{second}`")]
+    ProbeDuplicate {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+
+    #[error("probe `{probe}` references the tool `{reference}`, which no discovered tool provides")]
+    ProbeToolUnknown { probe: String, reference: String },
+
+    #[error(
+        "probe `{probe}` references the tool `{reference}`, which {matches} discovered tools provide: {candidates}"
+    )]
+    ProbeToolAmbiguous {
+        probe: String,
+        reference: String,
+        matches: usize,
+        candidates: String,
+    },
+
+    #[error("the behavioral runner cannot {what}: {reason}")]
+    RunnerUnsupported { what: String, reason: String },
+
+    #[error("the model request to `{endpoint}` failed: {reason}")]
+    RunnerRequest { endpoint: String, reason: String },
+
+    #[error("the model returned a response this build cannot read: {reason}")]
+    RunnerResponse { reason: String },
+
+    #[error("trace `{path}` is not usable: {reason}")]
+    TraceInvalid { path: PathBuf, reason: String },
+
+    #[error("trace `{path}` uses trace_version {found}, but this build supports {supported}")]
+    TraceVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("the schema in `{path}` asks for something this build cannot do: {reason}")]
+    SchemaUnsupported { path: PathBuf, reason: String },
+
+    #[error("no behavioral baseline exists at `{path}`")]
+    BehaviorBaselineMissing { path: PathBuf },
+
+    #[error(
+        "behavioral baseline `{path}` uses baseline_version {found}, but this build supports {supported}"
+    )]
+    BehaviorBaselineVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("behavioral baseline `{path}` describes a different probe suite than the one loaded")]
+    BehaviorBaselineStale { path: PathBuf },
 }
 
 impl Error {
@@ -178,6 +253,13 @@ impl Error {
             Error::ConfigVersion { .. } => {
                 Some("Upgrade agentchecksum, or set `version` to a supported value.".to_string())
             }
+            Error::InvalidUsage { .. } => Some("Run `agentchecksum --help` for the accepted flags.".to_string()),
+            Error::PolicyMetricUnknown { known, .. } => Some(format!("Metrics this build measures: {known}.")),
+            Error::PolicyRange { .. } => Some(
+                "Scores run from 0.0 to 1.0 and every metric points the same way, where 1.0 is good. \
+                 For a metric you want to keep low, use `max`."
+                    .to_string(),
+            ),
             Error::DependencyCollision { .. } => Some(
                 "Two declarations produced one identity. Rename the configured MCP server alias, or \
                  fix the duplicate declaration — a lockfile that silently kept one of two declared \
@@ -266,6 +348,67 @@ impl Error {
                 "The server did not finish {stage}. Check that it responds to MCP requests, or \
                  point `[[mcp.servers]]` at a server that does."
             )),
+            Error::ProbeParse { .. } => Some(
+                "Fix the file's TOML. Probe parsing is strict: an unknown key is a mistake, not a \
+                 feature to ignore."
+                    .to_string(),
+            ),
+            Error::ProbeInvalid { .. } => Some(
+                "Every probe needs at least one of the five expectation keys; see the design brief."
+                    .to_string(),
+            ),
+            Error::ProbeDuplicate { .. } => Some(
+                "Probe names are the durable identity of a behavioral assertion, so two probes cannot \
+                 share one. Rename one of them."
+                    .to_string(),
+            ),
+            Error::ProbeToolUnknown { .. } => Some(
+                "Check the name against the tool dependencies in `agentchecksum.lock`, or run \
+                 `agentchecksum inspect probes` to see what resolved."
+                    .to_string(),
+            ),
+            Error::ProbeToolAmbiguous { .. } => Some(
+                "Two servers expose a tool with that name, so use the canonical dependency id."
+                    .to_string(),
+            ),
+            Error::RunnerUnsupported { .. } => Some(
+                "The behavioral runner speaks the OpenAI-compatible chat-completions contract only; \
+                 see the design brief for what it can express."
+                    .to_string(),
+            ),
+            Error::RunnerRequest { .. } => Some(
+                "Check that the model endpoint is reachable and that the configured `[model].id` \
+                 exists there. AgentChecksum does not retry: a sample is one request."
+                    .to_string(),
+            ),
+            Error::RunnerResponse { .. } => Some(
+                "The endpoint answered, but not with an OpenAI-compatible chat completion."
+                    .to_string(),
+            ),
+            Error::TraceInvalid { .. } => Some(
+                "Re-record the trace with `agentchecksum check --refresh`.".to_string(),
+            ),
+            Error::TraceVersion { .. } => Some(
+                "Upgrade agentchecksum. A newer trace is never silently reinterpreted.".to_string(),
+            ),
+            Error::SchemaUnsupported { .. } => Some(
+                "AgentChecksum validates self-contained schemas with internal `#/\u{2026}` references \
+                 only; it never resolves a schema over the network."
+                    .to_string(),
+            ),
+            Error::BehaviorBaselineMissing { .. } => Some(
+                "Run `agentchecksum check --accept` after reviewing the current behavior.".to_string(),
+            ),
+            Error::BehaviorBaselineVersion { .. } => Some(
+                "Upgrade agentchecksum, or regenerate the baseline with `agentchecksum check \
+                 --accept`."
+                    .to_string(),
+            ),
+            Error::BehaviorBaselineStale { .. } => Some(
+                "The probes changed, so the recorded scores describe different assertions. Review the \
+                 drift, then accept a new baseline with `agentchecksum check --accept`."
+                    .to_string(),
+            ),
         }
     }
 }

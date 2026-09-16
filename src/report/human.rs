@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::cli::cmd::inspect::InspectProbesOutcome;
 use crate::config::RiskLevel;
-use crate::diff::{ChangeKind, DetailChange, DiffReport, FacetChange};
+use crate::diff::{ChangeKind, DependencyChange, DetailChange, DiffReport, FacetChange};
 use crate::discovery::Discovery;
+use crate::gate::result::drift_reasons;
+use crate::gate::{CheckReport, GateStatus, MetricRow, MetricVerdict, ProbeRow};
 use crate::lockfile::Lockfile;
 use crate::manifest::{DependencyKind, Digest};
+use crate::probes::MetricScore;
 
 /// The `snapshot` summary, in the shape described by the spec.
 pub fn snapshot(lock: &Lockfile, discovery: &Discovery) -> String {
@@ -168,7 +172,24 @@ pub fn diff(report: &DiffReport) -> String {
         return out;
     }
 
-    let count = report.changes.len();
+    out.push_str(&changes_block(&report.changes));
+
+    out.push_str(&format!(
+        "\nOverall behavioral risk: {} (heuristic)\n",
+        risk_label(report.overall_risk)
+    ));
+
+    out
+}
+
+/// The changed dependencies, one block each.
+///
+/// Shared by `diff` and `check` so the two cannot describe the same change differently:
+/// the layout is the part a reader learns once.
+fn changes_block(changes: &[DependencyChange]) -> String {
+    let mut out = String::new();
+
+    let count = changes.len();
     let noun = if count == 1 {
         "dependency"
     } else {
@@ -178,20 +199,18 @@ pub fn diff(report: &DiffReport) -> String {
 
     // Two column widths, computed so the report is read column-wise instead of
     // guessed at line by line.
-    let id_width = report
-        .changes
+    let id_width = changes
         .iter()
         .map(|change| bare_id(&change.id, change.kind).chars().count())
         .max()
         .unwrap_or(0);
-    let kind_width = report
-        .changes
+    let kind_width = changes
         .iter()
         .map(|change| kind_label(change.kind).chars().count())
         .max()
         .unwrap_or(0);
 
-    for change in &report.changes {
+    for change in changes {
         out.push_str(&format!(
             "\n{:<kind_width$}  {:<id_width$}  {}\n",
             kind_label(change.kind),
@@ -220,10 +239,195 @@ pub fn diff(report: &DiffReport) -> String {
         }
     }
 
+    out
+}
+
+/// The `check` report.
+///
+/// The shape follows the design spec §12.3: what the dependencies did, what the probes
+/// measured, why a comparison could not be made, and then the one line a CI log is read
+/// for. `fail_on_drift` is a parameter rather than a report field because it changes the
+/// exit code without changing a single status: the report still has to say *drift*, and
+/// the code is what differs.
+pub fn check(report: &CheckReport, fail_on_drift: bool) -> String {
+    let mut out = String::from("AgentChecksum check\n\n");
+
+    match &report.baseline_checksum {
+        Some(baseline) if baseline != &report.agent_checksum => out.push_str(&format!(
+            "Agent checksum changed: {} → {}\n\n",
+            baseline.as_str(),
+            report.agent_checksum.as_str()
+        )),
+        _ => out.push_str(&format!(
+            "Agent checksum: {}\n\n",
+            report.agent_checksum.as_str()
+        )),
+    }
+
+    if report.dependency.changed {
+        out.push_str(&changes_block(&report.dependency.changes));
+    } else {
+        out.push_str("No dependency changes detected.\n");
+    }
+
+    match &report.behavior {
+        None => out.push_str("\nBehavioral probes: not run.\n"),
+        Some(behavior) => {
+            out.push_str(&format!(
+                "\nBehavioral probes: {} / {} passed\n",
+                behavior.probes_passed, behavior.probes_total
+            ));
+            out.push_str(&metrics_table(&behavior.metrics));
+
+            // The table says *that* a constraint failed; these say by how much, which is
+            // the difference between a report and a verdict.
+            if !behavior.failures.is_empty() {
+                out.push_str("\nPolicy failures:\n");
+                for failure in &behavior.failures {
+                    out.push_str(&format!("  {failure}\n"));
+                }
+            }
+            if !behavior.notes.is_empty() {
+                out.push_str("\nPolicy notes:\n");
+                for note in &behavior.notes {
+                    out.push_str(&format!("  {note}\n"));
+                }
+            }
+
+            if !behavior.yardsticks_changed.is_empty() {
+                out.push_str(&format!(
+                    "\nYardsticks changed: {}\n",
+                    behavior.yardsticks_changed.join(", ")
+                ));
+            }
+
+            let failing: Vec<&ProbeRow> = behavior
+                .probes
+                .iter()
+                .filter(|row| !row.failures.is_empty())
+                .collect();
+            if !failing.is_empty() {
+                out.push_str("\nFailing probes:\n");
+                for row in failing {
+                    out.push_str(&format!(
+                        "  {}  {} / {} passed\n",
+                        row.probe, row.passed, row.total
+                    ));
+                    for failure in &row.failures {
+                        out.push_str(&format!("    {failure}\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    // A gate that did not pass says why it drifted; one that passed has nothing to
+    // explain, and a list of reasons under `PASS` would read as a contradiction.
+    if report.status != GateStatus::Pass {
+        let reasons = drift_reasons(report.behavior.as_ref(), report.dependency.changed);
+        if !reasons.is_empty() {
+            out.push_str("\nDrift reasons:\n");
+            for reason in reasons {
+                out.push_str(&format!("  {}\n", reason.as_str()));
+            }
+        }
+    }
+
     out.push_str(&format!(
-        "\nOverall behavioral risk: {} (heuristic)\n",
-        risk_label(report.overall_risk)
+        "\nBehavior Gate: {:<7} exit {}\n",
+        status_label(report.status),
+        report.exit_code(fail_on_drift)
     ));
+
+    out
+}
+
+/// The metric table: one row per metric, `baseline → current`, and the verdict.
+///
+/// `n/a` is a first-class value in both columns: a metric nothing measured has no
+/// percentage, and showing one would be a claim about behavior nobody observed.
+fn metrics_table(rows: &[MetricRow]) -> String {
+    if rows.is_empty() {
+        return "\n(no metric applied to this run)\n".to_string();
+    }
+
+    let width = rows
+        .iter()
+        .map(|row| row.metric.as_str().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&format!(
+            "{:<width$}  {} → {}  {}\n",
+            row.metric.as_str(),
+            score_text(row.baseline.as_ref()),
+            score_text(row.current.as_ref()),
+            verdict_label(row.verdict),
+        ));
+    }
+    out
+}
+
+/// A score as the table shows it: a whole percentage, or `n/a`.
+fn score_text(score: Option<&MetricScore>) -> String {
+    match score.and_then(MetricScore::score) {
+        Some(score) => format!("{:.0}%", score * 100.0),
+        None => "n/a".to_string(),
+    }
+}
+
+fn verdict_label(verdict: MetricVerdict) -> &'static str {
+    match verdict {
+        MetricVerdict::Pass => "PASS",
+        MetricVerdict::Fail => "FAIL",
+        MetricVerdict::Warn => "WARN",
+        MetricVerdict::NotMeasured => "n/a",
+    }
+}
+
+fn status_label(status: GateStatus) -> &'static str {
+    match status {
+        GateStatus::Pass => "PASS",
+        GateStatus::Drift => "DRIFT",
+        GateStatus::Regression => "FAIL",
+        GateStatus::Error => "ERROR",
+    }
+}
+
+/// The `inspect probes` report.
+pub fn inspect_probes(outcome: &InspectProbesOutcome) -> String {
+    let mut out = String::from("AgentChecksum inspect probes\n\n");
+    out.push_str(&format!(
+        "Suite:  {} probe{}\n",
+        outcome.probes.len(),
+        if outcome.probes.len() == 1 { "" } else { "s" }
+    ));
+    out.push_str(&format!("Digest: {}\n", outcome.suite_digest));
+
+    for probe in &outcome.probes {
+        out.push_str(&format!(
+            "\n{}\n  file     {}\n  repeat   {}\n  digest   {}\n  metrics  {}\n",
+            probe.probe,
+            probe.file,
+            probe.repeat,
+            probe.digest,
+            probe.metrics.join(", ")
+        ));
+
+        if probe.tools.is_empty() {
+            out.push_str("  tools    none\n");
+            continue;
+        }
+        for tool in &probe.tools {
+            out.push_str(&format!(
+                "  tool     {}\n            metrics: {}\n",
+                tool.id,
+                tool.metrics.join(", ")
+            ));
+        }
+    }
 
     out
 }
@@ -231,8 +435,6 @@ pub fn diff(report: &DiffReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `super::diff` is the renderer under test; the engine's comparison needs a
-    // distinct name in this module.
     use crate::diff::diff as compare;
     use crate::manifest::{Dependency, Facet};
     use std::collections::BTreeMap;

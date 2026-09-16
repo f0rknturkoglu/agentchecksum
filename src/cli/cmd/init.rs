@@ -41,6 +41,75 @@ path = "prompts/system.md"
 
 [probes]
 path = "probes"
+# How many times each probe is sampled. A probe whose expectations hold in every
+# sample is more convincing than one that held once, and repeat = 1 turns a
+# measurement into a coin flip.
+# repeat = 3
+
+# The Behavior Gate. Every metric runs from 0.0 to 1.0 and, for every one of them,
+# 1.0 is good — so `min` is a floor and `max` is a ceiling, whichever metric they
+# are attached to. `max_drop` compares against the committed baseline instead of an
+# absolute number, and is only applied when the baseline describes the same probe
+# suite.
+#
+# Metrics: tool_selection, argument_validity, argument_expectation,
+#          forbidden_tool_usage, tool_restraint, structured_output_validity
+#
+# `fail_on_risk` turns the static dependency risk into a gate: without it, a
+# changed dependency is reported and does not fail the check.
+#
+# [policy]
+# fail_on_risk = "critical"
+#
+# [policy.metrics.tool_selection]
+# min = 0.95
+#
+# [policy.metrics.argument_validity]
+# max_drop = 0.05
+#
+# [policy.metrics.forbidden_tool_usage]
+# max = 0.0
+"#;
+
+/// The starter probe, relative to the probe directory.
+const STARTER_PROBE_FILE: &str = "no-tools.toml";
+
+/// One valid probe, so a freshly initialized project can run `check`.
+///
+/// The loader refuses an empty suite, and an empty directory would teach nothing
+/// anyway: this file states the grammar in comments and asserts the one expectation
+/// that needs no tool catalog to be interesting — that the agent does not reach for a
+/// tool when the question does not need one.
+const STARTER_PROBE: &str = r#"# An example probe. Edit it, or replace it with probes about your own agent.
+#
+# A probe asks one question and declares what a correct answer looks like. `check`
+# samples your model through `[model]` and scores what came back.
+#
+# `name` is the durable identity of the assertion — a baseline records it — so renaming
+# a probe retires the score kept under the old name.
+#
+# Every probe carries at least one expectation:
+#
+#   expect_tool    = "search_repositories"    the named tool must be called
+#   expect_args    = { query = { contains = "postgres" } }   requires `expect_tool`;
+#                                              a JSON Pointer to a matcher, where a
+#                                              matcher is exactly one of `equals`,
+#                                              `contains`, `one_of`
+#   forbid_tools   = ["delete_file"]          none of these may be called
+#   expect_no_tool = true                     no tool may be called at all
+#   output_schema  = "schemas/answer.json"    the final message must be JSON that
+#                                              validates against this schema
+#
+# `repeat` is the number of samples. An expectation that held once is a coin flip; one
+# that held in five of five is a measurement. The default is 1.
+
+[[probe]]
+name = "no-tools"
+prompt = """
+Answer from what you already know, without calling any tool: what is the capital of
+Portugal?
+"""
+expect_no_tool = true
 "#;
 
 /// What `init` wrote, so the caller can report it without re-deriving paths.
@@ -50,9 +119,14 @@ pub struct InitOutcome {
     pub config: PathBuf,
     /// The probe directory, resolved against the config's directory.
     pub probes: PathBuf,
+    /// The starter probe this run wrote, when it wrote one.
+    ///
+    /// An existing `probes/no-tools.toml` is left alone: `--force` overwrites the
+    /// configuration, and it must not overwrite a probe somebody has edited.
+    pub starter: Option<PathBuf>,
 }
 
-/// Scaffold the config and the probe directory.
+/// Scaffold the config, the probe directory, and a starter probe.
 pub fn run(root: &Path, config_path: &Path, force: bool) -> Result<InitOutcome> {
     if config_path.exists() && !force {
         return Err(Error::AlreadyExists {
@@ -71,8 +145,20 @@ pub fn run(root: &Path, config_path: &Path, force: bool) -> Result<InitOutcome> 
         source,
     })?;
 
+    let starter = probes.join(STARTER_PROBE_FILE);
+    let starter = if starter.exists() {
+        None
+    } else {
+        std::fs::write(&starter, STARTER_PROBE).map_err(|source| Error::Write {
+            path: starter.clone(),
+            source,
+        })?;
+        Some(starter)
+    };
+
     Ok(InitOutcome {
         config: config_path.to_path_buf(),
         probes,
+        starter,
     })
 }

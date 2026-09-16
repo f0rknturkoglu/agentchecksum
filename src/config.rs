@@ -345,6 +345,56 @@ impl Config {
             }
         }
 
+        self.validate_policy()?;
+
+        Ok(())
+    }
+
+    /// A policy that cannot be applied is a configuration error, not a runtime
+    /// surprise: a typo in a metric name would otherwise silently gate nothing.
+    fn validate_policy(&self) -> Result<()> {
+        for (name, policy) in &self.policy.metrics {
+            // The key is a metric name, matched by the same spelling the report and
+            // the JSON output use.
+            let metric =
+                crate::probes::Metric::known(name).ok_or_else(|| Error::PolicyMetricUnknown {
+                    name: name.clone(),
+                    known: crate::probes::Metric::ALL
+                        .iter()
+                        .map(|metric| metric.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                })?;
+
+            for (field, value) in [
+                ("min", policy.min),
+                ("max", policy.max),
+                ("max_drop", policy.max_drop),
+            ] {
+                let Some(value) = value else { continue };
+                // `nan` and `inf` are valid TOML floats and neither is a usable
+                // threshold: every comparison against them is false, so a policy
+                // carrying one would silently never fire.
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(Error::PolicyRange {
+                        metric: metric.as_str().to_string(),
+                        detail: format!("`{field} = {value}` is outside 0.0..=1.0"),
+                    });
+                }
+            }
+
+            if let (Some(min), Some(max)) = (policy.min, policy.max)
+                && min > max
+            {
+                return Err(Error::PolicyRange {
+                    metric: metric.as_str().to_string(),
+                    detail: format!(
+                        "`min = {min}` is above `max = {max}`, so no score could ever satisfy both"
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -810,5 +860,76 @@ path = "./prompts/system.md"
             config.mcp.servers[0].url.as_deref(),
             Some("http://127.0.0.1:8123/mcp")
         );
+    }
+
+    #[test]
+    fn a_config_rejects_a_policy_for_a_metric_that_does_not_exist() {
+        let text = r#"
+version = 1
+[agent]
+name = "a"
+[policy.metrics.tool_slection]
+min = 0.95
+"#;
+        let error = Config::from_toml_at(text, Path::new("agentchecksum.toml")).unwrap_err();
+        assert!(
+            matches!(error, Error::PolicyMetricUnknown { .. }),
+            "{error:?}"
+        );
+        let suggestion = error.suggestion().unwrap();
+        assert!(suggestion.contains("tool_selection"), "{suggestion}");
+    }
+
+    #[test]
+    fn a_config_rejects_a_threshold_outside_the_score_range() {
+        // `nan` is a valid TOML float and every comparison against it is false, so a
+        // policy carrying one would silently never fire.
+        for bad in ["min = 1.5", "max = -0.1", "max_drop = nan"] {
+            let text = format!(
+                "version = 1\n[agent]\nname = \"a\"\n[policy.metrics.tool_selection]\n{bad}\n"
+            );
+            let error = Config::from_toml_at(&text, Path::new("agentchecksum.toml")).unwrap_err();
+            assert!(
+                matches!(error, Error::PolicyRange { .. }),
+                "{bad}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_rejects_a_policy_no_score_could_satisfy() {
+        let text = r#"
+version = 1
+[agent]
+name = "a"
+[policy.metrics.argument_validity]
+min = 0.9
+max = 0.5
+"#;
+        let error = Config::from_toml_at(text, Path::new("agentchecksum.toml")).unwrap_err();
+        assert!(matches!(error, Error::PolicyRange { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn the_shipped_example_policy_is_valid() {
+        // The documented policy names have to be the ones the config accepts.
+        let text = r#"
+version = 1
+[agent]
+name = "a"
+[policy]
+fail_on_risk = "critical"
+
+[policy.metrics.tool_selection]
+min = 0.95
+
+[policy.metrics.argument_validity]
+max_drop = 0.05
+
+[policy.metrics.forbidden_tool_usage]
+max = 0.0
+"#;
+        let config = Config::from_toml_at(text, Path::new("agentchecksum.toml")).unwrap();
+        assert_eq!(config.policy.metrics.len(), 3);
     }
 }
