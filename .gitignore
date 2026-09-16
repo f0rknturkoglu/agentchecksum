@@ -16,6 +16,10 @@
 # Tooling scratch space (plan ledgers, briefs, review packages). Never committed.
 .superpowers/
 
+# Bytecode from the release helper. It is a build artifact of a script, not source.
+__pycache__/
+*.pyc
+
 # A failed snapshot assertion leaves the candidate here; accepting it is a
 # deliberate `cargo insta accept`, not something to commit by accident.
 **/*.snap.new
