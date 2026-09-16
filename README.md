@@ -3,6 +3,8 @@
 **Know what changed in your agent — and whether it broke.**
 
 [![CI](https://github.com/f0rknturkoglu/agentchecksum/actions/workflows/ci.yml/badge.svg)](https://github.com/f0rknturkoglu/agentchecksum/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/agentchecksum.svg)](https://crates.io/crates/agentchecksum)
+[![GitHub release](https://img.shields.io/github/v/release/f0rknturkoglu/agentchecksum.svg)](https://github.com/f0rknturkoglu/agentchecksum/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 AgentChecksum is a language-agnostic dependency fingerprint and behavioral regression gate for AI
@@ -111,6 +113,18 @@ cargo install agentchecksum --locked
 The crate is published: [agentchecksum on crates.io](https://crates.io/crates/agentchecksum). This is
 the slowest of the three methods, because it compiles from source, and the one that needs no
 platform-specific asset.
+
+### Homebrew (macOS)
+
+```bash
+brew tap f0rknturkoglu/tap
+brew install f0rknturkoglu/tap/agentchecksum
+```
+
+Installs the prebuilt macOS binary — Apple Silicon or Intel — and compiles nothing.
+
+[distribution.md](docs/distribution.md) covers every channel, including `cargo-binstall`, which is
+prepared in the manifest and starts downloading release binaries with the next published version.
 
 ## Five-minute quickstart
 
@@ -271,6 +285,9 @@ jobs:
 
 If the model cannot be reached from the job, `--diff-only` still gates on the dependency half and
 needs no endpoint at all.
+
+`@v0.1` is the moving tag that tracks the 0.1.x Action line, and `v0.1.0` is the immutable product
+release; a consumer that needs an immovable reference should pin the full commit SHA instead.
 
 The action is a thin wrapper: it finds a binary — a published release for the platform, verified
 against the release's `SHA256SUMS` before it runs, or a source build when there is no release for it

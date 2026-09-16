@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Security
+
+# The quality gate in `ci.yml` proves the code does what its tests say. This proves
+# something else: that the crates it is built from have no advisory against them today.
+# A lockfile that was clean when it was written is not clean forever — the advisories move,
+# not the code — which is why this also runs on a schedule.
+#
+# It runs `cargo audit` directly rather than through a wrapper action. The RustSec advisory
+# database is the input, `cargo-audit` is the reader, and both are visible in this file:
+# the version is pinned, so a CI run today and a CI run in a month read the same tool.
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.toml", "Cargo.lock", ".github/workflows/security.yml"]
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", ".github/workflows/security.yml"]
+  schedule:
+    # Mondays, early: the advisory database changes without this repository changing.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: RustSec advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned on purpose. A `cargo install cargo-audit` with no version would read the
+      # same lockfile with whatever the tool looked like that morning, and a red build
+      # would say "an advisory applies" and "the tool changed" in the same way.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # Fails on an applicable advisory. A warning that is deliberately accepted belongs
+      # in an `[advisories] ignore` entry in `.cargo/audit.toml` with a written reason,
+      # not in a `|| true` here.
+      - name: Audit the lockfile
+        run: cargo audit
+
+      # Unmaintained and yanked crates are not exploits, so they are reported beside the
+      # audit rather than failing it — a gate that fails on a warning stops being read.
+      - name: Report unmaintained and yanked dependencies
+        run: cargo audit --deny unmaintained --deny yanked || true

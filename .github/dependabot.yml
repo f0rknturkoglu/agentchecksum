@@ -1,0 +1,39 @@
+# Dependabot keeps two things current: the crates this project builds with, and the
+# GitHub Actions its workflows run. Both are supply-chain inputs, and both move without
+# this repository changing.
+#
+# The `uses:` lines in `.github/workflows` are pinned to full commit SHAs, so Dependabot
+# is the mechanism that moves them — a pinned SHA cannot drift, and only an explicit pull
+# request can update it. Each update rewrites the SHA and the version comment beside it.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # One pull request for the routine part of a dependency bump. A major version still
+    # arrives on its own, because that is the one that needs reading.
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+
+# Not covered here, deliberately:
+#
+# - `rust-toolchain.toml`. Dependabot has no ecosystem for the toolchain pin, so moving
+#   from 1.98.1 to a newer compiler is a manual change: edit the file, run the suite, and
+#   update the `rust-version` in `Cargo.toml` if the floor moves. CI verifies the pin.
+# - The `f0rknturkoglu/homebrew-tap` formula. It is updated by the repository's own
+#   release tooling against the published release, not by Dependabot.

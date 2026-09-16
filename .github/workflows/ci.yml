@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # `rust-toolchain.toml` at the repo root is the single source of truth for
       # the compiler: it selects 1.98.1 with rustfmt and clippy, and any cargo or
