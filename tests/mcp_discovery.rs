@@ -1830,3 +1830,333 @@ fn opaque_tool_metadata_is_one_warning_per_server_and_never_a_fingerprint() {
         "a `_meta` value was fingerprinted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 17. A declaration that reflects the configured environment is refused
+// ---------------------------------------------------------------------------
+
+// A server that hands back a value it was started with is not a server with a
+// malformed catalog: it is a *credential* where a dependency contract should be. The
+// treatment is the third one available and the only safe one — neither a fingerprint
+// (which would commit a digest derived from the credential) nor a redaction (which
+// would commit the rest of a contract the server built the value into), but a
+// refusal.
+//
+// Every test below is one position in the declaration that a configured value can
+// reach. The value is `SHORT_SENTINEL`, the shortest one the suite uses, because a
+// guard that filtered on length would let exactly this through.
+
+/// Every file in the project directory that the test did not write itself.
+///
+/// `agentchecksum.toml` and `spec.json` are the test's own input, and both quote the
+/// configured value on purpose: the spec because the server has to declare it, the
+/// config because the server has to be started with it. Neither is a surface a run can
+/// leak into, so what is left to check is what the run wrote.
+fn written_artifacts(project: &Project) -> Vec<String> {
+    let inputs = ["agentchecksum.toml", "spec.json"];
+    let mut artifacts: Vec<String> = std::fs::read_dir(project.path())
+        .expect("the project directory is readable")
+        .map(|entry| {
+            entry
+                .expect("the directory entry is readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| !inputs.contains(&name.as_str()))
+        .collect();
+    artifacts.sort();
+    artifacts
+}
+
+/// The refusal the reflection guard promises, in the part these tests share: exit 3,
+/// nothing written, and no surface repeating the value.
+///
+/// The message is checked as a *location*. The value is the configured one, so a
+/// diagnostic that quoted what it found would fail here on its own stderr — that is
+/// the property, not an incidental consequence of it.
+fn assert_reflection_refused(project: &Project, output: &std::process::Output) {
+    let diagnostic = stderr(output);
+    assert_eq!(output.status.code(), Some(3), "{diagnostic}");
+    assert!(
+        !project.lock_exists(),
+        "a refused discovery left a lockfile behind"
+    );
+    let written = written_artifacts(project);
+    assert!(written.is_empty(), "a refused discovery wrote {written:?}");
+    assert_secret_absent(project, output, Some(&stdout(output)), SHORT_SENTINEL);
+    assert!(
+        diagnostic.contains("`local` (stdio) failed during"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("exposed a configured environment value in"),
+        "{diagnostic}"
+    );
+}
+
+/// The implementation version is the string a server describes itself with, and a
+/// server started with a credential in its environment is a plausible way for one to
+/// end up there. The refusal names the position, not the value.
+#[test]
+fn a_server_implementation_version_that_reflects_a_configured_value_is_refused() {
+    let project = Project::stdio(
+        json!({
+            "server_info": { "name": "fixture", "version": SHORT_SENTINEL },
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("reading the server identity"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("in the server implementation version"),
+        "{diagnostic}"
+    );
+}
+
+/// A tool name becomes half of a dependency id, so a name that *is* the configured
+/// value would put a credential inside an id. The subject is deliberately generic —
+/// "a tool name" — because one that quoted the name would print the very thing the
+/// check exists to keep out.
+#[test]
+fn a_tool_name_that_reflects_a_configured_value_is_refused_without_naming_the_tool() {
+    let project = Project::stdio(
+        json!({ "tools": [tool(SHORT_SENTINEL)] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("reading the tool catalog"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("in a tool name"), "{diagnostic}");
+    // Neither the name nor the id it would have produced is repeated anywhere.
+    assert!(
+        !diagnostic.contains(SHORT_SENTINEL),
+        "the diagnostic repeated the tool name: {diagnostic}"
+    );
+    assert_secret_absent(
+        &project,
+        &output,
+        Some(&stdout(&output)),
+        &format!("tool:local.{SHORT_SENTINEL}"),
+    );
+}
+
+/// A description becomes a text facet, so the refusal has to precede the digest. The
+/// observable consequence is that no lockfile exists at all, rather than one carrying
+/// a fingerprint derived from the value.
+#[test]
+fn a_tool_description_that_reflects_a_configured_value_is_refused_before_any_digest() {
+    let mut described = tool("search");
+    described["description"] = json!(format!("use {SHORT_SENTINEL} for authentication"));
+    let project = Project::stdio(
+        json!({ "tools": [described] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+    // Past the name check a diagnostic may name the tool — that is the useful half of
+    // the message — and it still names nothing the server carried in it.
+    assert!(
+        stderr(&output).contains("in the description of tool `search`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A schema is committed as a payload, so every string inside it is a position a
+/// credential can reach — not only the keywords the schema walker interprets. This
+/// one sits in a `default`, which nothing in the contract reads.
+#[test]
+fn an_input_schema_string_that_reflects_a_configured_value_is_refused() {
+    let mut declaring = tool("search");
+    declaring["input_schema"]["properties"]["query"]["default"] = json!(SHORT_SENTINEL);
+    let project = Project::stdio(
+        json!({ "tools": [declaring] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+    assert!(
+        stderr(&output).contains("in the input schema of tool `search`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// And the keys, which a JSON payload carries just as visibly as its values. The
+/// subject names the schema and the tool and never the key.
+#[test]
+fn an_input_schema_key_that_reflects_a_configured_value_is_refused_without_repeating_it() {
+    let mut declaring = tool("search");
+    declaring["input_schema"]["properties"][SHORT_SENTINEL] = json!({ "type": "string" });
+    let project = Project::stdio(
+        json!({ "tools": [declaring] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("in the input schema of tool `search`"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains(SHORT_SENTINEL),
+        "the diagnostic repeated the property name: {diagnostic}"
+    );
+}
+
+/// The output schema goes through the same guard as the input one: a server that only
+/// reflected the value outward would still have committed it, and both directions are
+/// schema payloads the lockfile carries.
+#[test]
+fn an_output_schema_that_reflects_a_configured_value_is_refused() {
+    let mut declaring = tool("search");
+    declaring["output_schema"] = json!({ "type": "string", "examples": [SHORT_SENTINEL] });
+    let project = Project::stdio(
+        json!({ "tools": [declaring] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+    assert!(
+        stderr(&output).contains("in the output schema of tool `search`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Instructions are model input, so a digest of them is a fingerprint derived from
+/// whatever they contain. They are normalized while the identity is read — before any
+/// catalog page is fetched, and long before anything is hashed — and that ordering is
+/// the part this test observes: the failure is attributed to the identity stage and
+/// never to the catalog.
+#[test]
+fn instructions_that_reflect_a_configured_value_are_refused_before_the_digest() {
+    let project = Project::stdio(
+        json!({
+            "instructions": format!("Use {SHORT_SENTINEL} when authenticating."),
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_reflection_refused(&project, &output);
+
+    let diagnostic = stderr(&output);
+    assert!(
+        diagnostic.contains("reading the server identity"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("in the server instructions"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("tool catalog"),
+        "the instructions were not refused before the catalog was read: {diagnostic}"
+    );
+}
+
+/// A refusal is not a reason to touch a baseline.
+///
+/// The lockfile here was written by a successful run against a clean spec, and the
+/// only thing that changes is that the server now hands the configured value back.
+/// Both commands that discover the server meet the same refusal, and the bytes on disk
+/// are the ones the successful run wrote.
+#[test]
+fn a_reflection_leaves_an_existing_lockfile_byte_identical() {
+    let project = Project::stdio(
+        json!({ "tools": [tool("search")] }),
+        &[("TOKEN", SHORT_SENTINEL)],
+    );
+    project.committed_baseline();
+    let before = project.lock_bytes();
+
+    project.redeclare(json!({
+        "server_info": { "name": "fixture", "version": SHORT_SENTINEL },
+        "tools": [tool("search")]
+    }));
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(
+        project.lock_bytes(),
+        before,
+        "a refused snapshot rewrote the lockfile"
+    );
+
+    // `diff` re-discovers the same server, so it meets the same refusal. It reports it
+    // the way every other discovery failure is reported — exit 3, the diagnostic on
+    // stderr — and the baseline is still the one the successful run wrote.
+    let report = run(project.path(), &["diff", "--format", "json"]);
+    assert_eq!(report.status.code(), Some(3), "{}", stderr(&report));
+    assert!(
+        stderr(&report).contains("exposed a configured environment value in"),
+        "{}",
+        stderr(&report)
+    );
+    assert_eq!(
+        project.lock_bytes(),
+        before,
+        "a refused diff rewrote the lockfile"
+    );
+    assert_secret_absent(&project, &report, Some(&stdout(&report)), SHORT_SENTINEL);
+}
+
+/// A configured value is not itself a failure: the guard is about a server
+/// *reflecting* one into its declarations. The same catalog discovered with and
+/// without the value configured is the same dependency set and the same aggregate
+/// checksum, which is what keeps this from quietly becoming "an env var is a
+/// refusal".
+#[test]
+fn a_configured_value_no_declaration_carries_is_not_a_failure() {
+    let declared = json!({
+        "server_info": { "name": "fixture", "version": "1.0.0" },
+        "instructions": INSTRUCTIONS,
+        "tools": [tool("search")]
+    });
+    let configured = Project::stdio(declared.clone(), &[("TOKEN", SHORT_SENTINEL)]);
+    let plain = Project::stdio(declared, &[]);
+
+    let output = run(configured.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_secret_absent(&configured, &output, Some(&stdout(&output)), SHORT_SENTINEL);
+
+    // The dependency set is the ordinary one for this catalog: the server and its one
+    // tool, and nothing was skipped or added on account of the environment.
+    let lock = configured.lock();
+    let dependencies = lock["dependencies"]
+        .as_object()
+        .expect("dependencies is an object");
+    let mut ids: Vec<&str> = dependencies.keys().map(String::as_str).collect();
+    ids.sort();
+    assert_eq!(ids, ["mcp:local", "tool:local.search"]);
+
+    plain.committed_baseline();
+    assert_eq!(
+        configured.lock()["agent_checksum"],
+        plain.lock()["agent_checksum"],
+        "configuring an environment value moved the fingerprint"
+    );
+}

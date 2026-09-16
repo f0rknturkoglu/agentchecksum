@@ -201,7 +201,15 @@ server declares produces the same checksum. And because configured environment v
 material, every non-empty one is redacted out of everything you can see — stdout, stderr, warnings,
 errors, tracing, the lockfile — including text a server echoes back. There is no length threshold: a
 three-character token is treated like any other. This is a guarantee about values you configured, not a
-claim to recognize secrets AgentChecksum was never given. When credentials do change the declared contract — a
+claim to recognize secrets AgentChecksum was never given.
+
+The boundary is enforced in the other direction too, because a server is handed its environment and can
+echo it back: if a server reflects a configured value into anything AgentChecksum would fingerprint — its
+own name or version, its instructions, a tool name, a tool description, or any key or string inside a
+schema — discovery **fails** rather than describing it. The declaration is not rewritten and the value is
+not blanked out inside the contract; a fingerprint taken over an edited declaration would describe a
+contract the server never declared. What a server sends in opaque fields AgentChecksum never reads, such
+as tool `_meta`, is not scanned either: unread data cannot reach a fingerprint. When credentials do change the declared contract — a
 narrower set of authorized tools, for example — that is a real dependency change, and it is reported as
 one.
 

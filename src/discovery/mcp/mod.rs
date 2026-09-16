@@ -30,11 +30,13 @@ pub mod limits;
 pub mod normalize;
 
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
+use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::config::Config;
-use crate::error::Result;
+use crate::config::{Config, McpServerConfig};
+use crate::error::{Error, Result};
 use crate::fingerprint::{canonical, normalize as text, schema};
 use crate::manifest::{Dependency, DependencyKind, Digest, Facet};
 
@@ -312,6 +314,89 @@ pub async fn discover(config: &Config) -> Result<(Vec<Dependency>, Vec<String>)>
     }
 
     Ok((discovered_dependencies, warnings))
+}
+
+/// A failure, with the configured environment redacted out of it.
+///
+/// The values in `[mcp.servers.env]` are connection material. They are not
+/// fingerprinted, they are not written anywhere, and they must not be readable in a
+/// diagnostic either — which matters because the text of a failure can come from
+/// the server, and a server is free to echo back whatever it was started with.
+pub(crate) struct Secrets(Vec<String>);
+
+impl Secrets {
+    pub(crate) fn from_config(server: &McpServerConfig) -> Self {
+        // Every non-empty value, however short. A token is not less of a token for
+        // being three characters long, and a length threshold is precisely the kind
+        // of assumption that leaves the shortest credentials unprotected. Empty
+        // values are skipped because replacing an empty string matches everywhere and
+        // would destroy the diagnostic instead of sanitizing it.
+        let mut values: Vec<String> = server
+            .env
+            .values()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+
+        // Longest first, then lexicographically so the order is total and stable.
+        // Order matters: replacing `abc` before `abc123` would leave `[redacted]123`,
+        // a fragment of a secret that was configured in full.
+        values.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+        values.dedup();
+        Self(values)
+    }
+
+    /// Free-form text from an error, sanitized before anyone can see it.
+    ///
+    /// Every string that reaches a user — a warning, a failure reason, a shutdown
+    /// note — goes through here first. The text can originate from a server, a
+    /// transport, or a child process, and any of them may echo back something they
+    /// were given, including the environment this process handed them.
+    pub(crate) fn diagnostic(&self, error: &dyn StdError) -> String {
+        self.redact(&error.to_string())
+    }
+
+    /// Whether a declaration carries a configured environment value.
+    ///
+    /// Substring, like the redaction above: a peer that was handed `abc123` and
+    /// declares `prefix-abc123-suffix` has still echoed it.
+    pub(crate) fn contains_configured_value(&self, text: &str) -> bool {
+        self.0.iter().any(|value| text.contains(value.as_str()))
+    }
+
+    pub(crate) fn redact(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for secret in &self.0 {
+            if redacted.contains(secret.as_str()) {
+                redacted = redacted.replace(secret.as_str(), "[redacted]");
+            }
+        }
+        redacted
+    }
+
+    pub(crate) fn failed(&self, server: &str, transport: &str, stage: &str, reason: &str) -> Error {
+        Error::McpFailed {
+            server: server.to_string(),
+            transport: transport.to_string(),
+            stage: stage.to_string(),
+            reason: self.redact(reason),
+        }
+    }
+
+    pub(crate) fn timeout(
+        &self,
+        server: &str,
+        transport: &str,
+        stage: &str,
+        budget: Duration,
+    ) -> Error {
+        Error::McpTimeout {
+            server: server.to_string(),
+            transport: transport.to_string(),
+            stage: stage.to_string(),
+            seconds: budget.as_secs(),
+        }
+    }
 }
 
 #[cfg(test)]

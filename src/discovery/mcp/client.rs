@@ -12,7 +12,6 @@
 
 use std::error::Error as StdError;
 use std::process::Stdio;
-use std::time::Duration;
 
 use rmcp::model::{
     ClientCapabilities, ClientConfig, ErrorCode, Implementation, MetaObject,
@@ -32,7 +31,7 @@ use crate::error::{Error, Result};
 
 use super::limits;
 use super::normalize::{self, Rejected};
-use super::{DiscoveredServer, DiscoveredTool};
+use super::{DiscoveredServer, DiscoveredTool, Secrets};
 
 /// The revision the stateless lifecycle speaks.
 ///
@@ -305,7 +304,7 @@ async fn introspect(
         .await;
 
     let instructions =
-        normalize::instructions(peer.instructions.as_deref()).map_err(|rejected| {
+        normalize::instructions(peer.instructions.as_deref(), secrets).map_err(|rejected| {
             as_diagnostic(
                 alias,
                 transport,
@@ -320,6 +319,7 @@ async fn introspect(
         &peer.capabilities,
         peer.server_info.as_ref(),
         supported_versions.as_deref(),
+        secrets,
     )
     .map_err(|rejected| {
         as_diagnostic(
@@ -453,7 +453,7 @@ async fn list_tools(
             })?;
 
         for declared in &page.tools {
-            let tool = normalize::tool(declared).map_err(|rejected| {
+            let tool = normalize::tool(declared, secrets).map_err(|rejected| {
                 as_diagnostic(
                     alias,
                     transport,
@@ -586,75 +586,6 @@ fn http_transport(
     Ok(StreamableHttpClientTransport::from_uri(url))
 }
 
-/// A failure, with the configured environment redacted out of it.
-///
-/// The values in `[mcp.servers.env]` are connection material. They are not
-/// fingerprinted, they are not written anywhere, and they must not be readable in a
-/// diagnostic either — which matters because the text of a failure can come from
-/// the server, and a server is free to echo back whatever it was started with.
-struct Secrets(Vec<String>);
-
-impl Secrets {
-    fn from_config(server: &McpServerConfig) -> Self {
-        // Every non-empty value, however short. A token is not less of a token for
-        // being three characters long, and a length threshold is precisely the kind
-        // of assumption that leaves the shortest credentials unprotected. Empty
-        // values are skipped because replacing an empty string matches everywhere and
-        // would destroy the diagnostic instead of sanitizing it.
-        let mut values: Vec<String> = server
-            .env
-            .values()
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .collect();
-
-        // Longest first, then lexicographically so the order is total and stable.
-        // Order matters: replacing `abc` before `abc123` would leave `[redacted]123`,
-        // a fragment of a secret that was configured in full.
-        values.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
-        values.dedup();
-        Self(values)
-    }
-
-    /// Free-form text from an error, sanitized before anyone can see it.
-    ///
-    /// Every string that reaches a user — a warning, a failure reason, a shutdown
-    /// note — goes through here first. The text can originate from a server, a
-    /// transport, or a child process, and any of them may echo back something they
-    /// were given, including the environment this process handed them.
-    fn diagnostic(&self, error: &dyn StdError) -> String {
-        self.redact(&error.to_string())
-    }
-
-    fn redact(&self, text: &str) -> String {
-        let mut redacted = text.to_string();
-        for secret in &self.0 {
-            if redacted.contains(secret.as_str()) {
-                redacted = redacted.replace(secret.as_str(), "[redacted]");
-            }
-        }
-        redacted
-    }
-
-    fn failed(&self, server: &str, transport: &str, stage: &str, reason: &str) -> Error {
-        Error::McpFailed {
-            server: server.to_string(),
-            transport: transport.to_string(),
-            stage: stage.to_string(),
-            reason: self.redact(reason),
-        }
-    }
-
-    fn timeout(&self, server: &str, transport: &str, stage: &str, budget: Duration) -> Error {
-        Error::McpTimeout {
-            server: server.to_string(),
-            transport: transport.to_string(),
-            stage: stage.to_string(),
-            seconds: budget.as_secs(),
-        }
-    }
-}
-
 /// Turn a rejected declaration into a diagnostic that names the server and the unit
 /// that failed.
 fn as_diagnostic(
@@ -664,12 +595,15 @@ fn as_diagnostic(
     rejected: &Rejected,
     secrets: &Secrets,
 ) -> Error {
-    secrets.failed(
-        server,
-        transport,
-        stage,
-        &format!("{}: {}", rejected.subject, rejected.reason),
-    )
+    // A reflected credential is not a malformed declaration: it is connection
+    // material where a contract should be, and the message says exactly that while
+    // naming only the location.
+    let reason = if rejected.reflection {
+        format!("it {} in {}", rejected.reason, rejected.subject)
+    } else {
+        format!("{}: {}", rejected.subject, rejected.reason)
+    };
+    secrets.failed(server, transport, stage, &reason)
 }
 
 #[cfg(test)]

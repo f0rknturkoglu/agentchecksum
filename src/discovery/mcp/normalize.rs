@@ -14,7 +14,7 @@ use rmcp::model::{
 use serde_json::Value;
 
 use super::limits;
-use super::{DiscoveredTool, Era, Identity, ServerInfo};
+use super::{DiscoveredTool, Era, Identity, Secrets, ServerInfo};
 
 /// Why a declaration could not become a dependency.
 ///
@@ -24,6 +24,12 @@ use super::{DiscoveredTool, Era, Identity, ServerInfo};
 pub struct Rejected {
     pub subject: String,
     pub reason: String,
+    /// Whether the declaration exposed a configured environment value.
+    ///
+    /// The caller turns this into a different diagnostic: a reflection is not a
+    /// malformed declaration, it is a *credential* appearing where a contract should
+    /// be, and the message must say so without repeating anything it carried.
+    pub reflection: bool,
 }
 
 impl Rejected {
@@ -31,8 +37,75 @@ impl Rejected {
         Self {
             subject: subject.to_string(),
             reason: reason.into(),
+            reflection: false,
         }
     }
+
+    /// A declaration that carries a configured environment value.
+    ///
+    /// `subject` names *where* it appeared — "the server implementation version",
+    /// "a tool name" — and never what appeared, so the diagnostic can be read by
+    /// someone who should not see the credential either.
+    fn reflected(subject: &str) -> Self {
+        Self {
+            subject: subject.to_string(),
+            reason: "exposed a configured environment value".to_string(),
+            reflection: true,
+        }
+    }
+}
+
+/// Whether a declaration carries a configured environment value.
+///
+/// Lexical and semantic-free: a substring, because the policy is the same one
+/// redaction follows, and a peer handed `abc123` that declares `prefix-abc123` has
+/// still echoed it.
+fn check_text(secrets: &Secrets, text: &str, subject: &str) -> std::result::Result<(), Rejected> {
+    if secrets.contains_configured_value(text) {
+        return Err(Rejected::reflected(subject));
+    }
+    Ok(())
+}
+
+/// Whether any key or string value in a JSON document carries one.
+///
+/// Recursive because unknown schema keywords are deliberately preserved, so any
+/// position can end up in a committed payload. Bounded by the schema depth bound the
+/// caller already enforced — and, like the schema walker, it follows no `$ref` and
+/// interprets nothing: this is a lexical scan, not a schema operation.
+fn check_json(
+    secrets: &Secrets,
+    value: &Value,
+    subject: &str,
+    depth: usize,
+) -> std::result::Result<(), Rejected> {
+    if depth > limits::MAX_SCHEMA_DEPTH {
+        return Ok(());
+    }
+
+    match value {
+        Value::String(text) => check_text(secrets, text, subject),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_json(secrets, item, subject, depth + 1)),
+        Value::Object(map) => map.iter().try_for_each(|(key, value)| {
+            check_text(secrets, key, subject)?;
+            check_json(secrets, value, subject, depth + 1)
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The extension and experimental identifiers a server capability set retains.
+fn capability_identifiers(capabilities: &ServerCapabilities) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    if let Some(extensions) = &capabilities.extensions {
+        identifiers.extend(identifiers_of(extensions));
+    }
+    if let Some(experimental) = &capabilities.experimental {
+        identifiers.extend(identifiers_of(experimental));
+    }
+    identifiers
 }
 
 /// Which protocol family a negotiated version belongs to.
@@ -49,13 +122,20 @@ pub fn era(version: &ProtocolVersion) -> Era {
 }
 
 /// What a server declared about itself, reduced to the behavior-relevant part.
-pub fn identity(
+pub(crate) fn identity(
     protocol_version: &ProtocolVersion,
     capabilities: &ServerCapabilities,
     server_info: Option<&Implementation>,
     supported_versions: Option<&[ProtocolVersion]>,
+    secrets: &Secrets,
 ) -> std::result::Result<(Identity, Vec<String>), Rejected> {
     let mut warnings = Vec::new();
+
+    // A capability identifier we retain is part of the contract, so it is checked
+    // like any other declaration. The settings beside it are not read at all.
+    for identifier in capability_identifiers(capabilities) {
+        check_text(secrets, &identifier, "a server capability identifier")?;
+    }
 
     let server_info = match server_info {
         Some(info) => {
@@ -69,6 +149,10 @@ pub fn identity(
                 &info.version,
                 limits::MAX_TEXT_BYTES,
             )?;
+            // The implementation describes itself with whatever it was started with,
+            // so this is a plausible place for a credential to surface.
+            check_text(secrets, &info.name, "the server implementation name")?;
+            check_text(secrets, &info.version, "the server implementation version")?;
             // Title, icons, website, and description are presentation. They cannot
             // change how a tool behaves, so a cosmetic edit must not read as a
             // dependency change.
@@ -203,7 +287,10 @@ fn identifiers_of<V>(map: &std::collections::BTreeMap<String, V>) -> Vec<String>
 /// `_meta` is extension space an agent's behavior does not depend on. The
 /// invocation contract is the name, the description, the schemas, and the effective
 /// behavior hints.
-pub fn tool(tool: &McpTool) -> std::result::Result<DiscoveredTool, Rejected> {
+pub(crate) fn tool(
+    tool: &McpTool,
+    secrets: &Secrets,
+) -> std::result::Result<DiscoveredTool, Rejected> {
     let name = tool.name.as_ref();
     if name.trim().is_empty() {
         return Err(Rejected::new(
@@ -212,15 +299,41 @@ pub fn tool(tool: &McpTool) -> std::result::Result<DiscoveredTool, Rejected> {
         ));
     }
     check_bytes("tool name", name, limits::MAX_TOOL_NAME_BYTES)?;
+    // The name becomes half of a dependency id, so it is checked before anything
+    // else *and* named generically in the diagnostic: a subject that quoted it would
+    // print the credential the check exists to keep out.
+    check_text(secrets, name, "a tool name")?;
 
+    // Past this point the name is known clean, so naming the tool in a diagnostic is
+    // safe and useful.
+    let described_as = format!("the description of tool `{name}`");
     let description = tool.description.as_ref().map(|text| text.as_ref());
     if let Some(description) = description {
         check_bytes("tool description", description, limits::MAX_TEXT_BYTES)?;
+        check_text(secrets, description, &described_as)?;
     }
 
     let input_schema = schema_value("input_schema", tool.input_schema.as_ref())?;
+    // Schemas are committed as payloads, so every key and string value is scanned
+    // rather than the few keywords that happen to be interpreted.
+    check_json(
+        secrets,
+        &input_schema,
+        &format!("the input schema of tool `{name}`"),
+        0,
+    )?;
+
     let output_schema = match tool.output_schema.as_ref() {
-        Some(schema) => Some(schema_value("output_schema", schema.as_ref())?),
+        Some(schema) => {
+            let value = schema_value("output_schema", schema.as_ref())?;
+            check_json(
+                secrets,
+                &value,
+                &format!("the output schema of tool `{name}`"),
+                0,
+            )?;
+            Some(value)
+        }
         None => None,
     };
 
@@ -240,11 +353,17 @@ pub fn tool(tool: &McpTool) -> std::result::Result<DiscoveredTool, Rejected> {
 ///
 /// Returned as text because the caller turns them into a facet: hashes are what
 /// reach the lockfile, and the prose does not.
-pub fn instructions(instructions: Option<&str>) -> std::result::Result<Option<String>, Rejected> {
+pub(crate) fn instructions(
+    instructions: Option<&str>,
+    secrets: &Secrets,
+) -> std::result::Result<Option<String>, Rejected> {
     let Some(instructions) = instructions else {
         return Ok(None);
     };
     check_bytes("server instructions", instructions, limits::MAX_TEXT_BYTES)?;
+    // Before it is hashed: instructions are model input, so a digest of them would
+    // commit a fingerprint derived from a credential.
+    check_text(secrets, instructions, "the server instructions")?;
     Ok(Some(instructions.to_string()))
 }
 
@@ -363,6 +482,167 @@ fn check_bytes(subject: &str, value: &str, limit: usize) -> std::result::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A server with nothing configured: the reflection guard has nothing to find.
+    fn no_secrets() -> Secrets {
+        configured_secrets(&[])
+    }
+
+    fn configured_secrets(values: &[(&str, &str)]) -> Secrets {
+        Secrets::from_config(&crate::config::McpServerConfig {
+            name: "s".to_string(),
+            transport: crate::config::Transport::Stdio,
+            command: Some("server".to_string()),
+            args: Vec::new(),
+            env: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            url: None,
+        })
+    }
+
+    fn schema_of(value: serde_json::Value) -> McpTool {
+        let schema: serde_json::Map<String, Value> =
+            serde_json::from_value(value).expect("object schema");
+        let mut tool = McpTool::new("search".to_string(), "Search.".to_string(), schema);
+        tool.annotations = None;
+        tool
+    }
+
+    /// Every surface that can reach a fingerprint is guarded.
+    #[test]
+    fn a_declaration_that_repeats_a_configured_value_is_refused() {
+        let secrets = configured_secrets(&[("TOKEN", "x7p")]);
+        let default_caps = ServerCapabilities::default();
+
+        // Server implementation identity.
+        let mut implementation = Implementation::new("fixture", "x7p");
+        assert!(
+            identity(
+                &ProtocolVersion::V_2026_07_28,
+                &default_caps,
+                Some(&implementation),
+                None,
+                &secrets,
+            )
+            .unwrap_err()
+            .reflection
+        );
+        implementation.version = "1.0.0".to_string();
+        implementation.name = "contains-x7p-here".to_string();
+        assert!(
+            identity(
+                &ProtocolVersion::V_2026_07_28,
+                &default_caps,
+                Some(&implementation),
+                None,
+                &secrets,
+            )
+            .unwrap_err()
+            .reflection
+        );
+
+        // Instructions, before they are hashed.
+        assert!(
+            instructions(Some("Use x7p when authenticating."), &secrets)
+                .unwrap_err()
+                .reflection
+        );
+
+        // A tool name: the id would have been `tool:local.x7p`.
+        assert!(
+            tool(&tool_with("x7p", None), &secrets)
+                .unwrap_err()
+                .reflection
+        );
+
+        // A description, before it becomes a digest.
+        let mut described = tool_with("search", None);
+        described.description = Some("Call with token x7p".into());
+        assert!(tool(&described, &secrets).unwrap_err().reflection);
+
+        // Schemas: a string value, an object key, and an output schema.
+        assert!(
+            tool(
+                &schema_of(serde_json::json!({
+                    "type": "object",
+                    "properties": { "token": { "type": "string", "default": "x7p" } }
+                })),
+                &secrets
+            )
+            .unwrap_err()
+            .reflection
+        );
+        assert!(
+            tool(
+                &schema_of(serde_json::json!({
+                    "type": "object",
+                    "properties": { "x7p": { "type": "string" } }
+                })),
+                &secrets
+            )
+            .unwrap_err()
+            .reflection
+        );
+        let mut with_output = schema_of(serde_json::json!({ "type": "object" }));
+        with_output.output_schema = Some(std::sync::Arc::new(
+            serde_json::from_value(serde_json::json!({ "type": "string", "examples": ["x7p"] }))
+                .expect("object schema"),
+        ));
+        assert!(tool(&with_output, &secrets).unwrap_err().reflection);
+
+        // A capability identifier that AgentChecksum retains.
+        let mut capabilities = ServerCapabilities::default();
+        capabilities.extensions = Some(std::collections::BTreeMap::from([(
+            "x7p".to_string(),
+            serde_json::Map::new(),
+        )]));
+        assert!(
+            identity(
+                &ProtocolVersion::V_2026_07_28,
+                &capabilities,
+                None,
+                None,
+                &secrets,
+            )
+            .unwrap_err()
+            .reflection
+        );
+    }
+
+    /// The diagnostic names a location, never what it found there.
+    #[test]
+    fn a_reflection_is_reported_without_repeating_anything_it_carried() {
+        let secrets = configured_secrets(&[("TOKEN", "x7p")]);
+
+        for rejected in [
+            tool(&tool_with("x7p", None), &secrets).unwrap_err(),
+            tool(
+                &schema_of(serde_json::json!({ "x7p": { "type": "string" } })),
+                &secrets,
+            )
+            .unwrap_err(),
+        ] {
+            assert!(rejected.reflection);
+            let text = format!("{} {}", rejected.subject, rejected.reason);
+            assert!(!text.contains("x7p"), "{text}");
+            assert!(!text.contains("TOKEN"), "{text}");
+        }
+    }
+
+    /// A configured value that stays out of the declarations changes nothing.
+    #[test]
+    fn a_configured_value_that_is_not_reflected_leaves_the_contract_alone() {
+        let untouched = tool(&tool_with("search", None), &no_secrets()).unwrap();
+        let guarded = tool(
+            &tool_with("search", None),
+            &configured_secrets(&[("TOKEN", "x7p")]),
+        )
+        .unwrap();
+
+        assert_eq!(untouched, guarded);
+    }
+
     fn tool_with(name: &str, annotations: Option<ToolAnnotations>) -> McpTool {
         let schema: serde_json::Map<String, Value> =
             serde_json::from_value(serde_json::json!({ "type": "object" })).expect("object schema");
@@ -447,7 +727,7 @@ mod tests {
     fn a_tool_name_that_is_only_whitespace_is_rejected() {
         // An identity that cannot be told apart from another identity is not an
         // identity.
-        let error = tool(&tool_with("   ", None)).unwrap_err();
+        let error = tool(&tool_with("   ", None), &no_secrets()).unwrap_err();
         assert_eq!(error.subject, "tool name");
     }
 
@@ -455,13 +735,18 @@ mod tests {
     fn an_oversized_name_or_description_is_rejected_rather_than_cut() {
         let long_name = "n".repeat(limits::MAX_TOOL_NAME_BYTES + 1);
         assert_eq!(
-            tool(&tool_with(&long_name, None)).unwrap_err().subject,
+            tool(&tool_with(&long_name, None), &no_secrets())
+                .unwrap_err()
+                .subject,
             "tool name"
         );
 
         let mut oversized = tool_with("t", None);
         oversized.description = Some("d".repeat(limits::MAX_TEXT_BYTES + 1).into());
-        assert_eq!(tool(&oversized).unwrap_err().subject, "tool description");
+        assert_eq!(
+            tool(&oversized, &no_secrets()).unwrap_err().subject,
+            "tool description"
+        );
     }
 
     #[test]
@@ -473,27 +758,33 @@ mod tests {
         let mut deep_tool = tool_with("t", None);
         deep_tool.input_schema =
             std::sync::Arc::new(serde_json::from_value(deep).expect("object schema"));
-        assert_eq!(tool(&deep_tool).unwrap_err().subject, "input_schema");
+        assert_eq!(
+            tool(&deep_tool, &no_secrets()).unwrap_err().subject,
+            "input_schema"
+        );
 
         let mut wide = serde_json::json!({ "type": "object" });
         wide["description"] = Value::String("x".repeat(limits::MAX_SCHEMA_BYTES));
         let mut wide_tool = tool_with("t", None);
         wide_tool.input_schema =
             std::sync::Arc::new(serde_json::from_value(wide).expect("object schema"));
-        assert_eq!(tool(&wide_tool).unwrap_err().subject, "input_schema");
+        assert_eq!(
+            tool(&wide_tool, &no_secrets()).unwrap_err().subject,
+            "input_schema"
+        );
     }
 
     #[test]
     fn display_only_metadata_is_not_part_of_the_contract() {
         // A title, an icon, and a `_meta` blob are all server presentation. Two
         // tools that differ only there are the same dependency contract.
-        let plain = tool(&tool_with("t", None)).unwrap();
+        let plain = tool(&tool_with("t", None), &no_secrets()).unwrap();
 
         let mut wire = tool_with("t", None);
         wire.title = Some("A prettier name".to_string());
         wire.icons = Some(vec![]);
         wire.meta = Some(rmcp::model::MetaObject::default());
-        let decorated = tool(&wire).unwrap();
+        let decorated = tool(&wire, &no_secrets()).unwrap();
 
         assert_eq!(plain.name, decorated.name);
         assert_eq!(plain.description, decorated.description);
@@ -520,7 +811,7 @@ mod tests {
         );
         wire.meta = Some(meta);
 
-        let normalized = tool(&wire).unwrap();
+        let normalized = tool(&wire, &no_secrets()).unwrap();
         assert!(normalized.opaque_metadata);
         let debugged = format!("{normalized:?}");
         assert!(
@@ -532,14 +823,14 @@ mod tests {
 
     #[test]
     fn server_instructions_are_bounded_and_kept_as_text() {
-        assert_eq!(instructions(None).unwrap(), None);
+        assert_eq!(instructions(None, &no_secrets()).unwrap(), None);
         assert_eq!(
-            instructions(Some("Prefer read-only tools.")).unwrap(),
+            instructions(Some("Prefer read-only tools."), &no_secrets()).unwrap(),
             Some("Prefer read-only tools.".to_string())
         );
 
         let oversized = "x".repeat(limits::MAX_TEXT_BYTES + 1);
-        let rejected = instructions(Some(&oversized)).unwrap_err();
+        let rejected = instructions(Some(&oversized), &no_secrets()).unwrap_err();
         assert_eq!(rejected.subject, "server instructions");
     }
 
@@ -554,6 +845,7 @@ mod tests {
             &ServerCapabilities::default(),
             Some(&implementation),
             None,
+            &no_secrets(),
         )
         .unwrap();
 
@@ -583,6 +875,7 @@ mod tests {
                 ProtocolVersion::V_2025_11_25,
                 ProtocolVersion::V_2026_07_28,
             ]),
+            &no_secrets(),
         )
         .unwrap();
 
@@ -599,6 +892,7 @@ mod tests {
             &ServerCapabilities::default(),
             None,
             None,
+            &no_secrets(),
         )
         .unwrap();
 

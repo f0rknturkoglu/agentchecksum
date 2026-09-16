@@ -958,6 +958,29 @@ The guarantee is deliberately a statement about **configured** values only. Agen
 secret it was never given, and it does not try to guess: the contract is that the connection material this
 process received is the connection material it never repeats.
 
+**A server that declares a configured value is refused, not redacted.** A child process is handed its
+environment and can print any of it back into its own declarations — an implementation version, the server
+instructions, a tool name, a tool description, or any key or string inside a schema. Those declarations are
+what becomes the fingerprint, so a credential arriving through one of them would be committed: hashed into
+a facet digest, baked into a dependency id, written into the lockfile.
+
+Discovery therefore checks every declaration it consumes against the configured values, before anything is
+hashed, and refuses the server when one appears. The declaration is *not* rewritten and the value is *not*
+replaced with `[redacted]` in place: a digest taken over an edited declaration would fingerprint a contract
+the server never declared, which is worse than refusing to describe it. Hash-then-reject is equally
+excluded — nothing derived from the value may exist, even transiently, in a payload that is about to be
+written.
+
+The check is lexical (a substring, the same rule redaction follows), semantic-free (no `$ref` is followed,
+no schema keyword is interpreted), and bounded by the same schema limits as normalization. The diagnostic
+names only the location — "the server implementation version", "a tool name", "the input schema of tool
+`search`" — and never the value, the environment key, or a declaration fragment containing either. A tool
+whose *name* carries the value is reported as "a tool name" rather than quoted.
+
+Data AgentChecksum deliberately never consumes stays unread: tool `_meta` values are neither fingerprinted
+nor scanned, because reading them for any purpose would widen the trust surface for a value that cannot
+reach a contract. The rule covers what becomes a dependency, and nothing else.
+
 Every free-form string in the MCP module goes through one sanitizing function before it is exposed — a
 failure reason, a warning about the session, the note that optional discovery metadata was unavailable, a
 shutdown complaint. The text can originate from a server, a transport, or a child process, and any of them
