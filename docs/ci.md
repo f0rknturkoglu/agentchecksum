@@ -76,9 +76,11 @@ and a few minutes of build time:
 - run: cargo install --locked --git https://github.com/f0rknturkoglu/agentchecksum
 ```
 
-`cargo install agentchecksum` (crates.io) does **not** work yet, and no prebuilt binary can be
-downloaded until the first tagged release. Both start working at that point; neither is a method to
-plan around today.
+Both of those work now: `cargo install agentchecksum --locked` pulls the published crate, and a
+prebuilt archive for the runner's platform can be downloaded from
+[the release](https://github.com/f0rknturkoglu/agentchecksum/releases/latest) instead of built. The
+reasons to prefer one over the other, and the other channels, are in
+[distribution.md](distribution.md).
 
 ## A dependency-only gate
 

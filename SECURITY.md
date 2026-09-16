@@ -39,10 +39,10 @@ the newest release; older minors do not receive backports.
 | Any earlier `v0.x` release | no |
 | `main` (untagged) | best effort — the code is in flux and is not a release |
 
-At the time of writing, `0.1.0` is the version in `Cargo.toml` but it has **not been tagged or
-released**, and no crate is published. Support therefore begins with the first tagged release; until
-then the only thing to report against is `main` or a local build, and reports against either are
-still welcome.
+`0.1.0` is released: tagged [`v0.1.0`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0),
+published on [crates.io](https://crates.io/crates/agentchecksum), and built for four targets. That
+release is the current supported version, and it is what a report should name. Reports against `main`
+or a local build are still welcome — they are just not covered by a support promise.
 
 ## What counts as a vulnerability
 
@@ -94,7 +94,17 @@ Stated so nobody has to discover it the hard way:
 ## Supported platforms
 
 AgentChecksum is a Rust CLI with no runtime dependency, and the pinned compiler is `1.98.1` (see
-`rust-toolchain.toml`). The test suite runs in CI on Linux x86_64; release archives are built and
-smoke-tested on native runners for macOS (Apple Silicon and Intel), Linux x86_64 and Windows x86_64 —
-and that packaging begins at the first tagged release. Reports about any platform are welcome, whether
-or not it is in that list.
+`rust-toolchain.toml`). The test suite runs in CI on Linux x86_64. Release archives are built and
+smoke-tested on native runners for these four targets, and they are published for every release:
+
+```text
+aarch64-apple-darwin        macOS, Apple Silicon
+x86_64-apple-darwin         macOS, Intel
+x86_64-unknown-linux-gnu    Linux, x86_64
+x86_64-pc-windows-msvc      Windows, x86_64
+```
+
+Source builds work anywhere the compiler does, and a distribution channel that carries the binary —
+[Homebrew](docs/distribution.md#homebrew), [cargo-binstall](docs/distribution.md#cargo-binstall) —
+covers a subset of those targets rather than a different set. Reports about any platform are welcome,
+whether or not it is in the list.

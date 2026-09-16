@@ -115,8 +115,9 @@ See [docs/security.md](docs/security.md) for the full trust model.
 Stated rather than discovered: no LLM judge, no regex matchers, no tool-result or multi-turn
 evaluation, no authentication for remote endpoints, trace *capture* is not bit-reproducible (trace
 *evaluation* is), and `inspect` is limited to `probes` — the dependency and MCP views the subcommand
-describes belong to a later phase. Prebuilt release binaries, a published crate and the composite
-action's download path all begin at the first tagged release.
+describes belong to a later phase. Prebuilt release binaries, the published crate and the
+composite action's download path all date from the first tagged release; there is no earlier state
+to install.
 
 [Unreleased]: https://github.com/f0rknturkoglu/agentchecksum/commits/main
 [0.1.0]: https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0
