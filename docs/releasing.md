@@ -233,9 +233,16 @@ Deliberately not done before the first release, and worth doing only once there 
 something to point at:
 
 - **The moving Action tag.** `uses: f0rknturkoglu/agentchecksum@v0.1` tracks the `v0.1.x`
-  line, so a consumer gets fixes without editing their workflow. Move it on every `v0.1.*`
-  tag — never on a major one, and never `v0.1.0`, which is immutable. `v0.1` was created at
-  the first release and points at the same commit.
+  line, so a consumer gets fixes without editing their workflow. Move it whenever the
+  tagged action changes — a new `v0.1.*` release, or a correction to `action.yml` itself,
+  which consumers pinning `@v0.1` need just as much as a fix in `scripts/`. Never move a
+  major tag backwards, and never touch `v0.1.0`, which is immutable.
+
+  It has moved once so far: from the `v0.1.0` commit to the commit that brought the action
+  description inside GitHub Marketplace's 125-character limit. Publish the Marketplace
+  listing from a release on `v0.1`, not on `v0.1.0`: the Marketplace reads `action.yml` at
+  the tag being released, and `v0.1.0` still carries the description it was validated
+  with.
 - **A crates.io publication.** The crate packages and installs cleanly today
   (`cargo install --path` from the packaged directory was verified against a temporary
   root), so publishing is a `cargo publish --locked` and a documented install line away. It
