@@ -1188,8 +1188,11 @@ forbidden_tool_usage        100% → 100%    PASS
 Behavior Gate: FAIL                            exit 1
 ```
 
-`--format json` emits a stable schema containing `status`, `agent_checksum`, `diff`, `metrics`, and
-the gate verdict.
+`--format json` emits a stable schema: `status`, `agent_checksum`, `baseline_checksum`,
+`dependency` (the static comparison), `behavior` and `error`. Every field is always present —
+`null` or `[]` where there is no answer — so a consumer never has to distinguish a missing key
+from an absent result. `behavior` is `null` when probes were not requested, and carries the
+metric table (`behavior.metrics`) and the gate verdict when they were.
 
 ---
 

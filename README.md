@@ -32,7 +32,8 @@ This is a young project; the table says exactly what runs today.
 | `snapshot` — Model, Prompt, MCP server and MCP tool discovery; byte-deterministic `agentchecksum.lock` | **works** |
 | `diff` — semantic dependency diff, per-facet risk, human and JSON output | **works** |
 | MCP discovery — server era, tool contracts, declared annotation capabilities | **works** |
-| Behavioral probes, `check`, the regression gate | next |
+| `check` — behavioral probes, policy, the regression gate, `--accept`, `--trace`, `--jobs` | **works** |
+| `inspect probes` — what is configured, what each probe asserts, what it feeds | **works** |
 | Demo project, GitHub Action, prebuilt releases | planned |
 
 Design decisions live in [`docs/specs`](docs/specs); the implementation plan for the current phase
@@ -49,10 +50,11 @@ Rust 1.98.1, edition 2024, single crate, single binary. No runtime, no database,
 ## Quickstart
 
 ```bash
-agentchecksum init        # writes agentchecksum.toml and probes/
+agentchecksum init        # writes agentchecksum.toml and an example probe
 agentchecksum snapshot    # fingerprints the agent, writes agentchecksum.lock
 # ... someone edits a prompt, a model, or an MCP tool ...
 agentchecksum diff        # what changed, and how risky it is
+agentchecksum check       # did it break? sample the agent, compare, gate
 ```
 
 ```console
@@ -110,6 +112,88 @@ Overall behavioral risk: MEDIUM (heuristic)
 ```
 
 The API did not break. The agent did.
+
+## The Behavior Gate
+
+`diff` answers *what changed*. `check` answers the second question: **did it break?** It samples the
+agent through `[model]`, scores each sample against the expectations the probes declare, compares the
+result against a committed baseline, applies policy, and exits with a code CI can act on.
+
+```console
+$ agentchecksum check
+
+AgentChecksum check
+
+Agent checksum: ac1:ca92e73c857f9c1e8289dd3da4e497412308a21d887f1c31cbb8c0bfd306a25d
+
+No dependency changes detected.
+
+Behavioral probes: 0 / 1 passed
+argument_validity  n/a → 0%  WARN
+tool_restraint     100% → 0%  FAIL
+
+Policy failures:
+  tool_restraint: score 0.0000 is below the required minimum 1.0000
+
+Failing probes:
+  no-tools  0 / 1 passed
+    sample 0: argument_validity `web_search` is not a declared tool, so its arguments cannot be checked
+    sample 0: tool_restraint 1 tool was called
+
+Behavior Gate: FAIL    exit 1
+```
+
+The probe that produced that verdict is a file:
+
+```toml
+[[probe]]
+name = "no-tools"
+prompt = """
+Answer from what you already know, without calling any tool: what is the capital of
+Portugal?
+"""
+expect_no_tool = true
+```
+
+Five expectations exist, and a probe must declare at least one: `expect_tool`, `expect_args`
+(JSON Pointer → matcher, requires `expect_tool`), `forbid_tools`, `expect_no_tool`, and
+`output_schema`. The six resulting metrics are all scored the same way — **1.0 is good** — which is
+why one policy vocabulary (`min` for a floor, `max` for a ceiling, `max_drop` against the baseline)
+describes all of them:
+
+```toml
+[policy]
+fail_on_risk = "critical"
+
+[policy.metrics.tool_restraint]
+min = 1.0
+
+[policy.metrics.argument_validity]
+max_drop = 0.05
+```
+
+### What the verdict refuses to claim
+
+The gate is built so that the less it knows, the less it says:
+
+- **A count, not a percentage.** `passed`/`total` is what a baseline records, because `0.9` invites an
+  argument that `9 / 10` does not.
+- **A metric nothing measured is absent, not zero.** `argument_validity` applies only to samples that
+  called a tool; a probe that calls nothing does not get a free 1.0.
+- **A row with no policy says `WARN`, not `PASS`.** "No threshold failed" and "the behavior was good"
+  are different claims, and a table should not make the second one by accident.
+- **Drift is not regression.** No baseline, or a changed probe suite, exits `0` (unless
+  `--fail-on-drift`) and says why: the scores on either side answer different questions. Only a policy
+  that actually failed is a `FAIL`.
+- **A check that could not finish is never a `PASS`.** An unreachable model, an invalid probe, a
+  malformed response: exit `3`, with the diagnostic. `--no-probes` is the explicit way to skip.
+- **The runner observes; it never executes.** No `tools/call`, no MCP request, no sandbox, nothing the
+  model asked for is ever run. The recorded tool decisions *are* the evidence.
+
+`check --accept` is how a verdict becomes the baseline. It refuses to run while the dependency state
+has moved — scores captured against a dependency set nobody committed would be attributed to the
+wrong revision — and it writes counts, digests and yardstick digests, never prompts, model output, or
+tool arguments.
 
 ## What it fingerprints
 
@@ -217,10 +301,10 @@ one.
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. `diff` uses this **even when the change is CRITICAL** — it reports, the gate decides |
-| `1` | Gate failure (behavioral regression or policy violation) |
-| `2` | Usage error |
-| `3` | Runtime error — config, discovery, network, unsupported input |
+| `0` | Success. `diff` uses this **even when the change is CRITICAL**, and `check` uses it for drift — they report, the policy decides |
+| `1` | Gate failure — a metric policy failed, or `--fail-on-drift` / `--fail-on-risk` turned a change into one |
+| `2` | Usage error, including a flag combination that cannot mean anything |
+| `3` | Runtime error — config, discovery, network, unsupported input, an interrupted check |
 
 Comparing successfully and finding danger are different outcomes, and the exit codes keep them
 apart so CI can tell them apart.
@@ -235,6 +319,14 @@ agentchecksum diff --format json | jq '.overall_risk, .changes[].id'
 
 A runtime failure writes its diagnostic to stderr and leaves stdout empty. The documented shape is
 in [spec §8.4](docs/specs).
+
+`check --format json` emits the whole verdict as one document — `status`, `agent_checksum`,
+`baseline_checksum`, `dependency`, `behavior`, `error` — and every field is always present, `null` or
+`[]` where there is no answer, so a consumer never has to tell a missing key from an absent result:
+
+```bash
+agentchecksum check --format json | jq '.status, .behavior.metrics[] | select(.verdict == "fail")'
+```
 
 ## How it stays deterministic
 
@@ -257,6 +349,15 @@ project it inspects: the only process it starts is the MCP server you configured
 `agentchecksum.toml`, and only to ask what that server declares. That matters when CI is examining an
 untrusted pull request — the configuration file is the trust boundary, which is why it is committed and
 reviewed like any other input.
+
+`check` adds exactly one outbound connection — the model endpoint in `[model]` — and no capability
+beyond it. Probes never execute tools, schemas are never fetched (`jsonschema` runs with HTTP and file
+resolution disabled, so a schema that needs them is refused), and recorded runs are evaluated offline,
+which is what makes `--trace` replayable on a machine with no model at all.
+
+Known limitations, stated rather than discovered: no LLM judge, no regex matchers, no tool-result or
+multi-turn evaluation, no authentication for remote endpoints, and trace *capture* is not
+bit-reproducible (trace *evaluation* is).
 
 ## License
 
