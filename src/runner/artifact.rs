@@ -26,9 +26,6 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
 use crate::error::{Error, Result};
 use crate::fingerprint::canonical;
 use crate::manifest::Digest;
@@ -36,6 +33,9 @@ use crate::probes::{MetricScores, ProbeOutcome, aggregate};
 use crate::runner::STATE_DIR;
 use crate::runner::trace::{CapturedWith, TRACE_VERSION, Trace};
 use crate::runner::write_atomic;
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use serde_json::Value;
 
 /// The run artifact format this build writes and reads.
 pub const RUN_VERSION: u32 = 1;
@@ -217,37 +217,6 @@ impl RunArtifact {
         }
 
         Ok(artifact)
-    }
-
-    /// Read the traces a `--trace` path names.
-    ///
-    /// Both shapes a user can hand to that flag are accepted, and the shape is decided
-    /// by the version key the file carries rather than by its extension: a single
-    /// recorded trace, or a run artifact holding several.
-    pub fn read_traces(path: &Path) -> Result<Vec<Trace>> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let peek: Value = serde_json::from_str(&text).map_err(|source| Error::TraceInvalid {
-            path: path.to_path_buf(),
-            reason: format!("it is not a readable trace or run artifact: {source}"),
-        })?;
-
-        if peek.get("run_version").is_some() {
-            return Ok(Self::read(path)?.traces);
-        }
-        if peek.get("trace_version").is_some() {
-            return Ok(vec![Trace::read(path)?]);
-        }
-
-        Err(Error::TraceInvalid {
-            path: path.to_path_buf(),
-            reason: "it carries neither a `trace_version` nor a `run_version`, so it is not \
-                     recorded evidence"
-                .to_string(),
-        })
     }
 }
 
@@ -644,35 +613,6 @@ mod tests {
             matches!(error, Error::RunnerUnsupported { .. }),
             "{error:?}"
         );
-    }
-
-    #[test]
-    fn a_trace_path_may_name_a_single_trace_or_a_whole_run() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // A single recorded trace, the shape `check --trace` writes and reads.
-        let trace_path = dir.path().join("trace.json");
-        std::fs::write(
-            &trace_path,
-            trace("repository-search", "sha256:p1", 2)
-                .to_bytes()
-                .unwrap(),
-        )
-        .unwrap();
-        let read = RunArtifact::read_traces(&trace_path).unwrap();
-        assert_eq!(read.len(), 1);
-        assert_eq!(read[0].probe, "repository-search");
-
-        // And a run artifact, which holds several.
-        let artifact = artifact();
-        let path = artifact.write(dir.path()).unwrap();
-        assert_eq!(RunArtifact::read_traces(&path).unwrap(), artifact.traces);
-
-        // Something that is neither is refused rather than read as empty.
-        let other = dir.path().join("other.json");
-        std::fs::write(&other, json!({ "hello": "world" }).to_string()).unwrap();
-        let error = RunArtifact::read_traces(&other).unwrap_err();
-        assert!(error.to_string().contains("recorded evidence"), "{error}");
     }
 
     #[test]

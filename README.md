@@ -190,6 +190,42 @@ The gate is built so that the less it knows, the less it says:
 - **The runner observes; it never executes.** No `tools/call`, no MCP request, no sandbox, nothing the
   model asked for is ever run. The recorded tool decisions *are* the evidence.
 
+### Replaying recorded evidence
+
+`check --trace <path>` scores a recorded run instead of sampling a model: no request, no endpoint, no
+`[model]` connection — the same evidence, the same deterministic evaluation, on a machine that cannot
+reach the model at all. The path may name a single recorded trace or a whole run artifact.
+
+Evidence is only scored when it demonstrably describes the agent being measured *now*. The recorded
+run carries the context it was captured with, and every part of it has to agree with the current one:
+
+| The evidence says | It must equal |
+|---|---|
+| `agent_checksum` | the agent this project fingerprints now |
+| `captured_with.tool_catalog_digest` | the catalog the model would be shown now |
+| `probe_suite_digest` (run artifacts) | the probe suite being scored now |
+| `captured_with.runner` / `runner_version` | the runner this build implements |
+| `probe` / `probe_digest` / sample count | the probe being asserted now |
+
+Anything else is **unusable evidence, not a verdict**: exit `3`, with the fact that disagrees named.
+It is never silently treated as drift, as a regression, or as a cache miss and re-captured. The
+practical consequence is worth stating plainly — a replay is a reproduction of a measurement, not a
+way to score an old agent against a new one. Evidence captured before a dependency change is refused
+rather than reinterpreted, because scoring it would attribute one agent's behavior to another.
+
+The same rule applies one level down, to what a call claims about itself. A recorded call that carries
+a canonical `tool_id` is asserting an identity, and both halves of that assertion are checked: the
+tool must exist in the catalog, and its declared name must be the name the call reported. A model that
+invents a name carries no `tool_id` and is *measured* — a hallucinated tool is behavior worth scoring,
+not a corrupt record — while a call whose `tool_id` and `name` contradict each other is refused, since
+believing either half would award credit for a tool the model never called.
+
+Baselines are compared under the same discipline. A committed baseline records the runner contract it
+was produced under, and a baseline from another contract is non-comparable: its scores came from
+different capture rules, so `max_drop` is not evaluated against it and the check reports **drift** with
+the reason. Absolute thresholds are applied regardless — a floor this run misses is a fact about this
+run.
+
 `check --accept` is how a verdict becomes the baseline. It refuses to run while the dependency state
 has moved — scores captured against a dependency set nobody committed would be attributed to the
 wrong revision — and it writes counts, digests and yardstick digests, never prompts, model output, or
@@ -351,9 +387,16 @@ untrusted pull request — the configuration file is the trust boundary, which i
 reviewed like any other input.
 
 `check` adds exactly one outbound connection — the model endpoint in `[model]` — and no capability
-beyond it. Probes never execute tools, schemas are never fetched (`jsonschema` runs with HTTP and file
-resolution disabled, so a schema that needs them is refused), and recorded runs are evaluated offline,
-which is what makes `--trace` replayable on a machine with no model at all.
+beyond it. That connection is made only when a run is *captured*: probes never execute tools, schemas
+are never fetched (`jsonschema` runs with HTTP and file resolution disabled, so a schema that needs
+them is refused), and `--trace` evaluates recorded evidence without contacting anything. Capture is
+statistical — one sample is one request, and no retry pretends otherwise — while evaluation is a pure
+function of the recording, which is what makes a replay reproducible.
+
+A replay still needs the current agent to be *describable*: `check` fingerprints the dependency state
+it compares against, and for a provider whose identity requires a live server (Ollama's model digest,
+for example) that fingerprinting is the one thing replay cannot do offline. That is discovery, not
+replay, and it is the same requirement `snapshot` has.
 
 Known limitations, stated rather than discovered: no LLM judge, no regex matchers, no tool-result or
 multi-turn evaluation, no authentication for remote endpoints, and trace *capture* is not

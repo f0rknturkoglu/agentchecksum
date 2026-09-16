@@ -68,7 +68,7 @@ path = "probes"
 # max_drop = 0.05
 #
 # [policy.metrics.forbidden_tool_usage]
-# max = 0.0
+# min = 1.0
 "#;
 
 /// The starter probe, relative to the probe directory.

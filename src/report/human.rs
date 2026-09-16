@@ -328,7 +328,7 @@ pub fn check(report: &CheckReport, fail_on_drift: bool) -> String {
         if !reasons.is_empty() {
             out.push_str("\nDrift reasons:\n");
             for reason in reasons {
-                out.push_str(&format!("  {}\n", reason.as_str()));
+                out.push_str(&format!("  {reason}\n"));
             }
         }
     }

@@ -60,10 +60,11 @@ pub struct MetricComparison<'a> {
     pub current: Option<&'a MetricScore>,
     /// The baseline's score for the same metric, when a baseline exists.
     pub baseline: Option<&'a MetricScore>,
-    /// Whether `baseline` belongs to the same probe suite.
+    /// Whether `baseline` was produced by the same test *and* the same capture rules.
     ///
-    /// A score from a different suite answers different questions, so a relative
-    /// comparison against it would be a comparison of two tests.
+    /// A score from a different probe suite answers different questions, and a score
+    /// from a different runner contract was produced by different rules; a relative
+    /// comparison against either would be a comparison of two measurements.
     pub baseline_comparable: bool,
     /// Whether a comparison against this baseline is meaningful:
     /// a baseline was found and it describes this suite.
@@ -133,11 +134,14 @@ pub fn evaluate(
             }
             _ => {
                 outcome.relative_undecided = true;
+                // Which reason it is belongs to the report's drift reasons, which knows
+                // about both the suite and the runner contract. Saying "the suite
+                // changed" here would be guessing.
                 outcome.note(
                     metric,
                     if comparison.baseline_present {
-                        "the probe suite changed, so a drop against the baseline would compare two \
-                         different test suites"
+                        "the committed baseline is not comparable with this run, so a drop \
+                         cannot be measured against it"
                     } else {
                         "no behavioral baseline exists, so a drop cannot be measured"
                     },
@@ -267,7 +271,8 @@ mod tests {
         assert!(absent.relative_undecided);
         assert!(absent.notes[0].detail.contains("no behavioral baseline"));
 
-        // A baseline from a different suite: the scores answer different questions.
+        // A baseline from a different suite — or a different runner contract: either
+        // way the scores answer different questions.
         let changed = evaluate(
             Metric::ToolSelection,
             &policy(None, None, Some(0.05)),
@@ -275,7 +280,7 @@ mod tests {
         );
         assert!(changed.failures.is_empty());
         assert!(changed.relative_undecided);
-        assert!(changed.notes[0].detail.contains("probe suite changed"));
+        assert!(changed.notes[0].detail.contains("not comparable"));
     }
 
     #[test]

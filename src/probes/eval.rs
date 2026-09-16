@@ -140,6 +140,18 @@ pub fn evaluate(
         )));
     }
 
+    // Every recorded call that claims a canonical identity is checked against the
+    // catalog before anything is scored. The built-in runner cannot produce a
+    // disagreement — it resolves the wire name to the contract it matched — so a
+    // disagreement here means the evidence was written by something else: edited by
+    // hand, or produced by a run whose catalog has since been replaced. Believing the
+    // claim would give a call credit for a tool it did not name.
+    for sample in &trace.samples {
+        for call in &sample.tool_calls {
+            validate_tool_identity(call, sample, catalog, &inconsistent)?;
+        }
+    }
+
     // Compiled once per probe rather than once per sample: a schema is a yardstick,
     // and re-deriving it a hundred times would only add ways to disagree.
     let output_schema = match &probe.output_schema {
@@ -188,6 +200,46 @@ pub fn evaluate(
         total: probe.repeat,
         metrics,
     })
+}
+
+/// Check that a recorded call's claimed identity is truthful.
+///
+/// A call with no `tool_id` is a model that invented a name: there is no claim to
+/// verify, and the behavior is real — it is scored by the metrics like any other
+/// answer, which is what makes a hallucinated tool measurable rather than fatal.
+///
+/// A call *with* a `tool_id` is asserting "this is tool X". Two things must hold: the
+/// catalog must know X, and X's declared name must be the name the call reported. A
+/// call whose claim is false is not evidence about anything — it is a contradiction
+/// between two parts of one record — and it is refused rather than reinterpreted by
+/// the name it happened to carry.
+fn validate_tool_identity(
+    call: &ToolCall,
+    sample: &Sample,
+    catalog: &ToolCatalog,
+    inconsistent: &impl Fn(String) -> Error,
+) -> Result<()> {
+    let Some(id) = &call.tool_id else {
+        return Ok(());
+    };
+
+    let Some(tool) = catalog.by_id(id) else {
+        return Err(inconsistent(format!(
+            "sample {} calls `{}` and claims the canonical tool `{id}`, which the current tool \
+             catalog does not declare; the call cannot be scored against a tool that is not there",
+            sample.index, call.name
+        )));
+    };
+
+    if tool.name != call.name {
+        return Err(inconsistent(format!(
+            "sample {} claims the canonical tool `{id}`, whose declared name is `{}`, but reports \
+             the call as `{}`; the two halves of the record disagree, so neither can be scored",
+            sample.index, tool.name, call.name
+        )));
+    }
+
+    Ok(())
 }
 
 /// Every applicable check for one sample, in metric order.
@@ -663,7 +715,9 @@ mod tests {
     }
 
     #[test]
-    fn an_invented_tool_name_is_matched_by_name_but_a_mismatched_id_is_not() {
+    fn an_invented_tool_name_is_measured_by_its_name() {
+        // No `tool_id`: the model invented a name. There is no identity claim to
+        // verify, and the behavior is real — it is scored rather than refused.
         let probe = probe("search", "expect_tool = \"search_repositories\"", 1);
         let by_name = run(
             &probe,
@@ -678,10 +732,15 @@ mod tests {
             )],
         );
         assert_eq!(by_name.passed, 1);
+    }
 
-        // A call whose resolved id names a different tool is that other tool, however
-        // it spells its name.
-        let by_id = run(
+    #[test]
+    fn a_call_whose_claimed_id_contradicts_its_name_is_refused() {
+        // The record says two different things about which tool was called. Believing
+        // either half would give the call credit it did not earn, so it is not
+        // evidence about anything and the evaluation stops with the contradiction.
+        let probe = probe("search", "expect_tool = \"search_repositories\"", 1);
+        let contradiction = trace(
             &probe,
             vec![sample(
                 0,
@@ -689,7 +748,35 @@ mod tests {
                 None,
             )],
         );
-        assert_eq!(by_id.passed, 0);
+
+        let error = evaluate(&probe, &contradiction, &catalog()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, crate::error::Error::ProbeInvalid { .. }),
+            "{error:?}"
+        );
+        assert!(message.contains(DELETE), "{message}");
+        assert!(message.contains("search_repositories"), "{message}");
+    }
+
+    #[test]
+    fn a_call_whose_claimed_id_is_not_in_the_catalog_is_refused() {
+        let probe = probe("search", "expect_tool = \"search_repositories\"", 1);
+        let forged = trace(
+            &probe,
+            vec![sample(
+                0,
+                vec![call(
+                    "search_repositories",
+                    Some("tool:unknown.search"),
+                    json!({}),
+                )],
+                None,
+            )],
+        );
+
+        let error = evaluate(&probe, &forged, &catalog()).unwrap_err();
+        assert!(error.to_string().contains("does not declare"), "{error}");
     }
 
     #[test]

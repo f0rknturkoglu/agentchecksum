@@ -16,15 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::manifest::{AgentChecksum, Digest};
 use crate::probes::{Metric, MetricScore, MetricScores};
+use crate::runner::RUNNER_CONTRACT;
 
 /// The baseline schema this build writes and understands.
 pub const BASELINE_VERSION: u32 = 1;
-
-/// The runner contract a baseline's scores were produced under.
-///
-/// Two runners measure different things, so a baseline recorded by one cannot be
-/// compared with a run of the other.
-pub const RUNNER_CONTRACT: &str = "openai-chat-completions-v1";
 
 /// Peeked before the full parse, like the lockfile, so a newer baseline is refused as
 /// a version problem rather than reported as a parse error.
@@ -68,6 +63,16 @@ impl BehaviorBaseline {
             probes,
             yardsticks: BTreeMap::from([("tool_input_schema".to_string(), tool_input_schemas)]),
         }
+    }
+
+    /// Whether this baseline was recorded under the runner contract in force now.
+    ///
+    /// A baseline from another contract measures a different experiment: the scores
+    /// were produced by different capture rules, so comparing them would be comparing
+    /// two measurements rather than two states of one agent. It is not a regression —
+    /// it is a comparison that cannot be made.
+    pub fn runner_contract_matches(&self) -> bool {
+        self.runner_contract == RUNNER_CONTRACT
     }
 
     pub fn metric(&self, metric: Metric) -> Option<&MetricScore> {
@@ -202,6 +207,26 @@ mod tests {
             "{error:?}"
         );
         assert!(error.suggestion().is_some());
+    }
+
+    #[test]
+    fn a_baseline_from_another_runner_contract_is_not_comparable() {
+        let mut recorded = baseline();
+        assert!(recorded.runner_contract_matches());
+
+        recorded.runner_contract = "some-other-runner-v1".to_string();
+        assert!(!recorded.runner_contract_matches());
+
+        // The field is read back, not defaulted: a committed baseline written before
+        // this check existed carries the contract it was really recorded under.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        recorded.write(&path).unwrap();
+        assert!(
+            !BehaviorBaseline::read(&path)
+                .unwrap()
+                .runner_contract_matches()
+        );
     }
 
     #[test]

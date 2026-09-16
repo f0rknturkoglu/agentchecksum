@@ -30,6 +30,7 @@
 pub mod artifact;
 pub mod cache;
 pub mod catalog;
+pub mod evidence;
 pub mod openai;
 pub mod trace;
 
@@ -44,6 +45,7 @@ use crate::manifest::Digest;
 pub use artifact::{RUN_VERSION, RunArtifact};
 pub use cache::{CACHE_VERSION, Cache, CacheEntry, CacheInputs};
 pub use catalog::{ToolCatalog, ToolContract};
+pub use evidence::{OwnedContext, RecordedEvidence, RunContext};
 pub use openai::{Client, MODEL_SAMPLE_TIMEOUT, RUNNER, RUNNER_CONTRACT, RUNNER_VERSION};
 pub use trace::{CapturedWith, Sample, TRACE_VERSION, ToolCall, Trace};
 

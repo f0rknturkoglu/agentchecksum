@@ -927,7 +927,7 @@ min = 0.95
 max_drop = 0.05
 
 [policy.metrics.forbidden_tool_usage]
-max = 0.0
+min = 1.0
 "#;
         let config = Config::from_toml_at(text, Path::new("agentchecksum.toml")).unwrap();
         assert_eq!(config.policy.metrics.len(), 3);

@@ -154,7 +154,9 @@ agentchecksum inspect probes          Parsed probe suite and the metrics each pr
 --fail-on-risk <level>       none|low|medium|high|critical (default: off; config may set it)
 --accept                     Record the current successful run as the behavioral baseline.
 --from <path>                Compare against a different lockfile instead of the committed one.
---trace <path>               Evaluate a recorded trace instead of calling a model.
+--trace <path>               Evaluate a recorded trace instead of calling a model. The
+                             evidence must describe the current agent, catalog, probe
+                             suite and runner (see §11.4); anything else exits 3.
 --refresh                    Ignore the trace cache and re-sample.
 --repeat <n>                 Override probe sample count.
 --jobs <n>                   Probe concurrency for the model runner.
@@ -221,7 +223,7 @@ min = 0.95
 max_drop = 0.05
 
 [policy.metrics.forbidden_tool_usage]
-max = 0.0
+min = 1.0
 ```
 
 Notes:
@@ -1051,7 +1053,7 @@ expectations; each metric is scored independently over that probe's samples.
 | `tool_selection` | `expect_tool` | Expected tool was called |
 | `argument_validity` | **automatic** | Every emitted tool call's arguments must validate against that tool's `inputSchema` — zero configuration |
 | `argument_expectation` | `expect_args` | User-declared argument matchers satisfied |
-| `forbidden_tool_usage` | `forbid_tools` | Violation rate (inverted: 1.0 = no violations) |
+| `forbidden_tool_usage` | `forbid_tools` | Restraint: 1.0 = no forbidden tool was called |
 | `tool_restraint` | `expect_no_tool` | No tool called when none should be |
 | `structured_output_validity` | `output_schema` | Final output validates against the schema |
 
@@ -1101,22 +1103,32 @@ a Trace.
 {
   "trace_version": 1,
   "probe": "repository-search",
+  "probe_digest": "sha256:…",
+  "agent_checksum": "ac1:…",
   "captured_with": {
-    "runner": "openai-compatible",
-    "endpoint": "http://localhost:11434/v1",
-    "model_digest": "sha256:…",
-    "tools_digest": "sha256:…",
-    "params": { "temperature": 0.0, "seed": 42 }
+    "runner": "openai-chat-completions",
+    "runner_version": 1,
+    "model_id": "qwen3:8b-q4",
+    "effective_params": { "temperature": 0.0, "seed": 42 },
+    "tool_catalog_digest": "sha256:…"
   },
   "samples": [
-    { "index": 0, "seed": 42,
-      "tool_calls": [ { "name": "search_repos", "arguments": { "query": "postgres vector search" } } ],
+    { "index": 0,
+      "tool_calls": [
+        { "name": "search_repos", "tool_id": "tool:local.search_repos",
+          "arguments": { "query": "postgres vector search" } }
+      ],
       "final_text": null }
   ]
 }
 ```
 
-Cache key: `sha256(JCS({model_digest, tools_digest, probe_name, prompt, repeat, params, sample_index}))`.
+`tool_id` is the canonical dependency id when the emitted name resolved to a declared tool, and absent
+when the model invented one — a hallucinated name is behavior to record and score, not a reason to
+fail a run. The circumstances are recorded so that replay can check them: see §11.4.
+
+Cache key: `sha256(JCS({runner_version, agent_checksum, probe_digest, tool_catalog_digest,
+effective_params, sample_index}))`.
 
 ### 11.2 The v0.1 runner
 
@@ -1139,6 +1151,34 @@ mitigations are: `temperature = 0`, fixed `seed`, `repeat = N` samples with pass
 instead of single-shot booleans, and a trace cache so a green run can be re-verified offline. The
 documentation must state this rather than imply that a probe result is bit-reproducible.
 
+### 11.4 Replay integrity
+
+`--trace` scores recorded evidence, and evidence is only scored for the agent it describes. Before
+evaluation, the recording must agree with the current run on:
+
+| Recorded | Must equal |
+|---|---|
+| `agent_checksum` | the current agent checksum |
+| `captured_with.tool_catalog_digest` | the digest of the current tool catalog |
+| `captured_with.runner`, `runner_version` | the runner this build implements |
+| `probe`, `probe_digest`, sample count | the probe being asserted now |
+| `probe_suite_digest` (run artifacts) | the current probe suite digest |
+
+A disagreement is **unusable evidence**: exit `3`, naming the fact that differs. It is never reported
+as drift, as a regression, never re-captured, and never silently reinterpreted. Two consequences are
+worth stating because they are easy to mistake for bugs: replaying evidence captured before a
+dependency change is refused (a reproduction scores the agent it recorded, not the one that replaced
+it), and `--accept` accepts only from a live run — a replay can never write a baseline.
+
+One level down, a recorded call that carries a `tool_id` is asserting an identity: the tool must exist
+in the catalog and its declared name must equal the name the call reported. A call whose two halves
+contradict each other is corrupt evidence and is refused; a call with no `tool_id` is a model-invented
+name and is scored by the behavioral metrics like any other answer.
+
+A committed baseline records `runner_contract`. A baseline from another contract is not comparable:
+`max_drop` is not evaluated against it, the check reports **drift** with that reason, and absolute
+constraints (`min`, `max`) are applied regardless — a floor this run misses is a fact about this run.
+
 ---
 
 ## 12. Behavior Gate
@@ -1159,9 +1199,15 @@ against the behavior recorded in the repository.
 
 ### 12.2 Policy
 
-Per metric: `max_drop` (drop relative to baseline), `min` (absolute floor), `max` (absolute ceiling,
-used for `forbidden_tool_usage`). Top-level: `fail_on_risk`, plus CLI `--fail-on-drift` for teams
-that want lockfile drift to fail before any baseline exists.
+Per metric: `min` (absolute floor), `max` (absolute ceiling), `max_drop` (drop relative to the
+baseline). Every metric points the same way — **1.0 is good** — so the vocabulary needs no notion of
+an inverted metric: `forbidden_tool_usage`, for example, is restraint, where 1.0 means no forbidden
+tool was called. Top-level: `fail_on_risk`, plus CLI `--fail-on-drift` for teams that want lockfile
+drift to fail before any baseline exists.
+
+`max_drop` is only applied when the committed baseline is comparable: the same probe suite *and* the
+same runner contract. Absolute constraints are applied regardless, because a floor this run misses is
+a fact about this run.
 
 **Precedence rule (tested):** when both `min` and `max_drop` are configured, **both must hold**.
 Satisfying one never excuses the other.

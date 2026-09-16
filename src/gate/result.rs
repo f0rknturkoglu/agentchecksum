@@ -49,7 +49,8 @@ pub enum MetricVerdict {
     Pass,
     /// A declared constraint failed. This is what fails the gate.
     Fail,
-    /// Measured, and no constraint was declared for it: reported, not gated.
+    /// Measured, and nothing judged it: either no constraint was declared, or the one
+    /// declared is relative and no comparable baseline exists. Reported, not gated.
     Warn,
     /// No sample made the metric applicable, so there is nothing to compare.
     NotMeasured,
@@ -67,6 +68,15 @@ pub struct MetricRow {
     /// The policy constraints declared for this metric, in the order they are
     /// checked, so a report can say what the number was measured against.
     pub policy: Vec<String>,
+}
+
+/// Whether a declared policy could actually judge this run.
+///
+/// An absolute constraint always can. A relative one needs a baseline that describes
+/// the same test under the same capture rules — which is why a declared `max_drop`
+/// with nothing comparable beside it leaves the metric reported but unjudged.
+fn policy_applies(policy: &crate::config::MetricPolicy, comparable: bool) -> bool {
+    policy.min.is_some() || policy.max.is_some() || (policy.max_drop.is_some() && comparable)
 }
 
 /// Build the metrics table: one row per metric the run measured, or that the policy
@@ -97,15 +107,17 @@ pub fn metric_rows(
                 .filter(|_| comparable)
                 .and_then(|baseline| baseline.metric(metric).copied());
 
-            let constrained = constrained.contains(&metric);
+            let declared = policy.metrics.get(metric.as_str());
+            let judged = declared.is_some_and(|policy| policy_applies(policy, comparable));
             MetricRow {
                 metric,
                 baseline: then,
                 current: now,
-                verdict: match (now, constrained) {
+                verdict: match (now, judged) {
                     (None, _) => MetricVerdict::NotMeasured,
                     (Some(_), _) if failure_metrics.contains(&metric) => MetricVerdict::Fail,
-                    // Nothing was declared for it, so nothing gates it — and a score
+                    // Nothing gated it — either nothing was declared, or what was
+                    // declared could not be applied to this comparison — and a score
                     // short of perfect is still worth the reader's attention.
                     (Some(score), false) if score.score() != Some(1.0) => MetricVerdict::Warn,
                     (Some(_), _) => MetricVerdict::Pass,
@@ -140,6 +152,8 @@ fn describe_policy(policy: &crate::config::MetricPolicy) -> Vec<String> {
 pub struct BehaviorHalf {
     pub baseline_present: bool,
     pub suite_matches: bool,
+    /// Whether the baseline was recorded under the runner contract in force now.
+    pub runner_contract_matches: bool,
     pub probe_suite_digest: String,
     pub probes_passed: u32,
     pub probes_total: u32,
@@ -176,11 +190,12 @@ impl BehaviorHalf {
             .iter()
             .map(|failure| failure.metric)
             .collect();
-        let comparable = outcome.baseline_present && outcome.suite_matches;
+        let comparable = outcome.comparable();
 
         Self {
             baseline_present: outcome.baseline_present,
             suite_matches: outcome.suite_matches,
+            runner_contract_matches: outcome.runner_contract_matches,
             probe_suite_digest: outcome.probe_suite_digest.clone(),
             probes_passed: outcomes.iter().map(|outcome| outcome.passed).sum(),
             probes_total: outcomes.iter().map(|outcome| outcome.total).sum(),
@@ -311,21 +326,18 @@ pub fn combined_status(
 }
 
 /// The drift reasons a report should show, in a stable order.
-pub fn drift_reasons(behavior: Option<&BehaviorHalf>, dependency_drift: bool) -> Vec<DriftReason> {
-    let mut reasons: Vec<DriftReason> = behavior
-        .map(|behavior| {
-            let mut reasons = Vec::new();
-            if !behavior.baseline_present {
-                reasons.push(DriftReason::NoBaseline);
-            } else if !behavior.suite_matches {
-                reasons.push(DriftReason::ProbeSuiteChanged);
-            }
-            reasons
-        })
+///
+/// The behavioral half reports its own reasons — they depend on the baseline, the probe
+/// suite and the runner contract, and it is the only place that knows all three — and
+/// this adds the dependency half's, which is the one reason a reader can see without
+/// the report telling them.
+pub fn drift_reasons(behavior: Option<&BehaviorHalf>, dependency_drift: bool) -> Vec<String> {
+    let mut reasons = behavior
+        .map(|half| half.drift_reasons.clone())
         .unwrap_or_default();
 
     if dependency_drift {
-        reasons.push(DriftReason::DependencyDrift);
+        reasons.push(DriftReason::DependencyDrift.as_str().to_string());
     }
     reasons
 }
@@ -487,6 +499,48 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_constraint_without_a_comparable_baseline_leaves_the_row_unjudged() {
+        // `max_drop` cannot be applied to a baseline that measures a different
+        // experiment. The row still shows the numbers — a row that hid them would be
+        // worse — and says they were not gated.
+        let outcomes = [outcome("restraint", 0, 1, Metric::ToolRestraint)];
+        let policy = PolicyConfig {
+            fail_on_risk: None,
+            metrics: std::collections::BTreeMap::from([(
+                "tool_restraint".to_string(),
+                crate::config::MetricPolicy {
+                    min: None,
+                    max: None,
+                    max_drop: Some(0.05),
+                },
+            )]),
+        };
+
+        let unjudged = metric_rows(&outcomes, None, &policy, false, &[]);
+        assert_eq!(unjudged[0].verdict, MetricVerdict::Warn);
+
+        // The same declaration with a comparable baseline is judged, and passes
+        // because the policy layer would have reported a failure if it had failed.
+        let judged = metric_rows(&outcomes, None, &policy, true, &[]);
+        assert_eq!(judged[0].verdict, MetricVerdict::Pass);
+
+        // An absolute constraint is applied whether or not anything is comparable.
+        let absolute = PolicyConfig {
+            fail_on_risk: None,
+            metrics: std::collections::BTreeMap::from([(
+                "tool_restraint".to_string(),
+                crate::config::MetricPolicy {
+                    min: Some(1.0),
+                    max: None,
+                    max_drop: None,
+                },
+            )]),
+        };
+        let failing = metric_rows(&outcomes, None, &absolute, false, &[Metric::ToolRestraint]);
+        assert_eq!(failing[0].verdict, MetricVerdict::Fail);
+    }
+
+    #[test]
     fn a_metric_a_policy_failed_is_marked_failed() {
         let rows = metric_rows(
             &[outcome("search", 7, 10, Metric::ArgumentValidity)],
@@ -540,6 +594,7 @@ mod tests {
                 baseline_present: true,
                 probe_suite_digest: "sha256:aa".to_string(),
                 suite_matches: true,
+                runner_contract_matches: true,
                 yardsticks_changed: Vec::new(),
                 failures: Vec::new(),
                 notes: Vec::new(),
@@ -564,6 +619,7 @@ mod tests {
                 baseline_present: false,
                 probe_suite_digest: "sha256:bb".to_string(),
                 suite_matches: false,
+                runner_contract_matches: false,
                 yardsticks_changed: Vec::new(),
                 failures: Vec::new(),
                 notes: Vec::new(),
@@ -576,6 +632,28 @@ mod tests {
         assert!(!half.baseline_present);
         assert_eq!(half.probe_suite_digest, "sha256:bb");
         assert_eq!(half.drift_reasons, vec!["no behavioral baseline exists"]);
+
+        // And a baseline that exists but was recorded by another runner contract is
+        // reported in its own words rather than folded into "the suite changed".
+        let incomparable = BehaviorHalf::of(
+            &[outcome("search", 3, 3, Metric::ToolSelection)],
+            &BehaviorOutcome {
+                baseline_present: true,
+                probe_suite_digest: "sha256:bb".to_string(),
+                suite_matches: true,
+                runner_contract_matches: false,
+                yardsticks_changed: Vec::new(),
+                failures: Vec::new(),
+                notes: Vec::new(),
+                relative_undecided: false,
+            },
+            None,
+            &PolicyConfig::default(),
+        );
+        assert_eq!(
+            incomparable.drift_reasons,
+            vec!["the behavioral baseline was recorded by a different runner contract"]
+        );
     }
 
     #[test]

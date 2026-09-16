@@ -16,7 +16,10 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-pub use baseline::{BASELINE_VERSION, BehaviorBaseline, RUNNER_CONTRACT};
+pub use baseline::{BASELINE_VERSION, BehaviorBaseline};
+// The runner owns what a runner contract is; a baseline records it, and a comparison
+// checks it. One definition, so capture, baseline and comparison cannot drift apart.
+pub use crate::runner::RUNNER_CONTRACT;
 pub use policy::{MetricComparison, PolicyFailure, PolicyNote, PolicyOutcome};
 pub use result::{BehaviorHalf, CheckReport, DependencyHalf, MetricRow, MetricVerdict, ProbeRow};
 
@@ -66,6 +69,9 @@ pub enum DriftReason {
     NoBaseline,
     /// The probes changed, so the baseline's scores describe a different test.
     ProbeSuiteChanged,
+    /// The baseline was recorded by a different runner contract, so its scores came
+    /// from different capture rules.
+    RunnerContractChanged,
     /// Dependency state differs and no static policy failed it.
     DependencyDrift,
 }
@@ -75,6 +81,9 @@ impl DriftReason {
         match self {
             DriftReason::NoBaseline => "no behavioral baseline exists",
             DriftReason::ProbeSuiteChanged => "behavior probe suite changed",
+            DriftReason::RunnerContractChanged => {
+                "the behavioral baseline was recorded by a different runner contract"
+            }
             DriftReason::DependencyDrift => "dependency checksum changed",
         }
     }
@@ -117,6 +126,8 @@ pub struct BehaviorOutcome {
     pub probe_suite_digest: String,
     /// Whether the baseline describes the suite that just ran.
     pub suite_matches: bool,
+    /// Whether the baseline was recorded under the runner contract in force now.
+    pub runner_contract_matches: bool,
     /// Tools whose input schema moved since the baseline. `argument_validity` is
     /// measured against those schemas, so a report has to say when they changed
     /// instead of letting a schema edit look like a model regression.
@@ -128,12 +139,23 @@ pub struct BehaviorOutcome {
 }
 
 impl BehaviorOutcome {
+    /// Whether the baseline can honestly be compared with this run.
+    ///
+    /// Two things have to hold before a *relative* comparison means anything: the
+    /// baseline must describe the same test (suite digest) and the same capture rules
+    /// (runner contract). Absolute policy constraints do not depend on either and are
+    /// applied regardless — a threshold the current run misses is a fact about the
+    /// current run.
+    pub fn comparable(&self) -> bool {
+        self.baseline_present && self.suite_matches && self.runner_contract_matches
+    }
+
     /// The behavioral contribution to the final status.
     pub fn status(&self) -> GateStatus {
         if !self.failures.is_empty() {
             return GateStatus::Regression;
         }
-        if !self.baseline_present || !self.suite_matches || self.relative_undecided {
+        if !self.comparable() || self.relative_undecided {
             return GateStatus::Drift;
         }
         GateStatus::Pass
@@ -144,8 +166,13 @@ impl BehaviorOutcome {
         let mut reasons = Vec::new();
         if !self.baseline_present {
             reasons.push(DriftReason::NoBaseline);
-        } else if !self.suite_matches {
-            reasons.push(DriftReason::ProbeSuiteChanged);
+        } else {
+            if !self.suite_matches {
+                reasons.push(DriftReason::ProbeSuiteChanged);
+            }
+            if !self.runner_contract_matches {
+                reasons.push(DriftReason::RunnerContractChanged);
+            }
         }
         reasons
     }
@@ -231,6 +258,7 @@ mod tests {
             baseline_present,
             probe_suite_digest: "sha256:aa".to_string(),
             suite_matches,
+            runner_contract_matches: true,
             yardsticks_changed: Vec::new(),
             failures: (0..failures)
                 .map(|index| PolicyFailure {
@@ -264,6 +292,27 @@ mod tests {
         let absent = outcome(0, false, false);
         assert_eq!(absent.status(), GateStatus::Drift);
         assert_eq!(absent.drift_reasons(), vec![DriftReason::NoBaseline]);
+    }
+
+    #[test]
+    fn a_baseline_from_another_runner_contract_is_drift_not_regression() {
+        // The scores were produced by different capture rules. That is not a
+        // regression — nothing says the behavior got worse — it is a comparison that
+        // cannot honestly be made.
+        let mut incomparable = outcome(0, true, true);
+        incomparable.runner_contract_matches = false;
+
+        assert_eq!(incomparable.status(), GateStatus::Drift);
+        assert_eq!(
+            incomparable.drift_reasons(),
+            vec![DriftReason::RunnerContractChanged]
+        );
+
+        // And an absolute policy failure still outranks it: a threshold this run
+        // misses is a fact about this run.
+        let mut failed = outcome(1, true, true);
+        failed.runner_contract_matches = false;
+        assert_eq!(failed.status(), GateStatus::Regression);
     }
 
     #[test]

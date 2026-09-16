@@ -250,6 +250,51 @@ impl Project {
         std::fs::read(self.path().join("agentchecksum.lock")).expect("the lockfile exists")
     }
 
+    /// Append to this project's configuration.
+    fn append_config(&self, extra: &str) {
+        let path = self.path().join("agentchecksum.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str(extra);
+        std::fs::write(&path, config).unwrap();
+    }
+
+    /// Declare one MCP server, so a probe resolves against a real tool catalog.
+    ///
+    /// A catalog is what tool identities are checked against, so a test about them
+    /// needs one a real server declared rather than a fixture-shaped lockfile.
+    fn declare_tools(&self, tools: &[(&str, Value)]) {
+        let spec = self.path().join("mcp.json");
+        let declared: Vec<Value> = tools
+            .iter()
+            .map(|(name, schema)| {
+                json!({
+                    "name": name,
+                    "description": format!("The {name} tool."),
+                    "input_schema": schema,
+                })
+            })
+            .collect();
+        std::fs::write(
+            &spec,
+            serde_json::to_vec_pretty(&json!({ "tools": declared })).unwrap(),
+        )
+        .unwrap();
+
+        self.append_config(&format!(
+            "\n[[mcp.servers]]\nname = \"local\"\ntransport = \"stdio\"\ncommand = \"{}\"\n\
+             args = [\"--stdio\"]\nenv = {{ AC_FIXTURE_SPEC = \"{}\" }}\n",
+            mcp_fixture().display(),
+            spec.display(),
+        ));
+    }
+
+    /// The first run artifact `check` left behind.
+    fn artifact(&self) -> PathBuf {
+        let mut artifacts = self.run_artifacts();
+        assert_eq!(artifacts.len(), 1, "one run, one artifact: {artifacts:?}");
+        artifacts.remove(0)
+    }
+
     /// The run artifacts `check` left behind, addressed by their own contents.
     fn run_artifacts(&self) -> Vec<PathBuf> {
         let runs = self.path().join(".agentchecksum/runs");
@@ -265,6 +310,27 @@ impl Project {
         paths.sort();
         paths
     }
+}
+
+/// Write a single-trace file derived from the evidence a real run produced.
+///
+/// `mutate` changes exactly one fact, and everything else — the agent checksum, the
+/// catalog digest, the runner, the probe name and its digest — is copied from evidence
+/// captured in this project. That is what makes a refusal attributable: the fixture
+/// cannot be blamed for a second mistake nobody made.
+fn derived_trace(
+    project: &Path,
+    artifact: &Path,
+    name: &str,
+    mutate: impl FnOnce(&mut Value),
+) -> PathBuf {
+    let run: Value = serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+    let mut trace = run["traces"][0].clone();
+    mutate(&mut trace);
+
+    let path = project.join(name);
+    std::fs::write(&path, serde_json::to_vec_pretty(&trace).unwrap()).unwrap();
+    path
 }
 
 /// The config every test starts from: one prompt, a model pointed at the fixture, and
@@ -821,68 +887,472 @@ fn trace_evaluates_recorded_evidence_without_a_model() {
     assert!(report.contains("tool_restraint"), "{report}");
     assert!(report.contains("100%"), "{report}");
 
-    // Evidence captured under an agent revision that is no longer current is still
-    // evaluable — that is what makes a replay useful after a change — and replaying it
-    // records nothing: the artifact belongs to the run that captured it.
-    project.set_prompt("Be terse.\n");
-    let moved = project.run(&["check", "--trace", artifact.to_str().unwrap()]);
-    let report = stdout(&moved);
-    assert_eq!(exit_code(&moved), Some(0), "{report}\n{}", stderr(&moved));
-    assert!(report.contains("dependency checksum changed"), "{report}");
-    assert!(report.contains("100%"), "{report}");
+    // A replay records nothing: the artifact belongs to the run that captured it.
     assert_eq!(
         project.run_artifacts().len(),
         1,
         "a replay must not write a second run artifact"
     );
-
-    // A replay needs no `[model]` at all: the evidence already records the model it was
-    // captured with, which is the point of being able to evaluate it later.
-    std::fs::write(
-        project.path().join("agentchecksum.toml"),
-        "version = 1\n\n[agent]\nname = \"behavior-check-test\"\n\n\
-         [[prompts]]\npath = \"prompts/system.md\"\n",
-    )
-    .unwrap();
-    let modelless = project.run(&["check", "--trace", artifact.to_str().unwrap()]);
-    let report = stdout(&modelless);
     assert_eq!(
-        exit_code(&modelless),
-        Some(0),
-        "{report}\n{}",
-        stderr(&modelless)
+        project.requests().len(),
+        1,
+        "a replay must not contact the model: the evidence is the sample"
     );
-    assert!(report.contains("100%"), "{report}");
 
-    // Evidence for a probe this suite does not hold is refused rather than scored.
-    let elsewhere = project.path().join("elsewhere.json");
-    std::fs::write(
-        &elsewhere,
-        serde_json::to_vec_pretty(&json!({
-            "trace_version": 1,
-            "probe": "another-probe",
-            "probe_digest": "sha256:0000",
-            "agent_checksum": "ac1:0000",
-            "captured_with": {
-                "runner": "openai-chat-completions",
-                "runner_version": 1,
-                "model_id": "fixture-model",
-                "effective_params": {},
-                "tool_catalog_digest": "sha256:0000"
-            },
-            "samples": [{ "index": 0, "tool_calls": [] }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
+    // Two ways a well-formed file stops being evidence, both exit 3 and neither a
+    // behavior verdict: it describes another agent, or it holds no trace for a probe
+    // the suite asserts. The second is checked separately from the first so a file
+    // whose identity is fine is still refused when its contents do not line up.
+    let elsewhere = derived_trace(project.path(), &artifact, "elsewhere.json", |trace| {
+        trace["agent_checksum"] = json!("ac1:0000");
+    });
     let mismatched = project.run(&["check", "--trace", elsewhere.to_str().unwrap()]);
     assert_eq!(exit_code(&mismatched), Some(3), "{}", stdout(&mismatched));
     assert!(
-        stderr(&mismatched).contains("no trace for the probe `no-tools`"),
+        stderr(&mismatched).contains("the current agent is"),
         "{}",
         stderr(&mismatched)
     );
+
+    let stranger = derived_trace(project.path(), &artifact, "stranger.json", |trace| {
+        trace["probe"] = json!("another-probe");
+    });
+    let unheld = project.run(&["check", "--trace", stranger.to_str().unwrap()]);
+    assert_eq!(exit_code(&unheld), Some(3), "{}", stdout(&unheld));
+    assert!(
+        stderr(&unheld).contains("holds no trace for the probe `no-tools`"),
+        "{}",
+        stderr(&unheld)
+    );
+}
+
+/// Evidence captured under another agent is refused: a passing run from before a
+/// dependency change must never be scored as the behavior of the agent that change
+/// produced. The probes are untouched in this scenario — which is exactly why the
+/// binding check cannot rely on them.
+#[test]
+fn replay_evidence_from_another_agent_is_refused() {
+    let project = Project::new(vec![text("Lisbon.")], "");
+    project.probe("no-tools.toml", RESTRAINT_PROBE);
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+    let requests = project.requests().len();
+
+    // The agent moves: the prompt changes, so a new snapshot describes a different
+    // agent, while the probe suite stays exactly as it was.
+    project.set_prompt("Be terse.\n");
+    project.snapshot();
+
+    let replayed = project.run(&["check", "--trace", artifact.to_str().unwrap()]);
+    let report = stdout(&replayed);
+
+    assert_eq!(exit_code(&replayed), Some(3), "{report}");
+    assert!(
+        !report.contains("Behavior Gate"),
+        "unusable evidence is an error, not a verdict: {report}"
+    );
+    let diagnostic = stderr(&replayed);
+    assert!(diagnostic.contains("the current agent is"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("captured under the agent"),
+        "{diagnostic}"
+    );
+    assert_eq!(
+        project.requests().len(),
+        requests,
+        "a refused replay must not contact the model"
+    );
+}
+
+/// Evidence captured against another tool catalog is refused: the model was choosing
+/// from a different set of tools, so its choices measure something else.
+#[test]
+fn replay_evidence_from_another_tool_catalog_is_refused() {
+    let project = Project::new(vec![text("Lisbon.")], "");
+    project.probe("no-tools.toml", RESTRAINT_PROBE);
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+
+    let elsewhere = derived_trace(project.path(), &artifact, "other-catalog.json", |trace| {
+        trace["captured_with"]["tool_catalog_digest"] = json!("sha256:0000");
+    });
+    let replayed = project.run(&["check", "--trace", elsewhere.to_str().unwrap()]);
+
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    let diagnostic = stderr(&replayed);
+    assert!(diagnostic.contains("tool catalog"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("different set of tools"),
+        "{diagnostic}"
+    );
+}
+
+/// A run artifact whose probe suite has changed is refused — the suite digest is
+/// metadata a reader could discard, and keeping it is what makes this refusal possible.
+#[test]
+fn replay_evidence_whose_probe_suite_changed_is_refused() {
+    let project = Project::new(vec![text("Lisbon.")], "");
+    project.probe("no-tools.toml", RESTRAINT_PROBE);
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+
+    // The assertion changes, so the recorded scores answer a question nobody is
+    // asking any more. The agent checksum is untouched.
+    project.probe(
+        "no-tools.toml",
+        &RESTRAINT_PROBE.replace(
+            "what is the capital of Portugal?",
+            "what is the capital of Portugal, and name one river?",
+        ),
+    );
+
+    let replayed = project.run(&["check", "--trace", artifact.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    let diagnostic = stderr(&replayed);
+    assert!(diagnostic.contains("probe suite"), "{diagnostic}");
+}
+
+/// A trace from a runner this build does not implement is refused rather than read
+/// under this evaluator's assumptions.
+#[test]
+fn replay_evidence_from_another_runner_is_refused() {
+    let project = Project::new(vec![text("Lisbon.")], "");
+    project.probe("no-tools.toml", RESTRAINT_PROBE);
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+
+    let newer = derived_trace(project.path(), &artifact, "newer-runner.json", |trace| {
+        trace["captured_with"]["runner_version"] = json!(agentchecksum::runner::RUNNER_VERSION + 1);
+    });
+    let replayed = project.run(&["check", "--trace", newer.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    assert!(
+        stderr(&replayed).contains("capture contract changed"),
+        "{}",
+        stderr(&replayed)
+    );
+
+    let other = derived_trace(project.path(), &artifact, "other-runner.json", |trace| {
+        trace["captured_with"]["runner"] = json!("some-other-runner");
+    });
+    let replayed = project.run(&["check", "--trace", other.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    assert!(
+        stderr(&replayed).contains("some-other-runner"),
+        "{}",
+        stderr(&replayed)
+    );
+}
+
+/// A call that claims a canonical tool identity must be telling the truth about it.
+///
+/// The distinction is the whole point: an invented name is real behavior and is scored,
+/// while a claimed identity that the catalog contradicts is a corrupted record and is
+/// refused. Believing either half of it would award credit for a tool the model never
+/// named.
+#[test]
+fn a_call_that_claims_a_tool_identity_the_catalog_contradicts_is_refused() {
+    let project = Project::new(
+        vec![tool_call_with(
+            "search_repositories",
+            r#"{"query":"postgres"}"#,
+        )],
+        "[policy.metrics.tool_selection]\nmin = 1.0\n",
+    );
+    project.declare_tools(&[
+        (
+            "search_repositories",
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            }),
+        ),
+        (
+            "delete_file",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        ),
+    ]);
+    project.probe(
+        "search.toml",
+        r#"
+[[probe]]
+name = "repository-search"
+prompt = "Find repositories about PostgreSQL vector search."
+expect_tool = "search_repositories"
+"#,
+    );
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+
+    // A well-formed capture with a real identity still replays.
+    let honest = derived_trace(project.path(), &artifact, "honest.json", |_| {});
+    let replayed = project.run(&["check", "--trace", honest.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(0), "{}", stderr(&replayed));
+    assert!(stdout(&replayed).contains("100%"), "{}", stdout(&replayed));
+
+    // A known canonical id whose declared name is a different tool.
+    let contradictory = derived_trace(project.path(), &artifact, "contradiction.json", |trace| {
+        trace["samples"][0]["tool_calls"] = json!([{
+            "name": "search_repositories",
+            "tool_id": "tool:local.delete_file",
+            "arguments": { "query": "postgres" },
+        }]);
+    });
+    let replayed = project.run(&["check", "--trace", contradictory.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    let diagnostic = stderr(&replayed);
+    assert!(
+        diagnostic.contains("tool:local.delete_file"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("search_repositories"), "{diagnostic}");
+    assert!(
+        !stdout(&replayed).contains("PASS"),
+        "a contradictory record earns no credit: {}",
+        stdout(&replayed)
+    );
+
+    // A canonical id the catalog does not declare at all.
+    let unknown = derived_trace(project.path(), &artifact, "unknown-id.json", |trace| {
+        trace["samples"][0]["tool_calls"] = json!([{
+            "name": "search_repositories",
+            "tool_id": "tool:local.hallucinated",
+            "arguments": { "query": "postgres" },
+        }]);
+    });
+    let replayed = project.run(&["check", "--trace", unknown.to_str().unwrap()]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    assert!(
+        stderr(&replayed).contains("does not declare"),
+        "{}",
+        stderr(&replayed)
+    );
+}
+
+/// The same identity rule holds for evidence that came from the cache rather than from
+/// `--trace`: a cache entry is a file too, and a call that claims a tool identity is
+/// checked against the catalog wherever the sample came from.
+#[test]
+fn a_forged_call_in_a_cached_sample_is_refused() {
+    let project = Project::new(
+        vec![tool_call_with(
+            "search_repositories",
+            r#"{"query":"postgres"}"#,
+        )],
+        "",
+    );
+    project.declare_tools(&[
+        (
+            "search_repositories",
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"],
+            }),
+        ),
+        (
+            "delete_file",
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        ),
+    ]);
+    project.probe(
+        "search.toml",
+        r#"
+[[probe]]
+name = "repository-search"
+prompt = "Find repositories about PostgreSQL vector search."
+expect_tool = "search_repositories"
+"#,
+    );
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let requests = project.requests().len();
+
+    // Rewrite the recorded sample: the cache stores what the model answered, and a
+    // claim about which tool that was is checked rather than believed.
+    let cache = project.path().join(".agentchecksum/cache");
+    let mut rewritten = 0;
+    for entry in std::fs::read_dir(&cache).unwrap() {
+        let path = entry.unwrap().path();
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["sample"]["tool_calls"] = json!([{
+            "name": "search_repositories",
+            "tool_id": "tool:local.delete_file",
+            "arguments": { "query": "postgres" },
+        }]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        rewritten += 1;
+    }
+    assert!(rewritten > 0, "the run must have cached its samples");
+
+    let replayed = project.run(&["check"]);
+    assert_eq!(exit_code(&replayed), Some(3), "{}", stdout(&replayed));
+    assert!(
+        stderr(&replayed).contains("tool:local.delete_file"),
+        "{}",
+        stderr(&replayed)
+    );
+    assert_eq!(
+        project.requests().len(),
+        requests,
+        "the forged sample came from the cache, so no request was made"
+    );
+}
+
+/// An invented tool name carries no identity claim, so it stays behavioral evidence and
+/// is measured — a hallucination the gate can see, rather than an error that hides it.
+#[test]
+fn an_invented_tool_name_is_measured_rather_than_refused() {
+    let project = Project::new(
+        vec![tool_call_with(
+            "search_repositories",
+            r#"{"query":"postgres"}"#,
+        )],
+        "",
+    );
+    project.declare_tools(&[(
+        "search_repositories",
+        json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+        }),
+    )]);
+    project.probe(
+        "search.toml",
+        r#"
+[[probe]]
+name = "repository-search"
+prompt = "Find repositories about PostgreSQL vector search."
+expect_tool = "search_repositories"
+"#,
+    );
+    project.snapshot();
+
+    let captured = project.run(&["check"]);
+    assert_eq!(exit_code(&captured), Some(0), "{}", stderr(&captured));
+    let artifact = project.artifact();
+
+    let invented = derived_trace(project.path(), &artifact, "invented.json", |trace| {
+        trace["samples"][0]["tool_calls"] = json!([{
+            "name": "hallucinated_tool",
+            "arguments": { "query": "postgres" },
+        }]);
+    });
+    let replayed = project.run(&["check", "--trace", invented.to_str().unwrap()]);
+    let report = stdout(&replayed);
+
+    // Scored, not refused: the run is a measurement of behavior nobody asked for.
+    assert_eq!(
+        exit_code(&replayed),
+        Some(0),
+        "{report}\n{}",
+        stderr(&replayed)
+    );
+    assert!(report.contains("Behavior Gate"), "{report}");
+    assert!(
+        report.contains("tool_selection") && report.contains("0%"),
+        "{report}"
+    );
+    assert!(
+        report.contains("hallucinated_tool"),
+        "the report must name what the model actually called: {report}"
+    );
+}
+
+/// A baseline recorded under a different runner contract is not comparable: its scores
+/// came from different capture rules, so a relative constraint must not be applied to
+/// it — while an absolute one still is, because a threshold this run misses is a fact
+/// about this run.
+#[test]
+fn a_baseline_from_another_runner_contract_is_not_comparable() {
+    // Two samples: a restraint the policy measures against the baseline, then a tool
+    // call that drops the score to zero.
+    let project = Project::new(
+        vec![text("Lisbon."), tool_call("delete_everything")],
+        "[probes]\nrepeat = 1\n\n[policy.metrics.tool_restraint]\nmax_drop = 0.05\n",
+    );
+    project.probe("no-tools.toml", RESTRAINT_PROBE);
+    project.snapshot();
+
+    let accepted = project.run(&["check", "--accept"]);
+    assert_eq!(exit_code(&accepted), Some(0), "{}", stderr(&accepted));
+
+    // The contract that recorded this baseline is no longer the one in force.
+    let mut baseline = project.baseline();
+    assert_eq!(
+        baseline["runner_contract"],
+        json!(agentchecksum::runner::RUNNER_CONTRACT)
+    );
+    baseline["runner_contract"] = json!("some-other-runner-v1");
+    std::fs::write(
+        project.baseline_path(),
+        serde_json::to_vec_pretty(&baseline).unwrap(),
+    )
+    .unwrap();
+
+    let compared = project.run(&["check", "--refresh"]);
+    let report = stdout(&compared);
+
+    // The drop would fail `max_drop` if the baseline were comparable. It is not, so it
+    // is drift: the behavior did not get worse, the comparison stopped being possible.
+    assert_eq!(
+        exit_code(&compared),
+        Some(0),
+        "{report}\n{}",
+        stderr(&compared)
+    );
+    assert!(report.contains("Behavior Gate: DRIFT"), "{report}");
+    assert!(
+        report.contains("different runner contract"),
+        "the report must say why the baseline was not used: {report}"
+    );
+    // The baseline's number is not shown as this run's "before": it was produced by
+    // different capture rules, and printing it beside this run would invite a
+    // subtraction the gate deliberately did not make.
+    assert!(report.contains("n/a → 0%"), "{report}");
+    assert!(!report.contains("below"), "{report}");
+
+    // An absolute constraint is still applied: a floor this run misses is a failure of
+    // this run, whatever the baseline can or cannot be compared with.
+    let absolute = Project::new(vec![text("Lisbon."), tool_call("delete_everything")], "");
+    absolute.probe("no-tools.toml", RESTRAINT_PROBE);
+    absolute.snapshot();
+    let accepted = absolute.run(&["check", "--accept"]);
+    assert_eq!(exit_code(&accepted), Some(0), "{}", stderr(&accepted));
+
+    let mut baseline = absolute.baseline();
+    baseline["runner_contract"] = json!("some-other-runner-v1");
+    std::fs::write(
+        absolute.baseline_path(),
+        serde_json::to_vec_pretty(&baseline).unwrap(),
+    )
+    .unwrap();
+    absolute.append_config("\n[policy.metrics.tool_restraint]\nmin = 1.0\n");
+
+    let gated = absolute.run(&["check", "--refresh"]);
+    let report = stdout(&gated);
+    assert_eq!(exit_code(&gated), Some(1), "{report}\n{}", stderr(&gated));
+    assert!(report.contains("Behavior Gate: FAIL"), "{report}");
+    assert!(report.contains("below the required minimum"), "{report}");
 }
 
 // ---------------------------------------------------------------------------

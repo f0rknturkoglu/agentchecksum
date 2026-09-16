@@ -35,7 +35,8 @@ use crate::lockfile::Lockfile;
 use crate::manifest::AgentChecksum;
 use crate::probes::{self, Metric, MetricScore, MetricScores, ProbeSuite, ResolvedProbe};
 use crate::runner::{
-    CaptureRequest, RunArtifact, Runner, STATE_DIR, ToolCatalog, Trace, system_prompt,
+    CaptureRequest, OwnedContext, RecordedEvidence, RunArtifact, Runner, STATE_DIR, ToolCatalog,
+    Trace, system_prompt,
 };
 
 /// The committed behavioral baseline, relative to the project root.
@@ -149,9 +150,12 @@ pub async fn run(
     let agent_checksum = current.agent_checksum.clone();
 
     let traces = match options.trace.as_deref() {
-        // Recorded evidence needs no endpoint and no `[model]`: the whole point of a
-        // replay is that it can be evaluated where the capture happened.
-        Some(path) => recorded_traces(path, &suite)?,
+        // Recorded evidence needs no endpoint and no model request: the whole point of
+        // a replay is that it can be evaluated where the capture happened. It does
+        // need to *be* about this agent, and that is what the binding check decides —
+        // evidence from another agent, catalog, suite or runner is a runtime error,
+        // never a score for an agent nobody measured.
+        Some(path) => recorded_traces(path, &suite, &agent_checksum, &catalog)?,
         None => {
             let model = config.model.as_ref().ok_or_else(|| Error::ConfigInvalid {
                 reason: "`check` samples the agent through `[model]`, and this configuration \
@@ -253,6 +257,11 @@ fn apply_policy(
     suite: &ProbeSuite,
     catalog: &ToolCatalog,
 ) -> Result<BehaviorOutcome> {
+    // A baseline from another runner contract was produced by different capture rules,
+    // so its scores are not this run's "before". Absolute constraints still apply: a
+    // threshold this run misses is a fact about this run, whatever the baseline did.
+    let runner_contract_matches = baseline.is_some_and(BehaviorBaseline::runner_contract_matches);
+    let comparable = suite_matches && runner_contract_matches;
     let mut failures = Vec::new();
     let mut notes = Vec::new();
     let mut relative_undecided = false;
@@ -267,7 +276,7 @@ fn apply_policy(
         let comparison = MetricComparison {
             current: aggregate.get(&metric),
             baseline: baseline.and_then(|baseline| baseline.metric(metric)),
-            baseline_comparable: suite_matches,
+            baseline_comparable: comparable,
             baseline_present: baseline.is_some(),
         };
         let evaluated = policy::evaluate(metric, metric_policy, &comparison);
@@ -281,6 +290,7 @@ fn apply_policy(
         baseline_present: baseline.is_some(),
         probe_suite_digest: suite.digest.as_str().to_string(),
         suite_matches,
+        runner_contract_matches,
         yardsticks_changed: changed_yardsticks(baseline, &catalog.input_schema_digests()?),
         failures,
         notes,
@@ -383,13 +393,25 @@ async fn capture_all(
         })
 }
 
-/// The recorded evidence a `--trace` path names, aligned with the suite.
+/// The recorded evidence a `--trace` path names, bound to this run and aligned with
+/// the suite.
 ///
-/// A probe with no trace in the file is an error: its samples cannot be scored from
-/// evidence that does not exist, and reporting the probes that happened to be present
-/// would be a pass rate over an unknown denominator.
-fn recorded_traces(path: &Path, suite: &ProbeSuite) -> Result<Vec<Trace>> {
-    let traces = RunArtifact::read_traces(path)?;
+/// Two things happen here, in this order, and both are refusals rather than warnings:
+/// the evidence has to describe the agent being measured now (same checksum, catalog,
+/// suite and runner), and it has to hold a trace for every probe in the suite. A probe
+/// with no trace cannot be scored — reporting a pass rate over the probes that
+/// happened to be present would be a rate over an unknown denominator.
+fn recorded_traces(
+    path: &Path,
+    suite: &ProbeSuite,
+    agent_checksum: &AgentChecksum,
+    catalog: &ToolCatalog,
+) -> Result<Vec<Trace>> {
+    let evidence = RecordedEvidence::read(path)?;
+    let context = OwnedContext::new(agent_checksum.as_str(), suite.digest.as_str(), catalog)?;
+    evidence.validate(path, &context.as_context())?;
+
+    let traces = evidence.traces();
 
     suite
         .probes
@@ -402,7 +424,8 @@ fn recorded_traces(path: &Path, suite: &ProbeSuite) -> Result<Vec<Trace>> {
                 .ok_or_else(|| Error::TraceInvalid {
                     path: path.to_path_buf(),
                     reason: format!(
-                        "it holds no trace for the probe `{}`, so there is nothing to evaluate",
+                        "the {} holds no trace for the probe `{}`, so there is nothing to evaluate",
+                        evidence.shape(),
                         probe.name
                     ),
                 })
