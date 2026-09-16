@@ -1,8 +1,8 @@
 name: AgentChecksum
-description: >-
-  Run AgentChecksum in a workflow: fingerprint the agent's dependencies and gate on
-  what the behavior probes measured. The CLI's exit code is the step's outcome — 1 for
-  a gate failure, 2 for a usage error, 3 for a check that could not be evaluated.
+# GitHub Marketplace rejects a description of 125 characters or more, and shows this
+# one verbatim — so it says what the action does and nothing that fits better in the
+# README. The exit-code contract lives in `outputs` below and in docs/ci.md.
+description: "Know what changed in your agent, and whether it broke: fingerprint dependencies, gate on behavior."
 author: AgentChecksum
 
 branding:
