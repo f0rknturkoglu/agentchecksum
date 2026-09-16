@@ -2,6 +2,11 @@
 /target
 **/*.rs.bk
 
+# Release archives and checksums built by scripts/release_artifacts.py. They are
+# produced in the workspace for a workflow to upload, never committed, and `cargo
+# package` must not pick them up.
+/dist
+
 # AgentChecksum machine-local state.
 # NOTE: .agentchecksum/baseline.json is intentionally committed — CI compares
 # against the behavioral baseline recorded in the repository.

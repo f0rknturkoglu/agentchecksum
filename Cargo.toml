@@ -7,6 +7,28 @@ rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 description = "Language-agnostic dependency fingerprint and behavioral regression gate for AI agents"
 repository = "https://github.com/f0rknturkoglu/agentchecksum"
+readme = "README.md"
+keywords = ["ai-agents", "llm", "regression-testing", "mcp", "cli"]
+categories = ["command-line-utilities", "development-tools::testing"]
+# What an installer needs. Development material stays in the repository: CI
+# configuration, the phase plans, the release tooling, the test fixture servers and
+# the toolchain pin are not something `cargo install` should download, and the
+# fixtures cannot be run from a published crate anyway (they need dev-dependencies).
+exclude = [
+    ".github/",
+    "scripts/",
+    "demo/",
+    "action.yml",           # the composite action's manifest, for consumers of the repo
+    "docs/plans/",
+    "docs/releasing.md",    # a maintainer checklist, not a user reference
+    "examples/",
+    # The integration suites drive the fixture servers under `examples/`, which are
+    # not shipped: a tarball holding tests that cannot run would be worse than one
+    # holding none.
+    "tests/",
+    ".gitignore",
+    "rust-toolchain.toml",
+]
 
 [dependencies]
 # CLI parsing; hand-rolling argument handling is unjustifiable.

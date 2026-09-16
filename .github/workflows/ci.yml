@@ -43,3 +43,10 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+
+      # The binary passing its own tests is not the same claim as the crate being
+      # publishable: packaging resolves the manifest, honours `include`/`exclude` and
+      # builds the package in isolation. It is quick, and it fails here rather than on
+      # the day someone tries to release.
+      - name: Package
+        run: cargo package --locked
