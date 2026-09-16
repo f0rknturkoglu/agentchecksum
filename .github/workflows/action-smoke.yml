@@ -20,7 +20,7 @@ jobs:
     name: The published action, against the published release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The action runs one command in *your* project, so this job needs a project.
       # `[model]` is declared because the agent checksum is computed from the dependency
@@ -41,6 +41,10 @@ jobs:
             'path = "prompts/system.md"' \
             > project/agentchecksum.toml
 
+      # Deliberately not pinned to a commit SHA, unlike every other `uses:` in this
+      # repository: the point of this workflow is to prove the public moving tag
+      # resolves and that the action behind it can fetch and verify a release. Pinning
+      # it here would test something nobody uses.
       - uses: f0rknturkoglu/agentchecksum@v0.1
         with:
           command: snapshot
