@@ -1,235 +1,48 @@
 # AgentChecksum
 
-> **Know what changed in your agent — and whether it broke.**
+**Know what changed in your agent — and whether it broke.**
+
+[![CI](https://github.com/f0rknturkoglu/agentchecksum/actions/workflows/ci.yml/badge.svg)](https://github.com/f0rknturkoglu/agentchecksum/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 AgentChecksum is a language-agnostic dependency fingerprint and behavioral regression gate for AI
-agents.
+agents. It is one Rust binary, with no service, no database and no telemetry.
 
-An agent's behavior does not depend only on its source code. It also depends on the model, its
-quantization, the provider, inference parameters, system prompts and prompt files, tool lists, tool
-schemas, tool *descriptions*, tool permissions, MCP servers and their protocol era, retrieval
-configuration, and guardrails. Change one of those and the agent still compiles, still runs, and
-quietly misbehaves: it picks the wrong tool, sends the right tool the wrong arguments, breaks its
-output format, or skips a call it should have made.
+An agent's behavior does not live in its source code alone. It also lives in the model behind the
+endpoint, the inference parameters, the prompts, the skills, the MCP servers, and the tool contracts
+those servers declare. Any of those can change without breaking a build: a quantized model, a
+rewritten system prompt, a tool description somebody improved on a Friday. The tests still pass, the
+code still compiles, and the agent quietly starts choosing the wrong tool.
 
-AgentChecksum answers two questions, in the order that matters:
-
-```text
-WHAT changed?                    DID it break?
-Dependency Checksum   ─────►     Behavior Gate
-```
-
-It is not an observability platform, a tracing dashboard, an agent framework, or an eval SaaS.
-It is a lockfile, a semantic diff, and a CI gate — for agents.
-
-## Status
-
-This is a young project; the table says exactly what runs today.
-
-| Capability | State |
-|---|---|
-| `init` — config + probe scaffolding | **works** |
-| `snapshot` — Model, Prompt, MCP server and MCP tool discovery; byte-deterministic `agentchecksum.lock` | **works** |
-| `diff` — semantic dependency diff, per-facet risk, human and JSON output | **works** |
-| MCP discovery — server era, tool contracts, declared annotation capabilities | **works** |
-| `check` — behavioral probes, policy, the regression gate, `--accept`, `--trace`, `--jobs` | **works** |
-| `inspect probes` — what is configured, what each probe asserts, what it feeds | **works** |
-| Demo project, GitHub Action, prebuilt releases | planned |
-
-Design decisions live in [`docs/specs`](docs/specs); the implementation plan for the current phase
-lives in [`docs/plans`](docs/plans).
-
-## Build
-
-```bash
-cargo build --release      # target/release/agentchecksum
-```
-
-Rust 1.98.1, edition 2024, single crate, single binary. No runtime, no database, no service.
-
-## Quickstart
-
-```bash
-agentchecksum init        # writes agentchecksum.toml and an example probe
-agentchecksum snapshot    # fingerprints the agent, writes agentchecksum.lock
-# ... someone edits a prompt, a model, or an MCP tool ...
-agentchecksum diff        # what changed, and how risky it is
-agentchecksum check       # did it break? sample the agent, compare, gate
-```
-
-```console
-$ agentchecksum snapshot
-Agent checksum generated.
-
-Checksum:
-ac1:53bc19ec0e230dd63e7f31fe1f1847fde4f257e43764a9fdfb9c535bf19a19e1
-
-Dependencies:
-1 prompt
-```
-
-`agentchecksum.lock` is committed. It is the baseline every future comparison is made against.
-
-### A real diff
-
-Same prompt, different layout — the words are identical, so this is a formatting change and the risk
-reflects that:
-
-```console
-$ agentchecksum diff
-
-AgentChecksum diff
-
-Baseline: ac1:53bc19ec0e230dd63e7f31fe1f1847fde4f257e43764a9fdfb9c535bf19a19e1
-Current:  ac1:7650a9fd47a3d737cff272e794934fb3ea1191c75f19ee68ad7015f57d972109
-
-1 dependency changed.
-
-PROMPT  prompts/system.md  LOW
-  content  sha256:bfad161d… → sha256:71fc3c90…
-    classification: formatting-only
-  shape    unchanged
-
-Overall behavioral risk: LOW (heuristic)
-```
-
-Two things are deliberate in that output. Every facet that was compared appears, including the one
-that did **not** move — so a reader can tell a facet that was checked from one that was never looked
-at. And the risk is labelled a heuristic, because it is one.
-
-### The diff this project exists for
-
-The same mechanism runs over MCP tool definitions. This is the shape from the design spec's primary
-demo — a "harmless documentation edit" that passes code review and passes API-compatibility checks:
+AgentChecksum answers two questions about that state:
 
 ```text
-TOOL  demo-tools.search_repos                MEDIUM
-  description    sha256:11aa88ff… → sha256:99bbccdd…
-  input_schema   unchanged
-  output_schema  unchanged
+WHAT changed?   →  dependency fingerprint, then a semantic diff with behavioral risk
+DID it break?   →  behavior probes, scored against a baseline you accepted, behind a gate
+```
+
+It reads, parses, normalizes, hashes and compares. It never imports your agent, and it never executes
+a tool a model asked for.
+
+```console
+$ agentchecksum diff          # a tool description changed; the schema did not
+TOOL  github.search_repositories  MEDIUM
+  capabilities  unchanged
+  description   sha256:9244b04a… → sha256:585836c7…
+    classification: text-changed
+  input_schema  unchanged
 
 Overall behavioral risk: MEDIUM (heuristic)
-```
 
-The API did not break. The agent did.
-
-## The Behavior Gate
-
-`diff` answers *what changed*. `check` answers the second question: **did it break?** It samples the
-agent through `[model]`, scores each sample against the expectations the probes declare, compares the
-result against a committed baseline, applies policy, and exits with a code CI can act on.
-
-```console
-$ agentchecksum check
-
-AgentChecksum check
-
-Agent checksum: ac1:ca92e73c857f9c1e8289dd3da4e497412308a21d887f1c31cbb8c0bfd306a25d
-
-No dependency changes detected.
-
-Behavioral probes: 0 / 1 passed
-argument_validity  n/a → 0%  WARN
-tool_restraint     100% → 0%  FAIL
+$ agentchecksum check         # and the behavior moved with it
+Behavioral probes: 1 / 2 passed
+tool_restraint        100% → 0%  FAIL
 
 Policy failures:
   tool_restraint: score 0.0000 is below the required minimum 1.0000
 
-Failing probes:
-  no-tools  0 / 1 passed
-    sample 0: argument_validity `web_search` is not a declared tool, so its arguments cannot be checked
-    sample 0: tool_restraint 1 tool was called
-
 Behavior Gate: FAIL    exit 1
 ```
-
-The probe that produced that verdict is a file:
-
-```toml
-[[probe]]
-name = "no-tools"
-prompt = """
-Answer from what you already know, without calling any tool: what is the capital of
-Portugal?
-"""
-expect_no_tool = true
-```
-
-Five expectations exist, and a probe must declare at least one: `expect_tool`, `expect_args`
-(JSON Pointer → matcher, requires `expect_tool`), `forbid_tools`, `expect_no_tool`, and
-`output_schema`. The six resulting metrics are all scored the same way — **1.0 is good** — which is
-why one policy vocabulary (`min` for a floor, `max` for a ceiling, `max_drop` against the baseline)
-describes all of them:
-
-```toml
-[policy]
-fail_on_risk = "critical"
-
-[policy.metrics.tool_restraint]
-min = 1.0
-
-[policy.metrics.argument_validity]
-max_drop = 0.05
-```
-
-### What the verdict refuses to claim
-
-The gate is built so that the less it knows, the less it says:
-
-- **A count, not a percentage.** `passed`/`total` is what a baseline records, because `0.9` invites an
-  argument that `9 / 10` does not.
-- **A metric nothing measured is absent, not zero.** `argument_validity` applies only to samples that
-  called a tool; a probe that calls nothing does not get a free 1.0.
-- **A row with no policy says `WARN`, not `PASS`.** "No threshold failed" and "the behavior was good"
-  are different claims, and a table should not make the second one by accident.
-- **Drift is not regression.** No baseline, or a changed probe suite, exits `0` (unless
-  `--fail-on-drift`) and says why: the scores on either side answer different questions. Only a policy
-  that actually failed is a `FAIL`.
-- **A check that could not finish is never a `PASS`.** An unreachable model, an invalid probe, a
-  malformed response: exit `3`, with the diagnostic. `--no-probes` is the explicit way to skip.
-- **The runner observes; it never executes.** No `tools/call`, no MCP request, no sandbox, nothing the
-  model asked for is ever run. The recorded tool decisions *are* the evidence.
-
-### Replaying recorded evidence
-
-`check --trace <path>` scores a recorded run instead of sampling a model: no request, no endpoint, no
-`[model]` connection — the same evidence, the same deterministic evaluation, on a machine that cannot
-reach the model at all. The path may name a single recorded trace or a whole run artifact.
-
-Evidence is only scored when it demonstrably describes the agent being measured *now*. The recorded
-run carries the context it was captured with, and every part of it has to agree with the current one:
-
-| The evidence says | It must equal |
-|---|---|
-| `agent_checksum` | the agent this project fingerprints now |
-| `captured_with.tool_catalog_digest` | the catalog the model would be shown now |
-| `probe_suite_digest` (run artifacts) | the probe suite being scored now |
-| `captured_with.runner` / `runner_version` | the runner this build implements |
-| `probe` / `probe_digest` / sample count | the probe being asserted now |
-
-Anything else is **unusable evidence, not a verdict**: exit `3`, with the fact that disagrees named.
-It is never silently treated as drift, as a regression, or as a cache miss and re-captured. The
-practical consequence is worth stating plainly — a replay is a reproduction of a measurement, not a
-way to score an old agent against a new one. Evidence captured before a dependency change is refused
-rather than reinterpreted, because scoring it would attribute one agent's behavior to another.
-
-The same rule applies one level down, to what a call claims about itself. A recorded call that carries
-a canonical `tool_id` is asserting an identity, and both halves of that assertion are checked: the
-tool must exist in the catalog, and its declared name must be the name the call reported. A model that
-invents a name carries no `tool_id` and is *measured* — a hallucinated tool is behavior worth scoring,
-not a corrupt record — while a call whose `tool_id` and `name` contradict each other is refused, since
-believing either half would award credit for a tool the model never called.
-
-Baselines are compared under the same discipline. A committed baseline records the runner contract it
-was produced under, and a baseline from another contract is non-comparable: its scores came from
-different capture rules, so `max_drop` is not evaluated against it and the check reports **drift** with
-the reason. Absolute thresholds are applied regardless — a floor this run misses is a fact about this
-run.
-
-`check --accept` is how a verdict becomes the baseline. It refuses to run while the dependency state
-has moved — scores captured against a dependency set nobody committed would be attributed to the
-wrong revision — and it writes counts, digests and yardstick digests, never prompts, model output, or
-tool arguments.
 
 ## What it fingerprints
 
@@ -238,169 +51,348 @@ tool arguments.
 | `model` | identity (provider, id, content digest, quantization, family, size), inference parameters, chat template, capabilities |
 | `prompt` | content, whitespace-collapsed shape |
 | `mcp` | server identity — era, negotiated protocol version, supported versions, server info, declared capabilities |
-| `tool` | input schema, output schema, description (+ shape), annotation capabilities |
+| `tool` | input schema, output schema, description (plus its shape), annotation capabilities |
 
-`shape` exists so that a whitespace-only change (LOW) is distinguished from a semantic change
-(MEDIUM) deterministically, with no LLM in the loop.
+Every dependency is normalized before it is hashed, so a reordered key or a trailing newline does not
+produce a false change, and a moved `required` field always does. Digests are SHA-256 over RFC 8785
+canonical JSON, which is a specification rather than a convention.
 
-## MCP servers and tools
+## What it is not
 
-An MCP server is fingerprinted where it is declared in `agentchecksum.toml`:
+Not an agent framework, not a tracing system, not an observability platform, not an eval SaaS. It has
+no dashboard, no hosted service, no LLM judge, and it sends nothing anywhere except the model endpoint
+you configured, and only while capturing behavior. If you want to watch an agent run, this is the
+wrong tool; if you want to know whether a change to its dependencies changed what it does, it is the
+right one.
 
-```toml
-[[mcp.servers]]
-name = "demo-tools"           # the alias: it prefixes every dependency id
-transport = "stdio"
-command = "uvx"               # executed directly, never through a shell
-args = ["demo-tools-server"]
-# env = { DEMO_TOKEN = "…" }  # passed to the child, never fingerprinted, redacted in diagnostics
+## Install
 
-# or a remote server:
-# [[mcp.servers]]
-# name = "remote"
-# transport = "streamable-http"
-# url = "https://example.com/mcp"
+### From source (works today)
+
+```bash
+git clone https://github.com/f0rknturkoglu/agentchecksum
+cd agentchecksum
+cargo build --release
+./target/release/agentchecksum --version     # agentchecksum 0.1.0
 ```
 
-Both transports are supported: **`stdio`** (the configured command is executed directly, with the
-configured argument vector — never through a shell) and **`streamable-http`** (`http`/`https` only;
-credentials, query strings, and fragments in the URL are rejected rather than stripped, and redirects
-are not followed).
+Rust 1.98 or newer. The repository pins its compiler in `rust-toolchain.toml`, so a source build uses
+exactly the toolchain the test suite was verified against; CI installs that pin rather than choosing
+its own.
 
-Session establishment is a two-step policy, and only the server can trigger the second step: AgentChecksum
-asks for the stateless protocol first, and falls back to the session handshake only when the server answers
-that it does not implement it. A slow server is a **failure**, never a legacy one — timing is not evidence
-about a protocol era, and letting it decide one would mean identical declarations fingerprinted differently
-from one run to the next.
+### Prebuilt binaries (after the first tagged release)
 
-Each server becomes a dependency `mcp:<alias>` carrying its identity and, when the server declares them,
-its **instructions** — the prose it gives the model about how to use it. Instructions are fingerprinted the
-way a prompt or a tool description is, as a content digest plus a whitespace-collapsed shape digest, so a
-reflow reads as LOW and a rewrite as MEDIUM, and the lockfile keeps hashes rather than server prose.
-Changing only the instructions, with every tool untouched, is therefore still a dependency change. Each
-declared tool becomes
-`tool:<alias>.<name>` — the name is percent-encoded, so two distinct names can never produce one id —
-carrying its description, its input schema, its output schema when it declares one, and its annotation
-capabilities. The alias is a namespace, not a display name: renaming it is an identity change, and it is
-deliberately restricted to `[A-Za-z0-9_-]+` because a dot would collide with the separator between alias
-and tool.
+`v0.1.0` has not been tagged yet, so no release assets exist. Once it is, the release workflow builds
+these archives on native runners and attaches them to the GitHub Release, with a `SHA256SUMS` manifest
+beside them:
 
-**Discovery never calls a tool.** It connects, asks the server what it declares, and closes: no tool is
-ever invoked on your behalf, so a snapshot cannot exercise the side effects a tool call would have.
-`prompts/*`, `resources/*`, tasks, sampling, roots, elicitation, and subscriptions are out of scope.
+```text
+agentchecksum-v0.1.0-aarch64-apple-darwin.tar.gz      macOS, Apple Silicon
+agentchecksum-v0.1.0-x86_64-apple-darwin.tar.gz       macOS, Intel
+agentchecksum-v0.1.0-x86_64-unknown-linux-gnu.tar.gz  Linux, x86_64
+agentchecksum-v0.1.0-x86_64-pc-windows-msvc.zip       Windows, x86_64
+```
 
-What is deliberately left out of the fingerprint is as settled as what goes in: transport and session
-plumbing (PIDs, ports, session ids, cache hints, timings), configured commands and environment variables,
-server stderr, cosmetic metadata (`title`, `icons`), and opaque `_meta` and extension *settings* (their
-presence and identifiers are reported — one aggregated warning per server — but never their values). The
-bounds on discovery —
-timeouts, page count, tool count, schema size and nesting depth — live in a single file, and exceeding one
-fails the run rather than truncating the inventory: a lockfile that describes a partial server is worse
-than no lockfile. Discovery is fail-closed. One server that cannot be fully discovered fails the command,
-nothing is written, and a duplicate id stops the run before a lockfile exists.
+Each archive holds the binary, this README and both license files. Verify a download before running
+it:
 
-Tool annotations are recorded as declared: AgentChecksum folds in the protocol defaults and reports the
-effective tokens (`read-only`/`write`, `destructive`/`non-destructive`, `idempotent`/`non-idempotent`,
-`open-world`/`closed-world`). They are hints a server declares about itself, not guarantees — a server
-that says `read-only` may still write, and nothing in the output claims otherwise.
+```bash
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf agentchecksum-v0.1.0-aarch64-apple-darwin.tar.gz
+./agentchecksum-v0.1.0-aarch64-apple-darwin/agentchecksum --version
+```
 
-Those tokens are also what makes one diff case stricter than the rest. A newly added tool is HIGH because
-it is new invocation surface; a newly added tool whose own declaration names it **write-capable and
-destructive** is CRITICAL — the worst thing a diff can discover on its own, and still only a *declared*
-one. The escalation needs both tokens, and a capability payload this build cannot decode leaves the
-ordinary added-tool risk in place rather than inflating or deflating it.
+### Cargo (after publication)
 
-Session establishment is deliberately strict about one thing: AgentChecksum falls back to the session
-protocol only when the server answers, in so many words, that it does not implement `server/discover`
-(`-32601`). Every other answer — a generic error, an internal failure, a timeout, a transport or
-authorization problem — is a **failure**, not evidence that the server is old. Nothing about timing or
-reachability is allowed to change which protocol era a dependency is fingerprinted under.
+Once the crate is published to crates.io:
 
-Because no credential-derived value is fingerprinted, rotating a token that does not change what the
-server declares produces the same checksum. And because configured environment values are connection
-material, every non-empty one is redacted out of everything you can see — stdout, stderr, warnings,
-errors, tracing, the lockfile — including text a server echoes back. There is no length threshold: a
-three-character token is treated like any other. This is a guarantee about values you configured, not a
-claim to recognize secrets AgentChecksum was never given.
+```bash
+cargo install agentchecksum --locked
+```
 
-The boundary is enforced in the other direction too, because a server is handed its environment and can
-echo it back: if a server reflects a configured value into anything AgentChecksum would fingerprint — its
-own name or version, its instructions, a tool name, a tool description, the protocol revisions it reports,
-or any key or string inside a schema — discovery **fails** rather than describing it. The declaration is not rewritten and the value is
-not blanked out inside the contract; a fingerprint taken over an edited declaration would describe a
-contract the server never declared. What a server sends in opaque fields AgentChecksum never reads, such
-as tool `_meta`, is not scanned either: unread data cannot reach a fingerprint. When credentials do change the declared contract — a
-narrower set of authorized tools, for example — that is a real dependency change, and it is reported as
-one.
+That path does not work yet — the crate has not been published. It is listed here so the plan is not a
+surprise, not to suggest it is available.
 
-## Exit codes
+## Five-minute quickstart
+
+```bash
+agentchecksum init            # agentchecksum.toml, probes/, and an example probe
+$EDITOR agentchecksum.toml    # name your agent, point [model] at a provider, declare prompts
+agentchecksum snapshot        # discover dependencies, write agentchecksum.lock
+
+git add agentchecksum.toml agentchecksum.lock probes/
+git commit -m "Fingerprint the agent"
+```
+
+`agentchecksum.lock` is the dependency baseline: every later comparison is made against it, so it is
+reviewed and committed like source.
+
+Then, when something changes:
+
+```bash
+agentchecksum diff            # what changed, and how risky it is (never fails a build)
+agentchecksum check           # did it break? sample the probes, compare, gate
+agentchecksum check --accept  # accept the measured behavior as the new baseline
+```
+
+`check` needs a model to sample: either a local Ollama server, or any OpenAI-compatible endpoint. If
+nothing is configured for it, it says so and exits 3 rather than pretending it measured something.
+`agentchecksum check --diff-only` gates on the dependency half alone when no model is available.
+
+### What to commit
+
+| Path | Kind | Committed? | What it holds |
+|---|---|---|---|
+| `agentchecksum.toml` | source contract | **yes** | the configuration, reviewed like code |
+| `probes/*.toml` | source contract | **yes** | the assertions; a probe's name is its identity in the baseline |
+| `agentchecksum.lock` | generated | **yes** | the dependency baseline; written only by `snapshot` |
+| `.agentchecksum/baseline.json` | generated | **yes** | the accepted behavior; written only by `check --accept`. Counts, digests and tool-schema digests — never prompts, model output or tool arguments |
+| `.agentchecksum/cache/` | machine-local | **no** | cached samples. **Contains raw model output** |
+| `.agentchecksum/runs/` | machine-local | **no** | run artifacts: recorded evidence and its evaluation. **Contains raw model output** |
+
+The two machine-local directories are in the repository's `.gitignore` for exactly this reason. A
+project that has never run `check --accept` has no `baseline.json` at all; committing one is how a
+team agrees on what "correct behavior" means.
+
+## Configuration
+
+```toml
+version = 1
+
+[agent]
+name = "research-agent"
+
+[model]
+provider = "openai-compatible"        # or "ollama"
+id = "qwen3:8b-q4"
+endpoint = "http://localhost:11434"
+params = { temperature = 0.0, seed = 42 }
+
+[[prompts]]
+path = "prompts/system.md"
+
+[[mcp.servers]]
+name = "github"                       # the alias that prefixes every dependency id
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+# Passed to the server as written: no shell or `${VAR}` expansion, and never
+# fingerprinted. Keep it out of the file by generating the config in CI.
+env = { GITHUB_TOKEN = "ghp_example_token" }
+
+[probes]
+path = "probes"
+repeat = 3
+
+[policy]
+fail_on_risk = "critical"
+
+[policy.metrics.tool_selection]
+min = 0.95
+
+[policy.metrics.argument_validity]
+max_drop = 0.05
+```
+
+Every key, every provider and every policy constraint is documented in
+[docs/configuration.md](docs/configuration.md). `agentchecksum init` writes a commented version of
+this file, so the first thing you read is the configuration you are about to edit.
+
+## Behavior probes
+
+A probe asks one question and declares what a correct answer looks like. `check` samples the model
+through `[model]` and scores what came back.
+
+```toml
+# A tool must be called, with arguments that satisfy matchers.
+[[probe]]
+name = "repository-search"
+prompt = "Find repositories about PostgreSQL vector search."
+expect_tool = "search_repositories"
+expect_args = { query = { contains = "postgres" }, per_page = { equals = 20 } }
+forbid_tools = ["delete_file"]
+
+# No tool may be called at all.
+[[probe]]
+name = "no-tools-when-not-asked"
+prompt = "Answer from what you already know: what is the capital of Portugal?"
+expect_no_tool = true
+
+# The final message must be JSON that validates against a schema.
+[[probe]]
+name = "structured-answer"
+prompt = "Return the result in the required schema."
+output_schema = "schemas/answer.json"
+```
+
+Exactly five expectation keys exist — `expect_tool`, `expect_args`, `forbid_tools`, `expect_no_tool`,
+`output_schema` — and a probe must declare at least one. `expect_args` maps an RFC 6901 JSON Pointer
+to one of three matchers: `equals`, `contains`, `one_of`.
+
+`repeat` is the number of samples per probe. An expectation that held once is an observation; one that
+held in twenty of twenty is a measurement, and the six metrics are exact counts for that reason —
+`9 / 10`, never a rounded `0.9`:
+
+`tool_selection`, `argument_validity`, `argument_expectation`, `forbidden_tool_usage` (restraint),
+`tool_restraint`, `structured_output_validity`. Every one of them is **1.0 is good**, which is why one
+small policy vocabulary (`min`, `max`, `max_drop`) describes all of them.
+
+Full reference: [docs/probes.md](docs/probes.md).
+
+## In CI
+
+`check` is the command that fails a build. `diff` never does: it reports what changed and lets your
+policy decide, so the exit code stays useful for telling "found danger" from "could not compare".
+
+```yaml
+name: AgentChecksum
+on: pull_request
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # `check` samples the model in [model], so the job needs an endpoint it can
+      # reach. AgentChecksum sends no credentials, so that endpoint must not require
+      # any: a local Ollama server, or a self-hosted OpenAI-compatible one.
+      - run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          ollama pull qwen3:8b-q4
+
+      # The composite action runs one AgentChecksum command and lets its exit code
+      # decide the step. `@main` works today; pin a tag once v0.1.0 is released.
+      - uses: f0rknturkoglu/agentchecksum@main
+        with:
+          command: check
+```
+
+If the model cannot be reached from the job, `--diff-only` still gates on the dependency half and
+needs no endpoint at all.
+
+The action is a thin wrapper: it finds a binary (a published release for the platform, or a source
+build when there is no release for it yet), runs your command in your project, prints stdout and
+stderr unchanged, and exits with the CLI's own code. It never reinterprets a verdict.
+
+Exit codes, the `--from` PR-gate variant, and capturing a baseline in a controlled job:
+[docs/ci.md](docs/ci.md).
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. `diff` uses this **even when the change is CRITICAL**, and `check` uses it for drift — they report, the policy decides |
-| `1` | Gate failure — a metric policy failed, or `--fail-on-drift` / `--fail-on-risk` turned a change into one |
-| `2` | Usage error, including a flag combination that cannot mean anything |
-| `3` | Runtime error — config, discovery, network, unsupported input, an interrupted check |
+| `0` | Completed. `diff` uses this even at CRITICAL risk; `check` uses it for drift unless `--fail-on-drift` asked for a gate |
+| `1` | Gate failure — a metric policy failed, or a change was explicitly gated |
+| `2` | Usage error — a flag combination with two readings |
+| `3` | The check could not be evaluated: config, discovery, network, invalid probe, unusable evidence. **Not a behavioral verdict, and never PASS** |
 
-Comparing successfully and finding danger are different outcomes, and the exit codes keep them
-apart so CI can tell them apart.
+## MCP servers and tool contracts
 
-## Machine-readable output
+MCP is a first-class dependency source: `snapshot` reads the server identity, its tool list, each
+tool's input and output schema, and its description. Both `stdio` and `streamable-http` transports are
+supported.
 
-`--format json` puts one JSON document on stdout and nothing else, so it is always parseable:
+Discovery never calls a tool, and it never fingerprints a partial catalog — a server that fails
+mid-enumeration is an error, not a smaller dependency set. Configured `env` values are passed to the
+server, are **never** fingerprinted, and never appear in diagnostics; if a credential changes the
+declared contract, that change is reported as the dependency change it is. The configuration file is
+the trust boundary, which is why it is committed and reviewed like any other input.
+
+## Trust model
+
+- **What is executed:** the MCP servers you configured (to ask what they declare), and nothing else.
+  Capturing behavior makes exactly one outbound connection per sample, to the model endpoint in
+  `[model]`.
+- **What is never executed:** anything a model asks for. A probe records the tool calls a model emits
+  and scores them; there is no `tools/call`, no sandbox, no plugin loading.
+- **What is stored:** the lockfile and the baseline in your repository (digests, counts and scores
+  only), and raw model answers under `.agentchecksum/cache` and `.agentchecksum/runs`, which are
+  machine-local and gitignored. Treat those as you would treat model output anywhere else.
+- **What is validated:** probe output schemas and tool input schemas run through `jsonschema` with
+  HTTP and file resolution disabled, so a schema that needs a remote reference is refused rather than
+  fetched.
+
+Details: [docs/security.md](docs/security.md).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `agentchecksum init` | Scaffold `agentchecksum.toml`, `probes/`, and an example probe |
+| `agentchecksum snapshot` | Discover dependencies and write `agentchecksum.lock` |
+| `agentchecksum diff` | Semantic dependency diff with per-facet behavioral risk. Reports; never gates |
+| `agentchecksum check` | The gate: dependency diff plus behavior probes, policy, one verdict |
+| `agentchecksum inspect probes` | Debug view of the parsed probe suite: what each probe asserts, which tools it references, which metrics it feeds |
+
+Global flags: `--format human\|json`, `--config <path>`, `--lock <path>`, `--from <path>` (compare
+against another lockfile — how CI compares a pull request with its base revision).
+
+`check` adds `--accept`, `--diff-only`, `--probes-only`, `--no-probes`, `--trace <path>`, `--refresh`,
+`--repeat <n>`, `--jobs <n>`, `--fail-on-drift` and `--fail-on-risk <level>`. `agentchecksum check
+--help` is the authority.
+
+### Replaying recorded evidence
+
+`check --trace <trace-or-run-artifact>` scores a recorded run instead of calling a model: no request,
+no endpoint needed. It is bound to the context it describes — agent checksum, tool catalog digest,
+runner and its version, probe identity, and the probe suite — so evidence from a different agent,
+catalog or suite is refused with exit 3 rather than scored as yours. A replay also never writes a
+baseline: `--accept` accepts only from a live run.
+
+## The honesty of a verdict
+
+These are the distinctions the tool is built around, and they are visible in its output rather than
+buried in documentation:
+
+- Static risk classification is a **heuristic**. The report says so.
+- Model sampling is **statistical**; evaluation over recorded evidence is **deterministic**. A probe
+  result is a pass rate, not a proof.
+- **Drift is not regression.** A missing baseline, a changed probe suite, or a baseline recorded under
+  a different runner contract exits `0` unless you asked otherwise, and says why: the scores on either
+  side answer different questions.
+- **A metric nothing measured is absent**, not perfect. `argument_validity` applies only to samples
+  that called a tool.
+- **A row nothing judged reads `WARN`**, not `PASS`. "No threshold failed" and "the behavior was good"
+  are different claims.
+- **A check that could not finish is never `PASS`.** It exits 3 with the diagnostic.
+
+## Demo
+
+A deterministic, offline walkthrough of the whole story — fingerprint, a tool description change, a
+behavioral baseline, a regression, and an offline replay — using the real CLI and two local fixture
+servers:
 
 ```bash
-agentchecksum diff --format json | jq '.overall_risk, .changes[].id'
+./demo/run.sh
 ```
 
-A runtime failure writes its diagnostic to stderr and leaves stdout empty. The documented shape is
-in [spec §8.4](docs/specs).
+See [demo/README.md](demo/README.md).
 
-`check --format json` emits the whole verdict as one document — `status`, `agent_checksum`,
-`baseline_checksum`, `dependency`, `behavior`, `error` — and every field is always present, `null` or
-`[]` where there is no answer, so a consumer never has to tell a missing key from an absent result:
+## Limitations
+
+Deliberate, at this version: no LLM judge, no regex matchers, no multi-turn or tool-result evaluation,
+and **no credentials of any kind** — AgentChecksum sends no authentication header, so the model
+endpoint must be reachable without one (local Ollama, or a self-hosted OpenAI-compatible server). Trace
+*capture* is not bit-reproducible; trace *evaluation* is. `openai-compatible` exposes no content digest, so the endpoint is part of the model's
+identity and a model swapped behind the same URL cannot be detected; the CLI warns about that when it
+fingerprints one.
+
+## Development
 
 ```bash
-agentchecksum check --format json | jq '.status, .behavior.metrics[] | select(.verdict == "fail")'
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-## How it stays deterministic
+Rust 1.98.1, edition 2024, a single crate and a single binary. Design decisions live in
+[docs/specs](docs/specs); the phase plans under [docs/plans](docs/plans) are engineering history.
+Getting started, configuration, probes, CI and the release process are documented under
+[docs/](docs) and in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- Every JSON digest is **SHA-256 over RFC 8785 canonical JSON**, so key order, whitespace, and number
-  formatting can never influence a checksum. Text facets — prompt content, prompt shape, tool
-  descriptions — digest normalized text instead, because that is what a model reads.
-- A narrow, individually tested normalization layer above JCS: `required` order, `enum` order,
-  parameter-set order, CRLF/LF, missing-versus-empty.
-- Behavior-relevant content is **never** treated as insignificant: schema `description`, `title`,
-  `examples` and `default`, prompts, tool descriptions, chat templates, and capabilities all move the
-  fingerprint.
-- Timestamps, absolute paths, machine identifiers, discovery order, and vendor metadata
-  (`modified_at`, `size`, `license`) are excluded by an explicit, tested list.
-- The agent checksum is a function of dependency inputs only — never of lockfile serialization.
-
-## How it treats your project
-
-AgentChecksum reads, parses, normalizes, hashes, and compares. It does **not** import or execute the
-project it inspects: the only process it starts is the MCP server you configured in
-`agentchecksum.toml`, and only to ask what that server declares. That matters when CI is examining an
-untrusted pull request — the configuration file is the trust boundary, which is why it is committed and
-reviewed like any other input.
-
-`check` adds exactly one outbound connection — the model endpoint in `[model]` — and no capability
-beyond it. That connection is made only when a run is *captured*: probes never execute tools, schemas
-are never fetched (`jsonschema` runs with HTTP and file resolution disabled, so a schema that needs
-them is refused), and `--trace` evaluates recorded evidence without contacting anything. Capture is
-statistical — one sample is one request, and no retry pretends otherwise — while evaluation is a pure
-function of the recording, which is what makes a replay reproducible.
-
-A replay still needs the current agent to be *describable*: `check` fingerprints the dependency state
-it compares against, and for a provider whose identity requires a live server (Ollama's model digest,
-for example) that fingerprinting is the one thing replay cannot do offline. That is discovery, not
-replay, and it is the same requirement `snapshot` has.
-
-Known limitations, stated rather than discovered: no LLM judge, no regex matchers, no tool-result or
-multi-turn evaluation, no authentication for remote endpoints, and trace *capture* is not
-bit-reproducible (trace *evaluation* is).
+The checksum format, the lockfile and baseline schemas, the report schema and the exit codes are
+**contracts**. Changing one is a compatibility decision, not a refactor.
 
 ## License
 

@@ -160,7 +160,8 @@ agentchecksum inspect probes          Parsed probe suite and the metrics each pr
 --refresh                    Ignore the trace cache and re-sample.
 --repeat <n>                 Override probe sample count.
 --jobs <n>                   Probe concurrency for the model runner.
--v/--verbose, -q/--quiet     Diagnostics verbosity (overrides RUST_LOG default).
+RUST_LOG=<filter>            Diagnostics verbosity. Nothing is printed below `warn` by
+                             default (RUST_LOG=info for detail); output is stderr-only.
 ```
 
 ### 4.3 Exit codes
@@ -231,8 +232,9 @@ Notes:
 - `params` is hashed as a **source**: the configured values are fingerprinted separately from the provider's
   reported defaults rather than merged into an effective set (§7.5 explains why the merge is deliberately not
   attempted).
-- `${VAR}` expansion is supported for `env` values only. Expanded values are **never** written to the
-  lockfile.
+- `env` values are passed to the server **unchanged**: there is no `${VAR}` expansion at this
+  version, so a value is exactly the string written in the configuration. Environment values are
+  **never** written to the lockfile, never fingerprinted, and never repeated in a diagnostic.
 - The `name` alias — not MCP `serverInfo.name` — determines dependency identity, because the MCP
   specification does **not** guarantee `serverInfo.name` uniqueness across servers.
 

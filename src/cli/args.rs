@@ -160,7 +160,7 @@ pub enum Command {
         #[arg(long, value_name = "LEVEL", value_enum)]
         fail_on_risk: Option<RiskThreshold>,
     },
-    /// Debug view: dependencies, MCP server, probes.
+    /// Debug view of what is configured: the parsed probe suite.
     Inspect {
         #[arg(value_enum)]
         target: InspectTarget,
