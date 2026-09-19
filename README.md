@@ -6,7 +6,7 @@
 [![crates.io](https://img.shields.io/crates/v/agentchecksum.svg)](https://crates.io/crates/agentchecksum)
 [![GitHub release](https://img.shields.io/github/v/release/f0rknturkoglu/agentchecksum.svg)](https://github.com/f0rknturkoglu/agentchecksum/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-
+[![M8ven Score](https://m8ven.ai/badge/mcp/f0rknturkoglu/agentchecksum)](https://m8ven.ai/mcp/f0rknturkoglu/agentchecksum)
 AgentChecksum is a language-agnostic dependency fingerprint and behavioral regression gate for AI
 agents. It is one Rust binary, with no service, no database and no telemetry.
 
