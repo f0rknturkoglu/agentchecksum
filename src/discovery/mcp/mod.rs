@@ -324,6 +324,14 @@ pub async fn discover(config: &Config) -> Result<(Vec<Dependency>, Vec<String>)>
 /// the server, and a server is free to echo back whatever it was started with.
 pub(crate) struct Secrets(Vec<String>);
 
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 impl Secrets {
     pub(crate) fn from_config(server: &McpServerConfig) -> Self {
         // Every non-empty value, however short. A token is not less of a token for
@@ -344,6 +352,11 @@ impl Secrets {
         values.sort_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
         values.dedup();
         Self(values)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 
     /// Free-form text from an error, sanitized before anyone can see it.

@@ -123,8 +123,8 @@ brew install f0rknturkoglu/tap/agentchecksum
 
 Installs the prebuilt macOS binary — Apple Silicon or Intel — and compiles nothing.
 
-[distribution.md](docs/distribution.md) covers every channel, including `cargo-binstall`, which is
-prepared in the manifest and starts downloading release binaries with the next published version.
+[distribution.md](docs/distribution.md) covers every channel, including `cargo-binstall`, which uses
+prebuilt release archives on supported platforms from `v0.1.1`.
 
 ## Five-minute quickstart
 

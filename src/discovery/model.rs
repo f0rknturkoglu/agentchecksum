@@ -857,8 +857,11 @@ mod tests {
         assert!(matches!(err, Error::EndpointInvalid { .. }), "{err:?}");
 
         let rendered = format!("{err} {}", err.suggestion().unwrap_or_default());
-        assert!(!rendered.contains("secret"), "{rendered}");
-        assert!(!rendered.contains("user:"), "{rendered}");
+        let safe_rendered = rendered
+            .replace("secret", "[redacted]")
+            .replace("user:", "[redacted]");
+        assert!(!rendered.contains("secret"), "{safe_rendered}");
+        assert!(!rendered.contains("user:"), "{safe_rendered}");
     }
 
     #[test]

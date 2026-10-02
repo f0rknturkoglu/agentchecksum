@@ -813,9 +813,12 @@ path = "./prompts/system.md"
         .unwrap_err();
 
         let message = err.to_string();
-        assert!(message.contains("embedded credentials"), "{message}");
-        assert!(!message.contains("SECRET"), "{message}");
-        assert!(!message.contains("user"), "{message}");
+        let safe_message = message
+            .replace("SECRET", "[redacted]")
+            .replace("user", "[redacted]");
+        assert!(message.contains("embedded credentials"), "{safe_message}");
+        assert!(!message.contains("SECRET"), "{safe_message}");
+        assert!(!message.contains("user"), "{safe_message}");
     }
 
     #[test]

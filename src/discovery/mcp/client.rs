@@ -711,13 +711,20 @@ mod tests {
             "the server said: x7p",
         ] {
             let sanitized = configured.redact(text);
-            assert!(!sanitized.contains("x7p"), "{sanitized}");
-            assert!(!sanitized.contains("abc"), "{sanitized}");
-            assert!(sanitized.contains("[redacted]"), "{sanitized}");
+            let safe_sanitized = sanitized
+                .replace("x7p", "[redacted]")
+                .replace("abc", "[redacted]");
+            assert!(!sanitized.contains("x7p"), "{safe_sanitized}");
+            assert!(!sanitized.contains("abc"), "{safe_sanitized}");
+            assert!(sanitized.contains("[redacted]"), "{safe_sanitized}");
         }
 
         // An empty value would match everywhere, so it is not part of the set.
-        assert_eq!(configured.0.len(), 2, "{:?}", configured.0);
+        assert_eq!(
+            configured.len(),
+            2,
+            "unexpected number of configured secrets"
+        );
     }
 
     /// A value that contains another must not leave a fragment behind.
@@ -727,20 +734,41 @@ mod tests {
 
         let sanitized = configured.redact("token=abc123");
         assert_eq!(sanitized, "token=[redacted]");
+        let safe_sanitized = sanitized
+            .replace("123", "[redacted]")
+            .replace("abc", "[redacted]");
         assert!(
             !sanitized.contains("123"),
-            "a fragment survived: {sanitized}"
+            "a fragment survived: {safe_sanitized}"
         );
         assert!(
             !sanitized.contains("abc"),
-            "a fragment survived: {sanitized}"
+            "a fragment survived: {safe_sanitized}"
         );
+
+        // Multiple overlapping values in complex text.
+        let complex = configured.redact("header abc123 middle abc tail");
+        assert_eq!(complex, "header [redacted] middle [redacted] tail");
     }
 
     #[test]
     fn duplicate_values_are_collapsed() {
         let configured = secrets(&[("A", "same"), ("B", "same")]);
-        assert_eq!(configured.0.len(), 1, "{:?}", configured.0);
+        assert_eq!(
+            configured.len(),
+            1,
+            "unexpected number of configured secrets"
+        );
+    }
+
+    /// Secrets debug representation exposes only safe metadata.
+    #[test]
+    fn secrets_debug_does_not_reveal_values() {
+        let configured = secrets(&[("TOKEN", "x7p"), ("OTHER", "abc")]);
+        let debug = format!("{configured:?}");
+        assert_eq!(debug, "Secrets { count: 2 }");
+        assert!(!debug.contains("x7p"));
+        assert!(!debug.contains("abc"));
     }
 
     /// The single door every free-form string goes through.
@@ -751,9 +779,10 @@ mod tests {
         // The shape the previously unredacted warning paths used.
         let error = std::io::Error::other("the server answered: failure for x7p");
         let diagnostic = configured.diagnostic(&error);
+        let safe_diagnostic = diagnostic.replace("x7p", "[redacted]");
 
-        assert!(diagnostic.contains("[redacted]"), "{diagnostic}");
-        assert!(!diagnostic.contains("x7p"), "{diagnostic}");
+        assert!(diagnostic.contains("[redacted]"), "{safe_diagnostic}");
+        assert!(!diagnostic.contains("x7p"), "{safe_diagnostic}");
     }
 
     /// The two preferred revisions are named, never taken from the SDK's `LATEST`.

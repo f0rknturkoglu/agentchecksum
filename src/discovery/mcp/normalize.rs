@@ -664,8 +664,17 @@ mod tests {
         ] {
             assert!(rejected.reflection);
             let text = format!("{} {}", rejected.subject, rejected.reason);
-            assert!(!text.contains("x7p"), "{text}");
-            assert!(!text.contains("TOKEN"), "{text}");
+            let safe_text = text
+                .replace("x7p", "[redacted]")
+                .replace("TOKEN", "[redacted]");
+            assert!(
+                !text.contains("x7p"),
+                "secret reached rejection diagnostic: {safe_text}"
+            );
+            assert!(
+                !text.contains("TOKEN"),
+                "secret key reached rejection diagnostic: {safe_text}"
+            );
         }
     }
 
