@@ -7,7 +7,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet. The next entry lands when work starts on the version after `0.1.0`.
+Nothing yet.
+
+## [0.1.1] — 2026-10-02
+
+Tagged [`v0.1.1`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.1).
+
+A conservative patch release focusing on CI hardening, test-suite secret containment, CodeQL finding resolution, and distribution closure.
+
+### Security
+
+- **Safe test failure diagnostics:** Removed configured and sentinel secret formatting from test assertions and debug helpers across `src/discovery/mcp/` and `tests/mcp_discovery.rs`. Failing tests now sanitize surfaces prior to assertion formatting so test failures in CI can never leak credentials into build logs.
+- **Redacted debug representation:** Implemented safe `Debug` formatting for `Secrets` exposing only metadata (`count`) instead of sensitive inner collections.
+- **Documented adversarial test fixture:** Documented the intentional cleartext stderr emission in `examples/mcp_fixture_server.rs`, which simulates a hostile MCP server leaking a configured secret to verify AgentChecksum's process isolation and diagnostic sanitization boundary. The fixture is dev/test-only, excluded from the published crate, and correctly classified as `used in tests`.
+- **Added regression coverage:** Added tests verifying that hostile MCP server stderr with configured secrets remains isolated and diagnostics are redacted across all surfaces.
+
+### CI
+
+- **Least-privilege permissions:** Declared explicit `permissions: contents: read` on `.github/workflows/ci.yml`.
+- **CodeQL analysis:** Reviewed and resolved open CodeQL findings for workflow permissions and cleartext logging diagnostics.
+
+### Distribution
+
+- **`cargo-binstall` activation:** First release published with `[package.metadata.binstall]` metadata in `Cargo.toml`. `cargo binstall agentchecksum` can now resolve and download prebuilt release archives on supported platforms (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`) without compiling from source.
+
+### Maintenance
+
+- Merged automated dependency updates (`jsonschema` to 0.58.1, `clap` to 4.6).
+- Pinned GitHub Action dependencies via Dependabot.
+- Added community Code of Conduct.
 
 ## [0.1.0] — 2026-09-16
 
@@ -119,5 +147,6 @@ describes belong to a later phase. Prebuilt release binaries, the published crat
 composite action's download path all date from the first tagged release; there is no earlier state
 to install.
 
-[Unreleased]: https://github.com/f0rknturkoglu/agentchecksum/commits/main
+[Unreleased]: https://github.com/f0rknturkoglu/agentchecksum/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/f0rknturkoglu/agentchecksum/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0

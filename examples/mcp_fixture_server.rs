@@ -635,6 +635,12 @@ fn record_attempt() {
 fn main() {
     let spec = Arc::new(Spec::load());
 
+    // SECURITY TEST FIXTURE:
+    // This intentionally emits a sentinel supplied by the test harness via spec.stderr_secret.
+    // AgentChecksum must prove it redacts or isolates hostile MCP stderr so sensitive data
+    // never reaches diagnostics. Do not replace this with pre-redacted output, or the
+    // adversarial regression test becomes meaningless.
+    // codeql[rust/cleartext-logging] Intentional test-only credential emission in adversarial fixture
     if !spec.stderr_secret.is_empty() {
         eprintln!("{}", spec.stderr_secret);
     }

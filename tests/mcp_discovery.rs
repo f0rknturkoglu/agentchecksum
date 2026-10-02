@@ -742,9 +742,10 @@ fn assert_secret_absent(
     secret: &str,
 ) {
     for (surface, text) in credential_surfaces(project, output, json_report) {
+        let safe_text = text.replace(secret, "[redacted]");
         assert!(
             !text.contains(secret),
-            "`{secret}` reached {surface}: {text}"
+            "sensitive value reached {surface}: {safe_text}"
         );
     }
 }
@@ -755,9 +756,10 @@ fn assert_no_sentinel(project: &Project, output: &std::process::Output, json_rep
     // credential traveled in describes configuration the contract must not carry.
     if project.lock_exists() {
         let text = String::from_utf8_lossy(&project.lock_bytes()).to_string();
+        let safe_text = text.replace("TOKEN", "[redacted]");
         assert!(
             !text.contains("TOKEN"),
-            "the environment key reached the lockfile: {text}"
+            "the environment key reached the lockfile: {safe_text}"
         );
     }
 }
@@ -842,10 +844,10 @@ fn a_short_configured_token_never_reaches_any_surface() {
     );
     let output = run(echoed.path(), &["snapshot", "--format", "json"]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let safe_stderr = stderr(&output).replace(SHORT_SENTINEL, "[redacted]");
     assert!(
         stderr(&output).contains("[redacted]"),
-        "the value was never treated as a secret at all: {}",
-        stderr(&output)
+        "the value was never treated as a secret at all: {safe_stderr}"
     );
     assert_secret_absent(&echoed, &output, Some(&stdout(&output)), SHORT_SENTINEL);
 
@@ -886,9 +888,10 @@ fn a_server_echoed_value_never_reaches_a_failure_diagnostic() {
         diagnostic.contains("connecting and negotiating"),
         "{diagnostic}"
     );
+    let safe_diagnostic = diagnostic.replace(SHORT_SENTINEL, "[redacted]");
     assert!(
         diagnostic.contains("[redacted]"),
-        "the peer's text was dropped rather than sanitized: {diagnostic}"
+        "the peer's text was dropped rather than sanitized: {safe_diagnostic}"
     );
     assert_secret_absent(&project, &output, Some(&stdout(&output)), SHORT_SENTINEL);
 }
@@ -955,12 +958,37 @@ fn a_servers_own_stderr_never_reaches_a_diagnostic() {
     let output = project.snapshot();
 
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let safe_stderr = stderr(&output).replace(SENTINEL, "[redacted]");
     assert!(
         !stderr(&output).contains(SENTINEL),
-        "the server's stderr reached the diagnostic: {}",
-        stderr(&output)
+        "the server's stderr reached the diagnostic: {safe_stderr}"
     );
     assert!(!stdout(&output).contains(SENTINEL));
+}
+
+/// An adversarial server emitting a configured secret to stderr combined with a failure
+/// diagnostic verifies that hostile stderr is isolated and diagnostics are redacted.
+#[test]
+fn a_servers_stderr_emitting_configured_secret_never_leaks_and_is_sanitized() {
+    let project = Project::stdio(
+        json!({
+            "stderr_secret": SENTINEL,
+            "discover": "refused",
+            "discover_error_code": -32600,
+            "discover_error_message": format!("server error mentioning {SENTINEL}"),
+            "tools": [tool("search")]
+        }),
+        &[("TOKEN", SENTINEL)],
+    );
+
+    let output = run(project.path(), &["snapshot", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_secret_absent(&project, &output, Some(&stdout(&output)), SENTINEL);
+    let safe_stderr = stderr(&output).replace(SENTINEL, "[redacted]");
+    assert!(
+        stderr(&output).contains("[redacted]"),
+        "the diagnostic did not contain redaction marker: {safe_stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1798,9 +1826,12 @@ fn opaque_tool_metadata_is_one_warning_per_server_and_never_a_fingerprint() {
             .any(|line| line.contains("1 tool declared") && line.contains("`mcp:remote`")),
         "{warnings:?}"
     );
-    assert!(!report.contains(OPAQUE_KEY), "{report}");
-    assert!(!report.contains("private-note"), "{report}");
-    assert!(!report.contains(OPAQUE_VALUE), "{report}");
+    let safe_report = report
+        .replace(OPAQUE_KEY, "[redacted]")
+        .replace(OPAQUE_VALUE, "[redacted]");
+    assert!(!report.contains(OPAQUE_KEY), "{safe_report}");
+    assert!(!report.contains("private-note"), "{safe_report}");
+    assert!(!report.contains(OPAQUE_VALUE), "{safe_report}");
 
     // The same two servers, declaring the same tools without `_meta`.
     let plain = two_stdio_servers(
@@ -1958,9 +1989,10 @@ fn a_reported_protocol_version_that_reflects_a_configured_value_is_refused() {
     );
     // Neither the offending string nor the set it arrived in is repeated: the subject
     // names the position, not what was found there.
+    let safe_diagnostic = diagnostic.replace(SHORT_SENTINEL, "[redacted]");
     assert!(
         !diagnostic.contains(SHORT_SENTINEL),
-        "the diagnostic repeated the reported revision: {diagnostic}"
+        "the diagnostic repeated the reported revision: {safe_diagnostic}"
     );
     assert!(
         !diagnostic.contains("2026-07-28"),
@@ -1989,9 +2021,10 @@ fn a_tool_name_that_reflects_a_configured_value_is_refused_without_naming_the_to
     );
     assert!(diagnostic.contains("in a tool name"), "{diagnostic}");
     // Neither the name nor the id it would have produced is repeated anywhere.
+    let safe_diagnostic = diagnostic.replace(SHORT_SENTINEL, "[redacted]");
     assert!(
         !diagnostic.contains(SHORT_SENTINEL),
-        "the diagnostic repeated the tool name: {diagnostic}"
+        "the diagnostic repeated the tool name: {safe_diagnostic}"
     );
     assert_secret_absent(
         &project,
@@ -2064,9 +2097,10 @@ fn an_input_schema_key_that_reflects_a_configured_value_is_refused_without_repea
         diagnostic.contains("in the input schema of tool `search`"),
         "{diagnostic}"
     );
+    let safe_diagnostic = diagnostic.replace(SHORT_SENTINEL, "[redacted]");
     assert!(
         !diagnostic.contains(SHORT_SENTINEL),
-        "the diagnostic repeated the property name: {diagnostic}"
+        "the diagnostic repeated the property name: {safe_diagnostic}"
     );
 }
 

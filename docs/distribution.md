@@ -11,7 +11,7 @@ only how it arrives.
 | [GitHub Releases](#github-releases) | a prebuilt archive for four targets, or the source | live |
 | [crates.io](#cargo--cratesio) | compiles from the published crate | live |
 | [Homebrew](#homebrew) | a prebuilt macOS binary, no compilation | live |
-| [cargo-binstall](#cargo-binstall) | a prebuilt archive, no compilation | prepared — active from the next published version |
+| [cargo-binstall](#cargo-binstall) | a prebuilt archive, no compilation | live (from `v0.1.1`) |
 | [GitHub Action](#github-action) | runs the CLI in a workflow, download verified against `SHA256SUMS` | live |
 
 ## GitHub Releases
@@ -79,16 +79,14 @@ archive for the platform instead of compiling. The metadata is in `Cargo.toml` a
 release layout directly: one archive per target, named
 `agentchecksum-v<version>-<target>.<ext>`, with the binary in a directory of the same name.
 
-**Status: prepared, and active from the next published version.** `cargo-binstall` takes
-that table from the manifest of the version it is asked to install, and the published
-`0.1.0` predates it — so today `cargo binstall agentchecksum` still compiles from source.
-It starts using the release binaries as soon as a version carrying this metadata is
-published. Nothing else is missing: the metadata has been exercised against the live
-release, with no compilation:
+**Status: live from `v0.1.1`.** `cargo-binstall` reads `[package.metadata.binstall]` from the published
+crate manifest and downloads the release archive for the platform instead of compiling. Starting with
+`v0.1.1`, the published crate carries this configuration, so `cargo binstall agentchecksum` uses the
+prebuilt release binaries directly on supported targets without compiling from source:
 
 ```bash
-cargo binstall --manifest-path ./Cargo.toml --no-confirm agentchecksum@0.1.0
-# WARN The package agentchecksum v0.1.0 (aarch64-apple-darwin) has been downloaded from github.com
+cargo binstall --manifest-path ./Cargo.toml --no-confirm agentchecksum@0.1.1
+# WARN The package agentchecksum v0.1.1 (aarch64-apple-darwin) has been downloaded from github.com
 ```
 
 **Who updates it:** nobody. The metadata is part of the manifest, and the release workflow

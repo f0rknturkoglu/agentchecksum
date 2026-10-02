@@ -39,7 +39,7 @@ the newest release; older minors do not receive backports.
 | Any earlier `v0.x` release | no |
 | `main` (untagged) | best effort — the code is in flux and is not a release |
 
-`0.1.0` is released: tagged [`v0.1.0`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.0),
+`0.1.1` is released: tagged [`v0.1.1`](https://github.com/f0rknturkoglu/agentchecksum/releases/tag/v0.1.1),
 published on [crates.io](https://crates.io/crates/agentchecksum), and built for four targets. That
 release is the current supported version, and it is what a report should name. Reports against `main`
 or a local build are still welcome — they are just not covered by a support promise.
