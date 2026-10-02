@@ -414,4 +414,6 @@ The checksum format, the lockfile and baseline schemas, the report schema and th
 
 ## License
 
+Community participation is covered by our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 MIT OR Apache-2.0, at your option.

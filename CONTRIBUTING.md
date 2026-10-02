@@ -1,5 +1,7 @@
 # Contributing
 
+Please follow our [Code of Conduct](CODE_OF_CONDUCT.md) when participating in the project.
+
 AgentChecksum is one Rust crate and one binary. Contributions are welcome; this page covers the parts
 that are not guessable from the code: the pinned toolchain, the checks a change has to pass, how to
 run one test instead of all of them, and the schemas that are contracts rather than implementation
