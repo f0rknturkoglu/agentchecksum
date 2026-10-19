@@ -3,6 +3,8 @@
 //! AgentChecksum: a language-agnostic dependency fingerprint and behavioral
 //! regression gate for AI agents.
 
+#![allow(clippy::result_large_err)]
+
 pub mod cli;
 pub mod config;
 pub mod diff;
