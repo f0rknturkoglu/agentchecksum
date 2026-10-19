@@ -35,10 +35,9 @@ use super::{DiscoveredServer, DiscoveredTool, Secrets};
 
 /// The revision the stateless lifecycle speaks.
 ///
-/// Named explicitly because the SDK's own `LATEST` constant still points at the
-/// previous, session-based one: asking for `LATEST` would negotiate a session
-/// protocol against a server that supports both, and the fingerprint would then
-/// describe an era the server does not have to be in.
+/// Named explicitly rather than relying on whatever the SDK's `LATEST` constant
+/// points to: discovery is pinned to a concrete revision, guaranteeing reproducibility
+/// and ensuring the stateless handshake never negotiates the legacy session revision.
 const STATELESS_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 /// The revision the session lifecycle speaks.
@@ -785,7 +784,8 @@ mod tests {
         assert!(!diagnostic.contains("x7p"), "{safe_diagnostic}");
     }
 
-    /// The two preferred revisions are named, never taken from the SDK's `LATEST`.
+    /// The stateless handshake asks for the concrete stateless revision by name and never
+    /// the legacy session revision.
     #[test]
     fn the_stateless_revision_is_asked_for_by_name() {
         let preferred = preferred_versions();
@@ -795,8 +795,8 @@ mod tests {
         );
         assert_ne!(
             preferred.first().map(ProtocolVersion::as_str),
-            Some(ProtocolVersion::LATEST.as_str()),
-            "the SDK's LATEST is still the previous revision, which would negotiate a session"
+            Some(LEGACY_VERSION.as_str()),
+            "the stateless handshake must not negotiate the legacy session revision"
         );
 
         // And the two steps are distinct: the first never falls back on its own.
